@@ -73,3 +73,17 @@ _Avoid_: Per-bet stake, isolated position
 **Intraday Cash Reserve**:
 The protected share of bankroll (`40%`) kept unallocated from Premarket Entry so capital remains available for high-conviction Intraday Repricing signals across timezones.
 _Avoid_: Idle balance
+
+### Versioning & Experimentation
+
+**Model Version**:
+An immutable identifier tagging a specific probability calibration configuration, feature set, and trained MOS artifact that produced a Fair Probability estimate.
+_Avoid_: Latest model, untagged prediction
+
+**Strategy Version**:
+An immutable identifier tagging a specific set of entry, exit, order-placement, and risk-sizing rules that governed a trading decision.
+_Avoid_: Current config, ad-hoc parameters
+
+**Experiment Replay**:
+A deterministic chronological simulation of a candidate Model Version and Strategy Version over archived historical or recorded live market and weather snapshots to compare performance before live deployment.
+_Avoid_: Curve fitting, unverified tweak
