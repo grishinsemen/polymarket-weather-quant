@@ -232,8 +232,8 @@ export function TopPortfolioBar({
 
           <div className="rounded bg-[#0f1726] border border-[#1c2638] px-3 py-2">
             <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-slate-500">
-              <span>Exposure</span>
-              <span className="font-mono-tabular text-slate-400">${cityCap.toFixed(0)} cap</span>
+              <span>Locked</span>
+              <span className="font-mono-tabular text-slate-400">${cityCap.toFixed(0)}/city</span>
             </div>
             <div className="font-mono-tabular text-xs font-semibold text-amber-300 mt-0.5">
               ${portfolio.total_city_exposure_usd.toFixed(2)}

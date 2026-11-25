@@ -44,6 +44,7 @@ from weather_quant.ml.quantile_mos import load_mos_provider_for_version
 from weather_quant.probability.engine import (
     EnsembleProbabilityEngine,
     get_latest_event_probability_snapshot,
+    list_latest_event_probability_snapshots,
     list_station_routine_metars,
     save_event_probability_snapshot,
     to_event_unit,
@@ -1173,7 +1174,7 @@ def _build_terminal_views(
             audit_log=ev_audit,
         )
 
-    screener.sort(key=lambda r: r.net_edge, reverse=True)
+    screener.sort(key=lambda r: (r.countdown_seconds <= 0, -r.net_edge))
     return screener, xrays
 
 
@@ -1499,16 +1500,23 @@ async def get_terminal_snapshot(
     stream.register_events(events)
     archive_store = get_archive_store(request)
 
-    probs_by_event: dict[str, EventProbabilitySnapshot] = {}
+    latest_probs = await list_latest_event_probability_snapshots(db, selected_mv)
+    probs_by_event: dict[str, EventProbabilitySnapshot] = {
+        snap.event_id: snap for snap in latest_probs
+    }
     books_by_event: dict[str, dict[str, OrderBookSnapshot]] = {}
     ensembles_by_event: dict[str, EnsembleSnapshot] = {}
     metars_by_station: dict[str, list[MetarObservation]] = {}
 
-    for event in events:
-        snap = await get_latest_event_probability_snapshot(db, event.event_id, selected_mv)
-        if snap is not None:
-            probs_by_event[event.event_id] = snap
+    runtime_obj = getattr(request.app.state, "autonomous_runtime", None)
+    runtime_ens_cache: dict[str, EnsembleSnapshot] = (
+        runtime_obj.get_cached_ensembles() if runtime_obj is not None else {}
+    )
 
+    missing_book_events: list[str] = []
+    missing_ens_events: list[WeatherEvent] = []
+
+    for event in events:
         books: dict[str, OrderBookSnapshot] = {}
         for bucket in event.buckets:
             live_book = stream.get_snapshot(
@@ -1518,19 +1526,42 @@ async def get_terminal_snapshot(
             )
             if live_book is not None:
                 books[bucket.bucket_id] = live_book
-        if not books:
-            archived_books = await archive_store.aread_orderbook_snapshots(event_id=event.event_id)
-            for b in archived_books:
-                books[b.bucket_id] = b
         books_by_event[event.event_id] = books
-
-        archived_ens = await archive_store.aread_ensemble_snapshots(event_id=event.event_id)
-        if archived_ens:
-            ensembles_by_event[event.event_id] = archived_ens[-1]
+        if not books and event.buckets:
+            missing_book_events.append(event.event_id)
 
         icao = event.station.icao.upper()
+        cached_ens = runtime_ens_cache.get(icao) or runtime_ens_cache.get(event.event_id)
+        if cached_ens is not None:
+            ensembles_by_event[event.event_id] = cached_ens
+        else:
+            missing_ens_events.append(event)
+
         if icao not in metars_by_station:
             metars_by_station[icao] = await list_station_routine_metars(db, icao)
+
+    if missing_book_events:
+        missing_set = set(missing_book_events)
+        archived_books = await archive_store.aread_orderbook_snapshots(
+            start_utc=now - timedelta(hours=12),
+        )
+        for b in archived_books:
+            if b.event_id in missing_set:
+                books_by_event[b.event_id][b.bucket_id] = b
+
+    if missing_ens_events:
+        archived_ens = await archive_store.aread_ensemble_snapshots(
+            start_utc=now - timedelta(days=2),
+        )
+        by_event_id: dict[str, EnsembleSnapshot] = {}
+        by_icao: dict[str, EnsembleSnapshot] = {}
+        for ens in archived_ens:
+            by_event_id[ens.event_id] = ens
+            by_icao[ens.station_icao.upper()] = ens
+        for event in missing_ens_events:
+            match = by_event_id.get(event.event_id) or by_icao.get(event.station.icao.upper())
+            if match is not None:
+                ensembles_by_event[event.event_id] = match
 
     fills = await store.list_fills(limit=500)
     positions = await store.list_positions()

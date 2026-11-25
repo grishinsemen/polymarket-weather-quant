@@ -171,7 +171,8 @@ class OpenMeteoEnsembleFetcher:
             params["start_date"] = (local_date - timedelta(days=1)).isoformat()
             params["end_date"] = (local_date + timedelta(days=1)).isoformat()
         else:
-            params["forecast_days"] = 3
+            params["past_days"] = 1
+            params["forecast_days"] = 4
 
         client, owns_client = await self._get_client()
         try:

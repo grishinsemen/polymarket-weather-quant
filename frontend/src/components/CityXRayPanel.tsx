@@ -173,7 +173,7 @@ export function CityXRayPanel({
           </div>
           <div className="text-[11px] font-mono-tabular text-slate-400 mt-1">
             {xray.event.station.name} • {xray.event.station.lat.toFixed(4)},{" "}
-            {xray.event.station.lon.toFixed(4)} ({xray.event.station.elevation_m}m) • Exposure $
+            {xray.event.station.lon.toFixed(4)} ({xray.event.station.elevation_m}m) • Locked $
             {xray.city_exposure_usd.toFixed(2)}
           </div>
           {xray.latest_metar && (

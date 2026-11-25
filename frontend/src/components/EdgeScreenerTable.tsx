@@ -21,6 +21,7 @@ export function EdgeScreenerTable({
 }: EdgeScreenerTableProps) {
   const [sortKey, setSortKey] = useState<SortKey>("net_edge");
   const [sortAsc, setSortAsc] = useState<boolean>(false);
+  const [showSettled, setShowSettled] = useState<boolean>(false);
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -46,9 +47,17 @@ export function EdgeScreenerTable({
     return map;
   }, [rows, nowMs]);
 
-  const sortedRows = useMemo(() => {
-    const copy = [...rows];
-    copy.sort((a, b) => {
+  const { sortedRows, settledCount } = useMemo(() => {
+    const isSettled = (r: ScreenerRow) =>
+      (liveClockByEventId?.get(r.event_id)?.remainingSeconds ?? r.countdown_seconds) <= 0;
+    const totalSettled = rows.filter(isSettled).length;
+    const hasActive = totalSettled < rows.length;
+    const filtered = !showSettled && hasActive ? rows.filter((r) => !isSettled(r)) : [...rows];
+
+    filtered.sort((a, b) => {
+      const aSettled = isSettled(a);
+      const bSettled = isSettled(b);
+      if (aSettled !== bSettled) return aSettled ? 1 : -1;
       const aRaw =
         sortKey === "countdown_seconds"
           ? liveClockByEventId?.get(a.event_id)?.remainingSeconds ?? a.countdown_seconds
@@ -62,17 +71,29 @@ export function EdgeScreenerTable({
       if (av === bv) return a.station_icao.localeCompare(b.station_icao);
       return sortAsc ? av - bv : bv - av;
     });
-    return copy;
-  }, [rows, sortKey, sortAsc, liveClockByEventId]);
+    return { sortedRows: filtered, settledCount: totalSettled };
+  }, [rows, sortKey, sortAsc, liveClockByEventId, showSettled]);
 
   const arrow = (key: SortKey) => (sortKey === key ? (sortAsc ? " ↑" : " ↓") : "");
 
   return (
     <section className="rounded-lg border border-[#1c2638] bg-[#0d131f] overflow-hidden">
-      <div className="px-4 py-2.5 border-b border-[#1c2638] flex items-center justify-between">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
-          Multi-City Edge Screener ({rows.length})
-        </h2>
+      <div className="px-4 py-2.5 border-b border-[#1c2638] flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-300">
+            Multi-City Edge Screener ({sortedRows.length})
+          </h2>
+          {settledCount > 0 && (
+            <button
+              type="button"
+              data-testid="toggle-settled-btn"
+              onClick={() => setShowSettled((prev) => !prev)}
+              className="text-[10px] font-mono-tabular px-2 py-0.5 rounded bg-[#0f1726] text-slate-300 border border-[#25324a] hover:border-sky-700"
+            >
+              {showSettled ? `Hide Settled (${settledCount})` : `Show Settled (${settledCount})`}
+            </button>
+          )}
+        </div>
         <span className="text-[11px] font-mono-tabular text-slate-500">
           Click any Station to inspect 11-Bucket X-Ray
         </span>
@@ -163,7 +184,7 @@ export function EdgeScreenerTable({
                         </span>
                       </div>
                       <div className="text-[10px] font-mono-tabular text-slate-500 mt-0.5 whitespace-nowrap">
-                        {row.local_date} • Exp ${row.city_exposure_usd.toFixed(2)}
+                        {row.local_date} • Locked ${row.city_exposure_usd.toFixed(2)}
                       </div>
                     </td>
 

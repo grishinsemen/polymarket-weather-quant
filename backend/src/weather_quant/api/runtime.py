@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 from fastapi import FastAPI
 
 from weather_quant.archive.parquet_store import ParquetArchiveStore
@@ -23,7 +24,7 @@ from weather_quant.probability.engine import (
 )
 from weather_quant.probability.ensemble_fetcher import EnsembleFetcherPort, OpenMeteoEnsembleFetcher
 from weather_quant.storage.database import Database
-from weather_quant.strategy.engine import StrategyEngine, StrategyStore
+from weather_quant.strategy.engine import StrategyEngine, StrategyStore, settlement_close_utc
 from weather_quant.strategy.paper_executor import PaperExecutor
 
 logger = logging.getLogger(__name__)
@@ -44,9 +45,16 @@ class AutonomousRuntime:
         self.metar_shift_threshold_c = metar_shift_threshold_c
         self._task: asyncio.Task[None] | None = None
         self._ensemble_cache: dict[str, EnsembleSnapshot] = {}
+        self._ensemble_warmed_from_archive: bool = False
+        self._ensemble_cooldown_until: datetime | None = None
+        self._archived_ensemble_keys: set[tuple[str, str]] = set()
         self._last_metar_by_station: dict[str, MetarObservation] = {}
         self._archived_metar_keys: set[tuple[str, str]] = set()
         self._cycle_lock = asyncio.Lock()
+
+    def get_cached_ensembles(self) -> dict[str, EnsembleSnapshot]:
+        """Return shallow copy of in-memory station ensemble cache."""
+        return dict(self._ensemble_cache)
 
     def _get_archive_store(self) -> ParquetArchiveStore:
         store = getattr(self.app.state, "parquet_archive", None)
@@ -126,6 +134,26 @@ class AutonomousRuntime:
         if fresh:
             await archive.awrite_metar_observations(fresh)
 
+    async def _warm_ensemble_cache(
+        self,
+        archive: ParquetArchiveStore,
+        now_utc: datetime,
+    ) -> None:
+        if self._ensemble_warmed_from_archive:
+            return
+        self._ensemble_warmed_from_archive = True
+        try:
+            recent = await archive.aread_ensemble_snapshots(
+                start_utc=now_utc - timedelta(days=2),
+            )
+            for snap in recent:
+                icao = snap.station_icao.upper()
+                prev = self._ensemble_cache.get(icao)
+                if prev is None or ensure_utc(snap.fetched_at_utc) > ensure_utc(prev.fetched_at_utc):
+                    self._ensemble_cache[icao] = snap
+        except Exception:
+            logger.debug("Skipping archive ensemble warmup", exc_info=True)
+
     async def _ensure_event_ensemble(
         self,
         event: WeatherEvent,
@@ -133,23 +161,59 @@ class AutonomousRuntime:
         archive: ParquetArchiveStore,
         now_utc: Any,
     ) -> EnsembleSnapshot | None:
-        cached = self._ensemble_cache.get(event.event_id)
+        icao = event.station.icao.upper()
+        cached = self._ensemble_cache.get(icao)
         if cached is not None:
             age = ensure_utc(now_utc) - ensure_utc(cached.fetched_at_utc)
             if age < timedelta(minutes=self.ensemble_refresh_minutes):
-                return cached
+                event_snap = (
+                    cached
+                    if cached.event_id == event.event_id
+                    else cached.model_copy(update={"event_id": event.event_id})
+                )
+                arch_key = (event.event_id, ensure_utc(event_snap.fetched_at_utc).isoformat())
+                if arch_key not in self._archived_ensemble_keys:
+                    self._archived_ensemble_keys.add(arch_key)
+                    await archive.awrite_ensemble_snapshots([event_snap])
+                return event_snap
+
+        if self._ensemble_cooldown_until is not None and ensure_utc(now_utc) < self._ensemble_cooldown_until:
+            return (
+                cached.model_copy(update={"event_id": event.event_id})
+                if cached is not None and cached.event_id != event.event_id
+                else cached
+            )
+
         try:
             snap = await fetcher.fetch_ensemble(
                 station=event.station,
                 event_id=event.event_id,
-                local_date=event.local_date,
+                local_date=None,
             )
-            self._ensemble_cache[event.event_id] = snap
+            self._ensemble_cache[icao] = snap
+            self._archived_ensemble_keys.add(
+                (event.event_id, ensure_utc(snap.fetched_at_utc).isoformat())
+            )
             await archive.awrite_ensemble_snapshots([snap])
             return snap
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                self._ensemble_cooldown_until = ensure_utc(now_utc) + timedelta(seconds=180)
+                logger.warning("Open-Meteo rate-limited (429); cooling down for 180s and using cached ensembles")
+            else:
+                logger.exception("Ensemble fetch failed for %s", event.event_id)
+            return (
+                cached.model_copy(update={"event_id": event.event_id})
+                if cached is not None and cached.event_id != event.event_id
+                else cached
+            )
         except Exception:
             logger.exception("Ensemble fetch failed for %s", event.event_id)
-            return cached
+            return (
+                cached.model_copy(update={"event_id": event.event_id})
+                if cached is not None and cached.event_id != event.event_id
+                else cached
+            )
 
     async def run_cycle(self) -> dict[str, int]:
         """Run one complete sync -> Parquet -> CLOB -> Probability/MOS -> Strategy -> Alert cycle."""
@@ -168,9 +232,21 @@ class AutonomousRuntime:
             bot = getattr(self.app.state, "telegram_bot", None)
             await self._archive_new_metars(latest_metars, archive, bot)
 
-            # 2. Register events on CLOB stream & archive current books
+            # 2. Register events on CLOB stream, hydrate cold books via REST, and push live_tick early
             stream = self._get_clob_stream()
             stream.register_events(events)
+            active_events = [e for e in events if settlement_close_utc(e) > now_utc]
+            if any(
+                stream.get_snapshot(b.token_id, now=now_utc) is None
+                for e in active_events
+                for b in e.buckets
+            ):
+                try:
+                    await stream.resync_snapshots()
+                except Exception:
+                    logger.warning("CLOB REST /books resync failed; continuing with WS stream", exc_info=True)
+            await radar.broadcast_live_tick(0.0)
+
             strategy_engine = await self._get_strategy_engine()
             book_snapshots = [
                 snap
@@ -189,6 +265,7 @@ class AutonomousRuntime:
                 await archive.awrite_orderbook_snapshots(book_snapshots)
 
             # 3. Ensembles + Fair Probability (MOS when active & covered, else 3-layer baseline)
+            await self._warm_ensemble_cache(archive, now_utc)
             active_mv = (await db.get_active_model_version()).model_version
             mos_provider = await load_mos_provider_for_version(
                 db,
@@ -203,6 +280,8 @@ class AutonomousRuntime:
             probs_computed = 0
 
             for event in events:
+                if settlement_close_utc(event) <= now_utc:
+                    continue
                 ensemble = await self._ensure_event_ensemble(event, fetcher, archive, now_utc)
                 if ensemble is None:
                     continue

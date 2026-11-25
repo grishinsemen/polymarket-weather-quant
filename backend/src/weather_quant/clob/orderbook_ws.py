@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Protocol
 
 import websockets
+import httpx
 from pydantic import BaseModel, Field
 
 from weather_quant.clob.fees import calculate_weather_fee_per_share
@@ -21,7 +22,38 @@ from weather_quant.domain.models import OrderBookSnapshot, OrderLevel, WeatherEv
 logger = logging.getLogger(__name__)
 
 POLYMARKET_CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+POLYMARKET_CLOB_BOOKS_URL = "https://clob.polymarket.com/books"
 TOP_DEPTH_LEVELS = 5
+
+
+async def fetch_clob_books_rest(
+    token_ids: list[str],
+    *,
+    client: httpx.AsyncClient | None = None,
+    batch_size: int = 100,
+    timeout_seconds: float = 10.0,
+) -> list[dict[str, Any]]:
+    """Fetch initial CLOB orderbook snapshots in chunks via Polymarket REST /books."""
+    if not token_ids:
+        return []
+    owns_client = client is None
+    http = client or httpx.AsyncClient(timeout=timeout_seconds)
+    books: list[dict[str, Any]] = []
+    try:
+        for idx in range(0, len(token_ids), batch_size):
+            chunk = token_ids[idx : idx + batch_size]
+            resp = await http.post(
+                POLYMARKET_CLOB_BOOKS_URL,
+                json=[{"token_id": tid} for tid in chunk],
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            if isinstance(payload, list):
+                books.extend(item for item in payload if isinstance(item, dict))
+    finally:
+        if owns_client:
+            await http.aclose()
+    return books
 
 
 class WsConnection(Protocol):

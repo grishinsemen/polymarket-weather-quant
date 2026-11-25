@@ -110,6 +110,7 @@ export function LiveRadarShell() {
       socket = new WebSocket(wsUrl);
       socket.onopen = () => {
         setWsStatus("connected");
+        void fetchSnapshot(versionsRef.current.mv, versionsRef.current.sv, true);
       };
       socket.onmessage = () => {
         void fetchSnapshot(versionsRef.current.mv, versionsRef.current.sv, true);

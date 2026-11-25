@@ -473,3 +473,93 @@ async def test_clob_stream_subscribes_dynamically_when_events_registered_after_c
         assert snap.best_bid == pytest.approx(0.41)
     finally:
         await stream.stop()
+
+
+@pytest.mark.asyncio
+async def test_http_world_feed_paginates_gamma_events_past_first_page() -> None:
+    import httpx
+    from weather_quant.metar.fetcher import HttpWorldFeed
+
+    seen_offsets: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        offset = request.url.params.get("offset")
+        seen_offsets.append(offset)
+        if offset in (None, "0"):
+            return httpx.Response(
+                200,
+                json=[{"id": f"evt-{i}", "slug": f"s-{i}"} for i in range(100)],
+            )
+        if offset == "100":
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": "evt-99", "slug": "s-99"},  # duplicate across page shift
+                    {"id": "evt-nov26-1", "slug": "highest-temperature-in-paris-on-november-26-2026"},
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        feed = HttpWorldFeed(client=client)
+        events = await feed.fetch_weather_events()
+
+    assert seen_offsets == ["0", "100"]
+    assert len(events) == 101
+    assert any(e["id"] == "evt-nov26-1" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_fetch_clob_books_rest_chunks_tokens_and_runtime_handles_429_cooldown(tmp_path: Path) -> None:
+    import json
+    import httpx
+    from weather_quant.clob.orderbook_ws import fetch_clob_books_rest
+
+    post_batches: list[list[str]] = []
+
+    def clob_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        tids = [item["token_id"] for item in body]
+        post_batches.append(tids)
+        return httpx.Response(
+            200,
+            json=[{"asset_id": tid, "bids": [{"price": "0.40", "size": "20"}], "asks": []} for tid in tids],
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(clob_handler)) as client:
+        books = await fetch_clob_books_rest(["t1", "t2", "t3"], client=client, batch_size=2)
+
+    assert post_batches == [["t1", "t2"], ["t3"]]
+    assert [b["asset_id"] for b in books] == ["t1", "t2", "t3"]
+
+    # Verify AutonomousRuntime enters 429 cooldown without aborting run_cycle
+    now = datetime(2026, 11, 26, 9, 15, tzinfo=timezone.utc)
+    clock = VirtualClock(now)
+    app = create_app(
+        db_path=":memory:",
+        world_feed=_FakeWorldFeed("LFPB", date(2026, 11, 26)),
+        clock=clock,
+        enable_background_poll=False,
+        archive_dir=str(tmp_path / "archive_429"),
+    )
+
+    class _RateLimitedFetcher:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def fetch_ensemble(self, station: Any, event_id: str, local_date: date | None = None) -> EnsembleSnapshot:
+            self.calls += 1
+            req = httpx.Request("GET", "https://ensemble-api.open-meteo.com/v1/ensemble")
+            resp = httpx.Response(429, request=req)
+            raise httpx.HTTPStatusError("429 Too Many Requests", request=req, response=resp)
+
+    limited = _RateLimitedFetcher()
+    app.state.ensemble_fetcher = limited
+    with TestClient(app):
+        summary = await app.state.autonomous_runtime.run_cycle()
+        assert summary["events_count"] == 1
+        assert limited.calls == 1
+        # Second cycle within 180s cooldown skips Open-Meteo completely
+        clock.advance(timedelta(seconds=30))
+        await app.state.autonomous_runtime.run_cycle()
+        assert limited.calls == 1

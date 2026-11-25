@@ -534,6 +534,56 @@ describe("WeatherQuantTerminal", () => {
     }
   });
 
+  it("hides SETTLED rows by default when active markets exist and reveals them via Show Settled toggle", () => {
+    const settledRow = {
+      ...FIXTURE_SNAPSHOT.screener[0],
+      event_id: "evt-eddm-settled",
+      slug: "highest-temp-munich-settled",
+      title: "Highest temperature in Munich on 2026-11-24?",
+      station_icao: "EDDM",
+      city: "Munich",
+      timezone: "Europe/Berlin",
+      local_date: "2026-11-24",
+      countdown_seconds: 0,
+      countdown_label: "SETTLED",
+      net_edge: 0.99,
+    };
+    const snapshotWithSettled: TerminalSnapshotResponse = {
+      ...FIXTURE_SNAPSHOT,
+      screener: [settledRow, ...FIXTURE_SNAPSHOT.screener],
+    };
+
+    render(
+      <WeatherQuantTerminal
+        snapshot={snapshotWithSettled}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    expect(screen.getAllByTestId("screener-city-row")).toHaveLength(2);
+    expect(screen.queryByTestId("screener-countdown-EDDM")).not.toBeInTheDocument();
+
+    const toggleBtn = screen.getByTestId("toggle-settled-btn");
+    expect(toggleBtn).toHaveTextContent("Show Settled (1)");
+    fireEvent.click(toggleBtn);
+
+    expect(screen.getAllByTestId("screener-city-row")).toHaveLength(3);
+    expect(screen.getByTestId("screener-countdown-EDDM")).toHaveTextContent("SETTLED");
+  });
+
   it("supports version filtering and Experiment Lab replay triggering and promotion", () => {
     const onFilterModel = vi.fn();
     const onFilterStrategy = vi.fn();

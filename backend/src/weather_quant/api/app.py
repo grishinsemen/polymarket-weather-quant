@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from weather_quant.api.runtime import AutonomousRuntime
 from weather_quant.api.service import RadarStateResponse, StationRadarService
 from weather_quant.archive.parquet_store import ParquetArchiveStore
-from weather_quant.clob.orderbook_ws import ClobOrderBookStream
+from weather_quant.clob.orderbook_ws import ClobOrderBookStream, fetch_clob_books_rest
 from weather_quant.domain.clock import Clock, SystemClock
 from weather_quant.domain.ports import WorldFeedPort
 from weather_quant.metar.fetcher import HttpWorldFeed
@@ -90,6 +90,7 @@ def create_app(
         fastapi_app.state.parquet_archive = ParquetArchiveStore(base_dir=resolved_archive_dir)
     fastapi_app.state.clob_stream = ClobOrderBookStream(
         clock=app_clock,
+        resync_books_fn=fetch_clob_books_rest if (enable_background_poll and world_feed is None) else None,
         on_snapshot=lambda _snap: radar_service.broadcast_live_tick(2.0),
     )
     fastapi_app.state.autonomous_runtime = AutonomousRuntime(fastapi_app)

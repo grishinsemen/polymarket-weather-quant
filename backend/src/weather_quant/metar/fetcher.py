@@ -27,23 +27,43 @@ class HttpWorldFeed:
         return httpx.AsyncClient(timeout=self._timeout_seconds), True
 
     async def fetch_weather_events(self) -> list[dict[str, Any]]:
-        """Fetch active Polymarket temperature Weather Events from Gamma API."""
+        """Fetch all active Polymarket temperature Weather Events from Gamma API."""
         client, owns_client = await self._get_client()
         try:
-            params = {
-                "active": "true",
-                "closed": "false",
-                "tag_slug": "weather",
-                "limit": 100,
-            }
-            resp = await client.get(GAMMA_EVENTS_URL, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list):
-                return [item for item in data if isinstance(item, dict)]
-            if isinstance(data, dict) and isinstance(data.get("data"), list):
-                return [item for item in data["data"] if isinstance(item, dict)]
-            return []
+            limit = 100
+            offset = 0
+            events: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
+            for _ in range(20):
+                params = {
+                    "active": "true",
+                    "closed": "false",
+                    "tag_slug": "weather",
+                    "limit": limit,
+                    "offset": offset,
+                }
+                resp = await client.get(GAMMA_EVENTS_URL, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                if isinstance(data, list):
+                    batch = [item for item in data if isinstance(item, dict)]
+                elif isinstance(data, dict) and isinstance(data.get("data"), list):
+                    batch = [item for item in data["data"] if isinstance(item, dict)]
+                else:
+                    batch = []
+                if not batch:
+                    break
+                for item in batch:
+                    item_id = str(item.get("id") or "")
+                    if item_id and item_id in seen_ids:
+                        continue
+                    if item_id:
+                        seen_ids.add(item_id)
+                    events.append(item)
+                if len(batch) < limit:
+                    break
+                offset += limit
+            return events
         finally:
             if owns_client:
                 await client.aclose()
