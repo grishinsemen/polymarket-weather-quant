@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Polymarket Weather Quant | Station METAR Radar",
-  description: "Autonomous ICAO METAR temperature radar and pro trading terminal",
+  title: "Polymarket Weather Quant | Pro Terminal & Replay Lab",
+  description: "Autonomous ICAO METAR temperature quant terminal, 11-bucket X-Ray, and Experiment Replay lab",
 };
 
 export default function RootLayout({

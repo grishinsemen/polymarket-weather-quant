@@ -1,58 +1,79 @@
 "use client";
 
 import React, { useCallback, useEffect, useState } from "react";
-import { StationRadarTerminal, type WsStatus } from "@/components/StationRadarTerminal";
-import type { RadarStateResponse } from "@/types/radar";
+import type { TerminalTab, WsStatus } from "@/components/TopPortfolioBar";
+import { WeatherQuantTerminal } from "@/components/WeatherQuantTerminal";
+import type { ExperimentRunSummary, TerminalSnapshotResponse } from "@/types/terminal";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
-const EMPTY_STATE: RadarStateResponse = {
+const EMPTY_SNAPSHOT: TerminalSnapshotResponse = {
   status: "ok",
-  active_model_version: "ensemble-3layer-v1",
-  active_strategy_version: "conservative-kelly-100-v1",
+  is_demo: true,
   server_time_utc: new Date().toISOString(),
-  last_sync_utc: null,
-  last_sync_error: null,
-  eligible_count: 0,
-  quarantined_count: 0,
-  metar_station_count: 0,
-  stations: [],
+  portfolio: {
+    reference_bankroll_usd: 100.0,
+    cash_balance_usd: 100.0,
+    equity_usd: 100.0,
+    realized_pnl_usd: 0.0,
+    unrealized_pnl_usd: 0.0,
+    total_city_exposure_usd: 0.0,
+    intraday_cash_reserve_usd: 40.0,
+    available_premarket_usd: 60.0,
+    avg_clv: null,
+    active_model_version: "ensemble-3layer-v1",
+    active_strategy_version: "conservative-kelly-100-v1",
+    is_paused: false,
+    as_of_utc: new Date().toISOString(),
+  },
+  model_versions: [],
+  strategy_versions: [],
+  screener: [],
+  xrays: {},
+  experiment_runs: [],
   quarantined_events: [],
-  catalog_stations: [],
 };
 
 export function LiveRadarShell() {
-  const [state, setState] = useState<RadarStateResponse>(EMPTY_STATE);
+  const [snapshot, setSnapshot] = useState<TerminalSnapshotResponse>(EMPTY_SNAPSHOT);
   const [wsStatus, setWsStatus] = useState<WsStatus>("connecting");
+  const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<TerminalTab>("terminal");
+  const [selectedModelVersion, setSelectedModelVersion] = useState<string>("ensemble-3layer-v1");
+  const [selectedStrategyVersion, setSelectedStrategyVersion] = useState<string>(
+    "conservative-kelly-100-v1",
+  );
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isTogglingPause, setIsTogglingPause] = useState(false);
+  const [isRunningReplay, setIsRunningReplay] = useState(false);
+  const [promotingRunId, setPromotingRunId] = useState<string | null>(null);
+  const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
-  const fetchInitialState = useCallback(async () => {
-    try {
-      const resp = await fetch(`${API_BASE}/api/state`, { cache: "no-store" });
-      if (resp.ok) {
-        const data = (await resp.json()) as RadarStateResponse;
-        setState(data);
+  const fetchSnapshot = useCallback(
+    async (mv?: string, sv?: string) => {
+      try {
+        const params = new URLSearchParams();
+        if (mv) params.set("model_version", mv);
+        if (sv) params.set("strategy_version", sv);
+        const qs = params.toString();
+        const url = `${API_BASE}/api/terminal/snapshot${qs ? `?${qs}` : ""}`;
+        const resp = await fetch(url, { cache: "no-store" });
+        if (resp.ok) {
+          const data = (await resp.json()) as TerminalSnapshotResponse;
+          setSnapshot(data);
+          setSelectedModelVersion(data.portfolio.active_model_version);
+          setSelectedStrategyVersion(data.portfolio.active_strategy_version);
+          setErrorBanner(null);
+        }
+      } catch {
+        // Backend may still be booting; WebSocket reconnects below
       }
-    } catch {
-      // Backend may still be booting; WebSocket reconnects below
-    }
-  }, []);
-
-  const handleSync = useCallback(async () => {
-    setIsSyncing(true);
-    try {
-      const resp = await fetch(`${API_BASE}/api/stations/sync`, { method: "POST" });
-      if (resp.ok) {
-        const data = (await resp.json()) as RadarStateResponse;
-        setState(data);
-      }
-    } finally {
-      setIsSyncing(false);
-    }
-  }, []);
+    },
+    [],
+  );
 
   useEffect(() => {
-    void fetchInitialState();
+    void fetchSnapshot();
 
     const wsUrl = API_BASE.replace(/^http/, "ws") + "/ws/stream";
     let socket: WebSocket | null = null;
@@ -66,18 +87,8 @@ export function LiveRadarShell() {
       socket.onopen = () => {
         setWsStatus("connected");
       };
-      socket.onmessage = (evt) => {
-        try {
-          const msg = JSON.parse(evt.data as string) as {
-            type?: string;
-            payload?: RadarStateResponse;
-          };
-          if (msg.type === "state_snapshot" && msg.payload) {
-            setState(msg.payload);
-          }
-        } catch {
-          // Ignore malformed WS frame
-        }
+      socket.onmessage = () => {
+        void fetchSnapshot(selectedModelVersion, selectedStrategyVersion);
       };
       socket.onclose = () => {
         setWsStatus("disconnected");
@@ -97,14 +108,124 @@ export function LiveRadarShell() {
       if (reconnectTimer) clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [fetchInitialState]);
+  }, [fetchSnapshot, selectedModelVersion, selectedStrategyVersion]);
+
+  const handleFilterModel = useCallback(
+    (mv: string) => {
+      setSelectedModelVersion(mv);
+      void fetchSnapshot(mv, selectedStrategyVersion);
+    },
+    [fetchSnapshot, selectedStrategyVersion],
+  );
+
+  const handleFilterStrategy = useCallback(
+    (sv: string) => {
+      setSelectedStrategyVersion(sv);
+      void fetchSnapshot(selectedModelVersion, sv);
+    },
+    [fetchSnapshot, selectedModelVersion],
+  );
+
+  const handleTogglePause = useCallback(async () => {
+    setIsTogglingPause(true);
+    try {
+      const endpoint = snapshot.portfolio.is_paused ? "/api/strategy/resume" : "/api/strategy/pause";
+      await fetch(`${API_BASE}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model_version: selectedModelVersion }),
+      });
+      await fetchSnapshot(selectedModelVersion, selectedStrategyVersion);
+    } finally {
+      setIsTogglingPause(false);
+    }
+  }, [fetchSnapshot, selectedModelVersion, selectedStrategyVersion, snapshot.portfolio.is_paused]);
+
+  const handleSync = useCallback(async () => {
+    setIsSyncing(true);
+    try {
+      await fetch(`${API_BASE}/api/stations/sync`, { method: "POST" });
+      await fetchSnapshot(selectedModelVersion, selectedStrategyVersion);
+    } finally {
+      setIsSyncing(false);
+    }
+  }, [fetchSnapshot, selectedModelVersion, selectedStrategyVersion]);
+
+  const handleSeedDemo = useCallback(async () => {
+    await fetch(`${API_BASE}/api/terminal/seed-demo`, { method: "POST" });
+    await fetchSnapshot(selectedModelVersion, selectedStrategyVersion);
+  }, [fetchSnapshot, selectedModelVersion, selectedStrategyVersion]);
+
+  const handleRunReplay = useCallback(
+    async (mv: string, sv: string) => {
+      setIsRunningReplay(true);
+      try {
+        const resp = await fetch(`${API_BASE}/api/replay/run`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model_version: mv, strategy_version: sv }),
+        });
+        if (!resp.ok) {
+          const detail = await resp.text();
+          setErrorBanner(`Replay failed: ${detail}`);
+        } else {
+          setErrorBanner(null);
+        }
+        await fetchSnapshot(mv, sv);
+      } finally {
+        setIsRunningReplay(false);
+      }
+    },
+    [fetchSnapshot],
+  );
+
+  const handlePromoteRun = useCallback(
+    async (run: ExperimentRunSummary) => {
+      setPromotingRunId(run.run_id);
+      try {
+        const resp = await fetch(`${API_BASE}/api/replay/promote`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model_version: run.model_version,
+            strategy_version: run.strategy_version,
+            run_id: run.run_id,
+          }),
+        });
+        if (resp.ok) {
+          setSelectedModelVersion(run.model_version);
+          setSelectedStrategyVersion(run.strategy_version);
+          await fetchSnapshot(run.model_version, run.strategy_version);
+        }
+      } finally {
+        setPromotingRunId(null);
+      }
+    },
+    [fetchSnapshot],
+  );
 
   return (
-    <StationRadarTerminal
-      initialState={state}
+    <WeatherQuantTerminal
+      snapshot={snapshot}
       wsStatus={wsStatus}
-      onSync={handleSync}
+      selectedEventId={selectedEventId}
+      activeTab={activeTab}
+      selectedModelVersion={selectedModelVersion}
+      selectedStrategyVersion={selectedStrategyVersion}
       isSyncing={isSyncing}
+      isTogglingPause={isTogglingPause}
+      isRunningReplay={isRunningReplay}
+      promotingRunId={promotingRunId}
+      errorBanner={errorBanner}
+      onSelectEvent={setSelectedEventId}
+      onSelectTab={setActiveTab}
+      onFilterModelVersion={handleFilterModel}
+      onFilterStrategyVersion={handleFilterStrategy}
+      onTogglePause={handleTogglePause}
+      onSync={handleSync}
+      onSeedDemo={handleSeedDemo}
+      onRunReplay={handleRunReplay}
+      onPromoteRun={handlePromoteRun}
     />
   );
 }

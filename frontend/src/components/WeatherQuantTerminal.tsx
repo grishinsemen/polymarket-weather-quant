@@ -1,0 +1,144 @@
+"use client";
+
+import React from "react";
+import { CityXRayPanel } from "./CityXRayPanel";
+import { EdgeScreenerTable } from "./EdgeScreenerTable";
+import { ExperimentLabPanel } from "./ExperimentLabPanel";
+import { TopPortfolioBar, type TerminalTab, type WsStatus } from "./TopPortfolioBar";
+import type { ExperimentRunSummary, TerminalSnapshotResponse } from "@/types/terminal";
+
+interface WeatherQuantTerminalProps {
+  snapshot: TerminalSnapshotResponse;
+  wsStatus: WsStatus;
+  selectedEventId: string | null;
+  activeTab: TerminalTab;
+  selectedModelVersion: string;
+  selectedStrategyVersion: string;
+  isSyncing?: boolean;
+  isTogglingPause?: boolean;
+  isRunningReplay?: boolean;
+  promotingRunId?: string | null;
+  errorBanner?: string | null;
+  onSelectEvent: (eventId: string) => void;
+  onSelectTab: (tab: TerminalTab) => void;
+  onFilterModelVersion: (mv: string) => void;
+  onFilterStrategyVersion: (sv: string) => void;
+  onTogglePause: () => Promise<void>;
+  onSync: () => Promise<void>;
+  onSeedDemo: () => Promise<void>;
+  onRunReplay: (modelVersion: string, strategyVersion: string) => Promise<void>;
+  onPromoteRun: (run: ExperimentRunSummary) => Promise<void>;
+}
+
+export function WeatherQuantTerminal({
+  snapshot,
+  wsStatus,
+  selectedEventId,
+  activeTab,
+  selectedModelVersion,
+  selectedStrategyVersion,
+  isSyncing = false,
+  isTogglingPause = false,
+  isRunningReplay = false,
+  promotingRunId = null,
+  errorBanner = null,
+  onSelectEvent,
+  onSelectTab,
+  onFilterModelVersion,
+  onFilterStrategyVersion,
+  onTogglePause,
+  onSync,
+  onSeedDemo,
+  onRunReplay,
+  onPromoteRun,
+}: WeatherQuantTerminalProps) {
+  const effectiveEventId =
+    selectedEventId && snapshot.xrays[selectedEventId]
+      ? selectedEventId
+      : snapshot.screener[0]?.event_id ?? null;
+  const activeXRay = effectiveEventId ? snapshot.xrays[effectiveEventId] ?? null : null;
+
+  return (
+    <div className="min-h-screen bg-[#070b12] text-slate-200 flex flex-col">
+      <TopPortfolioBar
+        portfolio={snapshot.portfolio}
+        modelVersions={snapshot.model_versions}
+        strategyVersions={snapshot.strategy_versions}
+        selectedModelVersion={selectedModelVersion}
+        selectedStrategyVersion={selectedStrategyVersion}
+        wsStatus={wsStatus}
+        isDemo={snapshot.is_demo}
+        activeTab={activeTab}
+        isSyncing={isSyncing}
+        isTogglingPause={isTogglingPause}
+        onSelectTab={onSelectTab}
+        onFilterModelVersion={onFilterModelVersion}
+        onFilterStrategyVersion={onFilterStrategyVersion}
+        onTogglePause={onTogglePause}
+        onSync={onSync}
+        onSeedDemo={onSeedDemo}
+      />
+
+      <main className="max-w-[1600px] w-full mx-auto px-4 lg:px-6 py-4 flex-1 space-y-4">
+        {errorBanner && (
+          <div className="px-4 py-2 rounded border border-rose-800/70 bg-rose-950/40 text-rose-200 text-xs font-mono-tabular">
+            {errorBanner}
+          </div>
+        )}
+
+        {activeTab === "terminal" ? (
+          <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 items-start">
+            <div className="xl:col-span-5 space-y-4">
+              <EdgeScreenerTable
+                rows={snapshot.screener}
+                selectedEventId={effectiveEventId}
+                onSelectEvent={onSelectEvent}
+              />
+
+              {snapshot.quarantined_events.length > 0 && (
+                <section className="rounded-lg border border-[#1c2638] bg-[#0d131f] overflow-hidden">
+                  <div className="px-4 py-2 border-b border-[#1c2638] flex items-center justify-between">
+                    <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                      Quarantined Non-METAR Markets ({snapshot.quarantined_events.length})
+                    </h3>
+                  </div>
+                  <div className="divide-y divide-[#1c2638]">
+                    {snapshot.quarantined_events.map((q) => (
+                      <div
+                        key={q.event_id}
+                        className="px-4 py-2 flex items-center justify-between gap-2 text-xs"
+                      >
+                        <span className="text-slate-300 truncate">{q.title || q.slug}</span>
+                        <span className="font-mono-tabular text-[10px] px-1.5 py-0.5 rounded bg-rose-950/60 text-rose-300 border border-rose-800/60">
+                          {q.reason_code}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </div>
+
+            <div className="xl:col-span-7">
+              <CityXRayPanel xray={activeXRay} />
+            </div>
+          </div>
+        ) : (
+          <ExperimentLabPanel
+            runs={snapshot.experiment_runs}
+            modelVersions={snapshot.model_versions}
+            strategyVersions={snapshot.strategy_versions}
+            selectedModelVersion={selectedModelVersion}
+            selectedStrategyVersion={selectedStrategyVersion}
+            isRunningReplay={isRunningReplay}
+            promotingRunId={promotingRunId}
+            onSelectModelVersion={onFilterModelVersion}
+            onSelectStrategyVersion={onFilterStrategyVersion}
+            onRunReplay={onRunReplay}
+            onPromoteRun={onPromoteRun}
+          />
+        )}
+      </main>
+    </div>
+  );
+}
