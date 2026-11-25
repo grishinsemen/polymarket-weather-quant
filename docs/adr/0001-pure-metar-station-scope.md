@@ -1,0 +1,3 @@
+# 0001: Restrict V1 Scope to Pure ICAO METAR Stations
+
+Polymarket daily weather markets settle against different authorities depending on the city: most cities (Paris `LFPB`, Seoul `RKSI`, Munich `EDDM`, Busan, London, Miami, Lucknow, etc.) settle strictly on routine hourly ICAO airport `METAR` reports while explicitly disqualifying `SPECI` special reports, whereas a few markets (such as Hong Kong) settle on local non-METAR observatories. We restrict V1 strictly to pure `METAR`-settled Weather Events, parse the exact 4-letter ICAO Station code and `RMK` tenths rules from event descriptions, and pull forecasts at the airport runway coordinates rather than city centers so training targets, live intraday tracking, and settlement rules match 1:1.

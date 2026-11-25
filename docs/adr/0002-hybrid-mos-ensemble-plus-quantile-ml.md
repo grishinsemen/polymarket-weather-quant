@@ -1,0 +1,3 @@
+# 0002: Hybrid 3-Layer Ensemble Core + Leak-Free Quantile ML on Top Stations
+
+Training deep neural networks across all cities risks overfitting and data leakage if post-factum reanalysis is mixed into features. We use a 3-layer baseline across every eligible Station (~120 physical runs from `ECMWF + GFS + ICON` + 30–45 day rolling Station Bias + intraday Bayesian Routine METAR cutoff/trend) and layer a Quantile GBDT (`LightGBM`/`CatBoost`) MOS model on the top 6–8 highest-volume Stations, trained strictly on archived forecasts (`historical-forecast-api.open-meteo.com`) against archived `report_type=3` Routine METAR observations (`Iowa State Mesonet`) with chronological splits.
