@@ -1,6 +1,6 @@
 # Polymarket Weather Quant Engine & Pro Terminal
 
-Status: ready-for-agent
+Status: resolved
 
 ## Problem Statement
 
