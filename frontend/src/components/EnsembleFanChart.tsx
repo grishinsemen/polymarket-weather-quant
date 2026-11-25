@@ -1,13 +1,59 @@
 "use client";
 
-import React from "react";
+import React, { useEffect, useState } from "react";
+import { formatHhMmInZone } from "@/lib/time";
 import type { EnsembleFanSeries } from "@/types/terminal";
 
 interface EnsembleFanChartProps {
   fan: EnsembleFanSeries;
+  stationTimezone?: string;
+  serverTimeUtc?: string;
+  nowMs?: number;
+  latestMetarTempInUnit?: number | null;
 }
 
-export function EnsembleFanChart({ fan }: EnsembleFanChartProps) {
+function interpolateSeriesAt(timesMs: number[], values: number[], targetMs: number): number {
+  const n = timesMs.length;
+  if (n === 0) return 0;
+  if (n === 1 || targetMs <= timesMs[0]) return values[0];
+  if (targetMs >= timesMs[n - 1]) return values[n - 1];
+  for (let i = 0; i < n - 1; i++) {
+    const t0 = timesMs[i];
+    const t1 = timesMs[i + 1];
+    if (targetMs >= t0 && targetMs <= t1) {
+      const span = t1 - t0;
+      if (span <= 0) return values[i];
+      const alpha = (targetMs - t0) / span;
+      return values[i] + alpha * (values[i + 1] - values[i]);
+    }
+  }
+  return values[n - 1];
+}
+
+export function EnsembleFanChart({
+  fan,
+  stationTimezone,
+  serverTimeUtc,
+  nowMs: controlledNowMs,
+  latestMetarTempInUnit = null,
+}: EnsembleFanChartProps) {
+  const [internalNowMs, setInternalNowMs] = useState<number>(() =>
+    serverTimeUtc ? new Date(serverTimeUtc).getTime() : Date.now(),
+  );
+
+  useEffect(() => {
+    if (controlledNowMs !== undefined) return;
+    const baseMs = serverTimeUtc ? new Date(serverTimeUtc).getTime() : Date.now();
+    const mountWallMs = Date.now();
+    setInternalNowMs(baseMs);
+    const interval = setInterval(() => {
+      setInternalNowMs(baseMs + (Date.now() - mountWallMs));
+    }, 1_000);
+    return () => clearInterval(interval);
+  }, [controlledNowMs, serverTimeUtc]);
+
+  const nowMs = controlledNowMs ?? internalNowMs;
+
   const n = fan.timestamps.length;
   if (n === 0 || fan.p10.length !== n || fan.p50.length !== n || fan.p90.length !== n) {
     return (
@@ -19,22 +65,34 @@ export function EnsembleFanChart({ fan }: EnsembleFanChartProps) {
 
   const width = 560;
   const height = 180;
-  const padL = 38;
+  const padL = 44;
   const padR = 16;
   const padT = 16;
   const padB = 26;
   const plotW = width - padL - padR;
   const plotH = height - padT - padB;
 
-  const allVals = [...fan.p10, ...fan.p90, ...fan.metar_points.map((m) => m.temp_c)];
-  const minT = Math.floor(Math.min(...allVals) - 1);
-  const maxT = Math.ceil(Math.max(...allVals) + 1);
-  const spanT = Math.max(1, maxT - minT);
-
   const timesMs = fan.timestamps.map((t) => new Date(t).getTime());
   const minTime = timesMs[0];
   const maxTime = timesMs[n - 1];
   const spanTime = Math.max(1, maxTime - minTime);
+
+  const currentTemp =
+    fan.metar_points.length > 0
+      ? fan.metar_points[fan.metar_points.length - 1].temp_c
+      : latestMetarTempInUnit !== null && latestMetarTempInUnit !== undefined
+        ? latestMetarTempInUnit
+        : interpolateSeriesAt(timesMs, fan.p50, nowMs);
+
+  const allVals = [
+    ...fan.p10,
+    ...fan.p90,
+    ...fan.metar_points.map((m) => m.temp_c),
+    currentTemp,
+  ];
+  const minT = Math.floor(Math.min(...allVals) - 1);
+  const maxT = Math.ceil(Math.max(...allVals) + 1);
+  const spanT = Math.max(1, maxT - minT);
 
   const xForIdx = (i: number) =>
     n === 1 ? padL + plotW / 2 : padL + (i / (n - 1)) * plotW;
@@ -55,14 +113,47 @@ export function EnsembleFanChart({ fan }: EnsembleFanChartProps) {
     .map((val, i) => `${i === 0 ? "M" : "L"}${xForIdx(i).toFixed(1)},${yForVal(val).toFixed(1)}`)
     .join(" ");
 
-  const yTicks = [minT, Math.round((minT + maxT) / 2), maxT];
+  const yTicks = Array.from(new Set([minT, Math.round((minT + maxT) / 2), maxT]));
+  const majorSet = new Set(yTicks);
+  const degreeStep = spanT > 40 ? Math.ceil(spanT / 30) : 1;
+  const minorTicks: number[] = [];
+  for (let deg = minT + degreeStep; deg < maxT; deg += degreeStep) {
+    if (!majorSet.has(deg)) {
+      minorTicks.push(deg);
+    }
+  }
+
+  const tz = stationTimezone || "UTC";
+  const xTickIndices = Array.from(new Set([0, Math.floor(n / 2), n - 1]));
+  const xNow = xForMs(nowMs);
+  const yNow = yForVal(currentTemp);
+  const currentTimeLabel = formatHhMmInZone(new Date(nowMs), tz);
+  const currentTempLabel = `${currentTemp.toFixed(1)}°${fan.unit}`;
+  const timeLabelX = Math.max(padL + 16, Math.min(width - padR - 16, xNow));
+
+  const metarTemps = fan.metar_points.map((pt) => pt.temp_c);
+  const dayMinTemp = metarTemps.length > 0 ? Math.min(...metarTemps) : null;
+  const dayMaxTemp = metarTemps.length > 0 ? Math.max(...metarTemps) : null;
 
   return (
     <div className="rounded border border-[#1c2638] bg-[#0a101b] p-3">
       <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-300">
-          Ensemble Distribution Fan (P10–P90) + Routine METAR
-        </span>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-300">
+            Ensemble Distribution Fan (P10–P90) + Routine METAR
+          </span>
+          <div
+            data-testid="ensemble-day-extremes"
+            className="flex items-center gap-1.5 text-[10px] font-mono-tabular"
+          >
+            <span className="inline-block whitespace-nowrap px-1.5 py-0.5 rounded bg-cyan-950/50 text-cyan-300 border border-cyan-800/60">
+              MIN {dayMinTemp !== null ? `${dayMinTemp.toFixed(1)}°${fan.unit}` : "—"}
+            </span>
+            <span className="inline-block whitespace-nowrap px-1.5 py-0.5 rounded bg-amber-950/50 text-amber-300 border border-amber-800/60">
+              MAX {dayMaxTemp !== null ? `${dayMaxTemp.toFixed(1)}°${fan.unit}` : "—"}
+            </span>
+          </div>
+        </div>
         <div className="flex items-center gap-3 text-[10px] font-mono-tabular text-slate-400">
           <span className="flex items-center gap-1">
             <span className="inline-block w-2.5 h-2 bg-sky-500/30 border border-sky-400/50 rounded-sm" />
@@ -76,6 +167,14 @@ export function EnsembleFanChart({ fan }: EnsembleFanChartProps) {
             <span className="inline-block w-2 h-2 rounded-full bg-emerald-400" />
             METAR
           </span>
+          <span className="flex items-center gap-1">
+            <span className="inline-flex items-center justify-center w-2 h-2.5">
+              <span className="inline-block w-0.5 h-2.5 bg-yellow-400 relative">
+                <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-yellow-400" />
+              </span>
+            </span>
+            NOW
+          </span>
         </div>
       </div>
 
@@ -86,6 +185,34 @@ export function EnsembleFanChart({ fan }: EnsembleFanChartProps) {
         role="img"
         aria-label="Ensemble distribution P10 P50 P90 fan chart with METAR points"
       >
+        {minorTicks.map((deg) => {
+          const y = yForVal(deg);
+          return (
+            <g key={`minor-${deg}`}>
+              <line
+                data-testid="ensemble-minor-degree-line"
+                x1={padL}
+                x2={width - padR}
+                y1={y}
+                y2={y}
+                stroke="#94a3b8"
+                strokeOpacity={0.09}
+                strokeWidth={0.75}
+                strokeDasharray="2 4"
+              />
+              <line
+                x1={padL - 3}
+                x2={padL}
+                y1={y}
+                y2={y}
+                stroke="#94a3b8"
+                strokeOpacity={0.22}
+                strokeWidth={0.75}
+              />
+            </g>
+          );
+        })}
+
         {yTicks.map((tick) => {
           const y = yForVal(tick);
           return (
@@ -131,9 +258,8 @@ export function EnsembleFanChart({ fan }: EnsembleFanChartProps) {
           );
         })}
 
-        {[0, Math.floor((n - 1) / 2), n - 1].map((idx) => {
-          const d = new Date(fan.timestamps[idx]);
-          const label = `${String(d.getUTCHours()).padStart(2, "0")}:00Z`;
+        {xTickIndices.map((idx) => {
+          const label = formatHhMmInZone(fan.timestamps[idx], tz);
           return (
             <text
               key={`${idx}-${label}`}
@@ -146,6 +272,71 @@ export function EnsembleFanChart({ fan }: EnsembleFanChartProps) {
             </text>
           );
         })}
+
+        <g data-testid="ensemble-now-indicator">
+          <line
+            x1={padL}
+            x2={xNow}
+            y1={yNow}
+            y2={yNow}
+            stroke="#facc15"
+            strokeWidth={0.85}
+            strokeOpacity={0.5}
+            strokeDasharray="2 3"
+          />
+          <line
+            x1={xNow}
+            x2={xNow}
+            y1={padT}
+            y2={height - padB}
+            stroke="#facc15"
+            strokeWidth={1}
+            strokeOpacity={0.85}
+          />
+          <circle
+            data-testid="ensemble-now-dot"
+            cx={xNow}
+            cy={yNow}
+            r={3.2}
+            fill="#facc15"
+            stroke="#070b12"
+            strokeWidth={1.2}
+          />
+          <rect
+            x={2}
+            y={yNow - 6.5}
+            width={padL - 5}
+            height={13}
+            rx={2}
+            fill="#0a101b"
+          />
+          <text
+            data-testid="ensemble-now-temp-label"
+            x={padL - 6}
+            y={yNow + 3}
+            textAnchor="end"
+            className="fill-yellow-400 text-[10px] font-semibold font-mono-tabular"
+          >
+            {currentTempLabel}
+          </text>
+          <rect
+            x={timeLabelX - 17}
+            y={height - 16}
+            width={34}
+            height={13}
+            rx={2}
+            fill="#0a101b"
+          />
+          <text
+            data-testid="ensemble-now-time-label"
+            x={timeLabelX}
+            y={height - 6}
+            textAnchor="middle"
+            className="fill-yellow-400 text-[10px] font-semibold font-mono-tabular"
+          >
+            {currentTimeLabel}
+          </text>
+        </g>
       </svg>
     </div>
   );

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Any
 
@@ -58,7 +59,7 @@ class StationRadarService:
         db: Database,
         world_feed: WorldFeedPort,
         clock: Clock | None = None,
-        poll_interval_seconds: int = 600,
+        poll_interval_seconds: int = 60,
     ) -> None:
         self.db = db
         self.world_feed = world_feed
@@ -69,6 +70,7 @@ class StationRadarService:
         self._ws_clients: set[WebSocket] = set()
         self._poll_task: asyncio.Task[None] | None = None
         self._sync_lock = asyncio.Lock()
+        self._last_live_tick_mono: float = 0.0
 
     async def sync_once(self) -> RadarStateResponse:
         """Fetch Weather Events and Routine METARs once, persist, and broadcast."""
@@ -153,6 +155,27 @@ class StationRadarService:
         frame: dict[str, Any] = {
             "type": "state_snapshot",
             "payload": state.model_dump(mode="json"),
+        }
+        stale: list[WebSocket] = []
+        for ws in list(self._ws_clients):
+            try:
+                await ws.send_json(frame)
+            except Exception:
+                stale.append(ws)
+        for ws in stale:
+            self._ws_clients.discard(ws)
+
+    async def broadcast_live_tick(self, min_interval_seconds: float = 2.0) -> None:
+        """Broadcast a throttled live_tick signal when CLOB orderbooks update."""
+        if not self._ws_clients:
+            return
+        now_mono = time.monotonic()
+        if now_mono - self._last_live_tick_mono < min_interval_seconds:
+            return
+        self._last_live_tick_mono = now_mono
+        frame: dict[str, Any] = {
+            "type": "live_tick",
+            "server_time_utc": self.clock.now().isoformat(),
         }
         stale: list[WebSocket] = []
         for ws in list(self._ws_clients):

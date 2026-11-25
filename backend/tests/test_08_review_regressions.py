@@ -89,18 +89,28 @@ def test_build_ensemble_fan_converts_celsius_to_fahrenheit_for_f_events() -> Non
     metars = [
         MetarObservation(
             station_icao="KLGA",
+            raw_report="METAR KLGA 252351Z 00000KT 10SM CLR 14/04 A3010",
+            observed_at_utc=datetime(2026, 11, 25, 23, 51, tzinfo=timezone.utc),  # 18:51 EST Nov 25 (prior day)
+            ingested_at_utc=datetime(2026, 11, 25, 23, 52, tzinfo=timezone.utc),
+            temp_c=14.0,
+            whole_temp_c=14,
+            is_routine=True,
+        ),
+        MetarObservation(
+            station_icao="KLGA",
             raw_report="METAR KLGA 261151Z 00000KT 10SM CLR 10/04 A3010",
             observed_at_utc=datetime(2026, 11, 26, 11, 51, tzinfo=timezone.utc),
             ingested_at_utc=datetime(2026, 11, 26, 11, 52, tzinfo=timezone.utc),
             temp_c=10.0,
             whole_temp_c=10,
             is_routine=True,
-        )
+        ),
     ]
 
     fan = _build_ensemble_fan(event, ensemble, metars)
     assert fan.unit == "F"
     assert fan.p50 == [pytest.approx(50.0)]
+    assert len(fan.metar_points) == 1
     assert fan.metar_points[0].temp_c == pytest.approx(50.0)
 
 
@@ -373,3 +383,93 @@ async def test_autonomous_runtime_executes_full_24_7_pipeline_cycle(tmp_path: Pa
         assert health.kinds["metar"].row_count >= 1
         assert health.kinds["orderbook"].row_count >= 2
         assert health.kinds["ensemble"].row_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_clob_stream_subscribes_dynamically_when_events_registered_after_connect() -> None:
+    import asyncio
+    import json
+    from weather_quant.clob.orderbook_ws import ClobOrderBookStream
+    from weather_quant.domain.models import Bucket, Station
+
+    sent_frames: list[str] = []
+    recv_gate = asyncio.Event()
+
+    class _DynamicWs:
+        async def send(self, message: str) -> None:
+            sent_frames.append(message)
+
+        async def recv(self) -> str:
+            await recv_gate.wait()
+            return json.dumps(
+                {
+                    "event_type": "book",
+                    "asset_id": "tok-dyn-0",
+                    "bids": [{"price": "0.41", "size": "25"}],
+                    "asks": [{"price": "0.45", "size": "25"}],
+                }
+            )
+
+        async def close(self) -> None:
+            return None
+
+    ws = _DynamicWs()
+    stream = ClobOrderBookStream(
+        ws_factory=lambda _url: ws,
+        clock=VirtualClock(datetime(2026, 11, 26, 9, 0, tzinfo=timezone.utc)),
+        ping_interval_seconds=60.0,
+    )
+    stream.start()
+    try:
+        # Allow session to open with zero tokens registered initially
+        await asyncio.sleep(0.05)
+        assert sent_frames == []
+
+        event = WeatherEvent(
+            event_id="evt-dyn-1",
+            slug="highest-temp-paris-dyn",
+            title="Highest temperature in Paris on 2026-11-26?",
+            url="https://polymarket.com/event/highest-temp-paris-dyn",
+            station=Station(
+                icao="LFPB",
+                name="Paris-Le Bourget Airport",
+                city="Paris",
+                country="FR",
+                lat=48.97,
+                lon=2.44,
+                elevation_m=67.0,
+                timezone="Europe/Paris",
+            ),
+            local_date=date(2026, 11, 26),
+            polarity=Polarity.HIGHEST,
+            remark_tenths_enabled=True,
+            unit="C",
+            buckets=[
+                Bucket(
+                    bucket_id="evt-dyn-1-b0",
+                    market_id="m0",
+                    token_id="tok-dyn-0",
+                    label="10°C",
+                    lower_bound=10.0,
+                    upper_bound=10.0,
+                    outcome_index=0,
+                )
+            ],
+            discovered_at_utc=datetime(2026, 11, 25, 18, 0, tzinfo=timezone.utc),
+        )
+        stream.register_event(event)
+        await asyncio.sleep(0.05)
+
+        assert any(
+            json.loads(frame).get("assets_ids") == ["tok-dyn-0"]
+            for frame in sent_frames
+            if frame != "PING"
+        )
+
+        recv_gate.set()
+        await asyncio.sleep(0.05)
+        snap = stream.get_snapshot("tok-dyn-0")
+        assert snap is not None
+        assert snap.best_bid == pytest.approx(0.41)
+    finally:
+        await stream.stop()

@@ -81,21 +81,25 @@ $BackendLog = Join-Path $LogsDir "backend.log"
 $FrontendLog = Join-Path $LogsDir "frontend.log"
 
 $BackendCmd = @"
+`$ErrorActionPreference = 'Continue'
 `$Host.UI.RawUI.WindowTitle = 'WeatherQuant Backend (FastAPI :8000)'
 Set-Location '$RepoRoot'
 `$env:PYTHONPATH = '$($env:PYTHONPATH)'
-& '$VenvPython' -m uvicorn weather_quant.api.app:app --host 127.0.0.1 --port 8000 2>&1 | Tee-Object -FilePath '$BackendLog' -Append
+& '$VenvPython' -m uvicorn weather_quant.api.app:app --host 127.0.0.1 --port 8000 2>&1 | ForEach-Object { "`$_" } | Tee-Object -FilePath '$BackendLog' -Append
 "@
-Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $BackendCmd) | Out-Null
+$BackendEncoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($BackendCmd))
+Start-Process -FilePath "cmd.exe" -WindowStyle Hidden -ArgumentList @("/c", "start", '""', "/min", "powershell.exe", "-WindowStyle", "Minimized", "-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $BackendEncoded) | Out-Null
 
 # 6. Launch Next.js Pro Terminal in a labelled PowerShell window
 $FrontendCmd = @"
+`$ErrorActionPreference = 'Continue'
 `$Host.UI.RawUI.WindowTitle = 'WeatherQuant Terminal (Next.js :3000)'
 Set-Location '$FrontendDir'
 `$env:NEXT_PUBLIC_API_BASE_URL = '$($env:NEXT_PUBLIC_API_BASE_URL)'
-npm run dev 2>&1 | Tee-Object -FilePath '$FrontendLog' -Append
+npm run dev 2>&1 | ForEach-Object { "`$_" } | Tee-Object -FilePath '$FrontendLog' -Append
 "@
-Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $FrontendCmd) | Out-Null
+$FrontendEncoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($FrontendCmd))
+Start-Process -FilePath "cmd.exe" -WindowStyle Hidden -ArgumentList @("/c", "start", '""', "/min", "powershell.exe", "-WindowStyle", "Minimized", "-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", $FrontendEncoded) | Out-Null
 
 # 7. Wait briefly for /api/health
 $HealthUrl = "http://127.0.0.1:8000/api/health"

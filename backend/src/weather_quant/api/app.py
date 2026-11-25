@@ -35,7 +35,7 @@ def create_app(
     world_feed: WorldFeedPort | None = None,
     clock: Clock | None = None,
     enable_background_poll: bool = True,
-    poll_interval_seconds: int = 600,
+    poll_interval_seconds: int = 60,
     archive_dir: str | None = None,
 ) -> FastAPI:
     """Create configured FastAPI app with versioned DB, CORS, WS stream, and routers."""
@@ -88,7 +88,10 @@ def create_app(
     fastapi_app.state.radar_service = radar_service
     if resolved_db_path != ":memory:":
         fastapi_app.state.parquet_archive = ParquetArchiveStore(base_dir=resolved_archive_dir)
-    fastapi_app.state.clob_stream = ClobOrderBookStream(clock=app_clock)
+    fastapi_app.state.clob_stream = ClobOrderBookStream(
+        clock=app_clock,
+        on_snapshot=lambda _snap: radar_service.broadcast_live_tick(2.0),
+    )
     fastapi_app.state.autonomous_runtime = AutonomousRuntime(fastapi_app)
 
     fastapi_app.add_middleware(

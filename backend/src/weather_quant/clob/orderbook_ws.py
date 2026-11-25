@@ -166,6 +166,8 @@ class ClobOrderBookStream:
         self._token_meta: dict[str, tuple[str, str]] = {}
         self._events: dict[str, WeatherEvent] = {}
         self._books: dict[str, _BookState] = {}
+        self._subscribed_tokens: set[str] = set()
+        self._subscription_changed = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self.reconnect_count: int = 0
@@ -174,8 +176,13 @@ class ClobOrderBookStream:
     def register_event(self, event: WeatherEvent) -> None:
         """Register all Bucket token IDs belonging to a Weather Event."""
         self._events[event.event_id] = event
+        has_new = False
         for bucket in event.buckets:
             self._token_meta[bucket.token_id] = (event.event_id, bucket.bucket_id)
+            if bucket.token_id not in self._subscribed_tokens:
+                has_new = True
+        if has_new:
+            self._subscription_changed.set()
 
     def register_events(self, events: list[WeatherEvent]) -> None:
         for event in events:
@@ -492,10 +499,12 @@ class ClobOrderBookStream:
         return snapshots
 
     async def _send_subscribe(self, ws: WsConnection) -> None:
+        self._subscription_changed.clear()
         token_ids = self.active_token_ids()
         if not token_ids:
             return
         await ws.send(json.dumps({"assets_ids": token_ids, "type": "market"}))
+        self._subscribed_tokens = set(token_ids)
 
     async def _ping_loop(self, ws: WsConnection, session_done: asyncio.Event) -> None:
         while not session_done.is_set() and not self._stop_event.is_set():
@@ -511,27 +520,47 @@ class ClobOrderBookStream:
                 await ws.send("PING")
 
     async def _consume_ws(self, ws: WsConnection) -> None:
+        self._subscribed_tokens.clear()
         await self._send_subscribe(ws)
         session_done = asyncio.Event()
         ping_task = asyncio.create_task(self._ping_loop(ws, session_done))
         try:
             while not self._stop_event.is_set():
                 recv_task = asyncio.create_task(ws.recv())
+                sub_task = asyncio.create_task(self._subscription_changed.wait())
                 done, _ = await asyncio.wait(
-                    {recv_task, ping_task},
+                    {recv_task, ping_task, sub_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if ping_task in done:
-                    recv_task.cancel()
-                    try:
-                        await recv_task
-                    except BaseException:
-                        pass
+                    for pending in (recv_task, sub_task):
+                        if not pending.done():
+                            pending.cancel()
+                        try:
+                            await pending
+                        except BaseException:
+                            pass
                     # Propagate ping error if ping failed
                     ping_task.result()
                     break
-                raw_msg = recv_task.result()
-                await self.process_raw_message(raw_msg)
+                if recv_task in done:
+                    if not sub_task.done():
+                        sub_task.cancel()
+                    try:
+                        await sub_task
+                    except BaseException:
+                        pass
+                    raw_msg = recv_task.result()
+                    await self.process_raw_message(raw_msg)
+                if sub_task in done:
+                    if not recv_task.done():
+                        recv_task.cancel()
+                        try:
+                            await recv_task
+                        except BaseException:
+                            pass
+                    if not self._stop_event.is_set():
+                        await self._send_subscribe(ws)
         finally:
             session_done.set()
             if not ping_task.done():

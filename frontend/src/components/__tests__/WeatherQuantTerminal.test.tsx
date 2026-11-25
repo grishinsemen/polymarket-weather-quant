@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { WeatherQuantTerminal } from "../WeatherQuantTerminal";
 import type {
@@ -267,7 +267,20 @@ const FIXTURE_SNAPSHOT: TerminalSnapshotResponse = {
         active: true,
         discovered_at_utc: "2026-11-25T16:00:00Z",
       },
-      latest_metar: null,
+      latest_metar: {
+        station_icao: "RKSI",
+        raw_report: "METAR RKSI 251800Z 32010KT 9999 SCT040 10/03 Q1020 RMK T01030030",
+        observed_at_utc: "2026-11-25T18:00:00Z",
+        ingested_at_utc: "2026-11-25T18:05:00Z",
+        temp_c: 10.3,
+        whole_temp_c: 10,
+        remark_tenths_c: 10.3,
+        has_remark_tenths: true,
+        wind_dir_deg: 320,
+        wind_speed_kt: 10,
+        cloud_cover_oktas: 3,
+        is_routine: true,
+      },
       model_version: "ensemble-3layer-v1",
       model_badge: "3-Layer",
       city_exposure_usd: 5.66,
@@ -282,6 +295,12 @@ const FIXTURE_SNAPSHOT: TerminalSnapshotResponse = {
         p50: [8.4, 11.1, 10.2],
         p90: [9.8, 12.6, 11.5],
         metar_points: [
+          {
+            observed_at_utc: "2026-11-26T01:00:00Z",
+            temp_c: 8.6,
+            raw_report: "METAR RKSI ...",
+            has_remark_tenths: true,
+          },
           {
             observed_at_utc: "2026-11-26T03:00:00Z",
             temp_c: 10.3,
@@ -435,9 +454,84 @@ describe("WeatherQuantTerminal", () => {
     expect(within(screenerRows[0]).getByText("LFPB")).toBeInTheDocument();
     expect(within(screenerRows[1]).getByText("RKSI")).toBeInTheDocument();
 
+    // Model badges keep single-line pill styling without wrapping mid-badge
+    for (const badge of screen.getAllByTestId("screener-model-badge")) {
+      expect(badge).toHaveClass("whitespace-nowrap", "inline-block");
+    }
+
+    // Routine METAR time is displayed in Moscow time (18:00Z -> 21:00) without Z suffix
+    expect(within(screenerRows[0]).getByText("21:00")).toBeInTheDocument();
+    expect(within(screenerRows[0]).queryByText(/Z$/)).not.toBeInTheDocument();
+
+    // Ensemble Fan Chart renders local station times without Z, interior degree guides, and yellow NOW indicator
+    const fanSvg = screen.getByTestId("ensemble-fan-svg");
+    expect(within(fanSvg).getByText("09:00")).toBeInTheDocument();
+    expect(within(fanSvg).getByText("15:00")).toBeInTheDocument();
+    expect(within(fanSvg).getByText("21:00")).toBeInTheDocument();
+    expect(within(fanSvg).queryByText(/00Z$/)).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("ensemble-minor-degree-line").length).toBeGreaterThan(0);
+    expect(screen.getByTestId("ensemble-now-indicator")).toBeInTheDocument();
+    expect(screen.getByTestId("ensemble-now-dot")).toBeInTheDocument();
+    expect(screen.getByTestId("ensemble-now-time-label")).toHaveTextContent("04:00");
+    expect(screen.getByTestId("ensemble-now-temp-label")).toHaveTextContent("10.3°C");
+    const dayExtremes = screen.getByTestId("ensemble-day-extremes");
+    expect(dayExtremes).toHaveTextContent("MIN 8.6°C");
+    expect(dayExtremes).toHaveTextContent("MAX 10.3°C");
+
+    // Unified Resting Maker Orders & Open Positions panel shows orders & positions across ALL cities with short badges
+    const unifiedPanel = screen.getByTestId("unified-orders-positions-panel");
+    expect(within(unifiedPanel).getByText(/\(4\)/)).toBeInTheDocument();
+    expect(within(unifiedPanel).getAllByText(/RKSI/)).toHaveLength(2);
+    expect(within(unifiedPanel).getAllByText(/LFPB/)).toHaveLength(2);
+    expect(within(unifiedPanel).getAllByTestId("order-phase-badge")[0]).toHaveTextContent("PREMARKET");
+    expect(within(unifiedPanel).queryByText(/PREMARKET_ENTRY/)).not.toBeInTheDocument();
+
+    // METAR header shows elapsed minutes in parentheses
+    expect(screen.getByTestId("xray-metar-line")).toHaveTextContent("(60 мин назад)");
+
     // Clicking LFPB row invokes onSelectEvent("evt-lfpb")
     fireEvent.click(screenerRows[0]);
     expect(onSelectEvent).toHaveBeenCalledWith("evt-lfpb");
+  });
+
+  it("ticks countdown, METAR elapsed minutes, and chart current time live every second without page refresh", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-25T19:00:00Z"));
+    try {
+      render(
+        <WeatherQuantTerminal
+          snapshot={FIXTURE_SNAPSHOT}
+          wsStatus="connected"
+          selectedEventId="evt-rksi"
+          activeTab="terminal"
+          selectedModelVersion="ensemble-3layer-v1"
+          selectedStrategyVersion="conservative-kelly-100-v1"
+          onSelectEvent={vi.fn()}
+          onSelectTab={vi.fn()}
+          onFilterModelVersion={vi.fn()}
+          onFilterStrategyVersion={vi.fn()}
+          onTogglePause={vi.fn(async () => {})}
+          onSync={vi.fn(async () => {})}
+          onSeedDemo={vi.fn(async () => {})}
+          onRunReplay={vi.fn(async () => {})}
+          onPromoteRun={vi.fn(async () => {})}
+        />,
+      );
+
+      expect(screen.getByTestId("screener-countdown-RKSI")).toHaveTextContent("20h 00m");
+      expect(screen.getByTestId("xray-metar-line")).toHaveTextContent("(60 мин назад)");
+      expect(screen.getByTestId("ensemble-now-time-label")).toHaveTextContent("04:00");
+
+      act(() => {
+        vi.advanceTimersByTime(60_000);
+      });
+
+      expect(screen.getByTestId("screener-countdown-RKSI")).toHaveTextContent("19h 59m");
+      expect(screen.getByTestId("xray-metar-line")).toHaveTextContent("(61 мин назад)");
+      expect(screen.getByTestId("ensemble-now-time-label")).toHaveTextContent("04:01");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("supports version filtering and Experiment Lab replay triggering and promotion", () => {

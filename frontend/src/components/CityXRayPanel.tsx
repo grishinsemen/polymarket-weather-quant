@@ -1,11 +1,110 @@
 "use client";
 
 import React from "react";
+import { formatMetarMinutesAgo } from "@/lib/time";
 import { EnsembleFanChart } from "./EnsembleFanChart";
-import type { CityXRay } from "@/types/terminal";
+import type { CityXRay, MakerOrder, PositionRecord } from "@/types/terminal";
 
 interface CityXRayPanelProps {
   xray: CityXRay | null;
+  allXrays?: Record<string, CityXRay>;
+  screenerOrder?: string[];
+  serverTimeUtc?: string;
+  nowMs?: number;
+  onSelectEvent?: (eventId: string) => void;
+}
+
+interface UnifiedOrderItem {
+  order: MakerOrder;
+  stationIcao: string;
+  city: string;
+  eventId: string;
+  bucketLabel: string;
+}
+
+interface UnifiedPositionItem {
+  position: PositionRecord;
+  stationIcao: string;
+  city: string;
+  eventId: string;
+}
+
+function collectPortfolioOrdersAndPositions(
+  activeXray: CityXRay,
+  allXrays?: Record<string, CityXRay>,
+  screenerOrder?: string[],
+): { orders: UnifiedOrderItem[]; positions: UnifiedPositionItem[] } {
+  const source =
+    allXrays && Object.keys(allXrays).length > 0
+      ? allXrays
+      : { [activeXray.event.event_id]: activeXray };
+
+  const orderedIds =
+    screenerOrder && screenerOrder.length > 0
+      ? [
+          ...screenerOrder.filter((id) => Boolean(source[id])),
+          ...Object.keys(source).filter((id) => !screenerOrder.includes(id)),
+        ]
+      : Object.keys(source);
+
+  const seenOrderIds = new Set<string>();
+  const seenPositionIds = new Set<string>();
+  const orders: UnifiedOrderItem[] = [];
+  const positions: UnifiedPositionItem[] = [];
+
+  for (const eid of orderedIds) {
+    const cityXray = source[eid];
+    if (!cityXray) continue;
+    const stationIcao = cityXray.event.station.icao;
+    const city = cityXray.event.station.city;
+    const bucketLabelMap = new Map(cityXray.buckets.map((b) => [b.bucket_id, b.label]));
+
+    for (const o of cityXray.orders) {
+      if ((o.status === "OPEN" || o.status === "PARTIAL") && !seenOrderIds.has(o.order_id)) {
+        seenOrderIds.add(o.order_id);
+        orders.push({
+          order: o,
+          stationIcao,
+          city,
+          eventId: eid,
+          bucketLabel: bucketLabelMap.get(o.bucket_id) ?? o.bucket_id,
+        });
+      }
+    }
+
+    for (const b of cityXray.buckets) {
+      if (
+        b.resting_order &&
+        (b.resting_order.status === "OPEN" || b.resting_order.status === "PARTIAL") &&
+        !seenOrderIds.has(b.resting_order.order_id)
+      ) {
+        seenOrderIds.add(b.resting_order.order_id);
+        orders.push({
+          order: b.resting_order,
+          stationIcao,
+          city,
+          eventId: eid,
+          bucketLabel: b.label,
+        });
+      }
+
+      if (
+        b.open_position &&
+        b.open_position.status === "OPEN" &&
+        !seenPositionIds.has(b.open_position.position_id)
+      ) {
+        seenPositionIds.add(b.open_position.position_id);
+        positions.push({
+          position: b.open_position,
+          stationIcao,
+          city,
+          eventId: eid,
+        });
+      }
+    }
+  }
+
+  return { orders, positions };
 }
 
 function fmtPct(prob: number): string {
@@ -16,7 +115,14 @@ function fmtPrice(val: number | null): string {
   return val === null ? "—" : `${(val * 100).toFixed(0)}¢`;
 }
 
-export function CityXRayPanel({ xray }: CityXRayPanelProps) {
+export function CityXRayPanel({
+  xray,
+  allXrays,
+  screenerOrder,
+  serverTimeUtc,
+  nowMs,
+  onSelectEvent,
+}: CityXRayPanelProps) {
   if (!xray) {
     return (
       <section className="rounded-lg border border-[#1c2638] bg-[#0d131f] p-8 text-center text-xs text-slate-500">
@@ -25,16 +131,23 @@ export function CityXRayPanel({ xray }: CityXRayPanelProps) {
     );
   }
 
+  const effectiveNowMs =
+    nowMs ?? (serverTimeUtc ? new Date(serverTimeUtc).getTime() : Date.now());
+
   const maxDepth = Math.max(
     1,
     ...xray.buckets.map((b) => Math.max(b.bid_depth_usd, b.ask_depth_usd)),
   );
   const maxProb = Math.max(0.05, ...xray.buckets.map((b) => b.fair_probability));
 
-  const restingOrders = xray.orders.filter((o) => o.status === "OPEN" || o.status === "PARTIAL");
-  const openPositions = xray.buckets
-    .map((b) => b.open_position)
-    .filter((p): p is NonNullable<typeof p> => p !== null);
+  const { orders: unifiedOrders, positions: unifiedPositions } =
+    collectPortfolioOrdersAndPositions(xray, allXrays, screenerOrder);
+
+  const latestMetarTempInUnit = xray.latest_metar
+    ? xray.event.unit === "F"
+      ? (xray.latest_metar.temp_c * 9) / 5 + 32
+      : xray.latest_metar.temp_c
+    : null;
 
   return (
     <section
@@ -49,7 +162,7 @@ export function CityXRayPanel({ xray }: CityXRayPanelProps) {
             </span>
             <h2 className="text-sm font-semibold text-slate-100">{xray.event.title}</h2>
             <span
-              className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
+              className={`inline-block whitespace-nowrap text-[10px] font-semibold px-1.5 py-0.5 rounded border ${
                 xray.model_badge === "MOS ML"
                   ? "bg-violet-950/60 text-violet-300 border-violet-700/60"
                   : "bg-slate-800 text-slate-300 border-slate-700"
@@ -64,8 +177,14 @@ export function CityXRayPanel({ xray }: CityXRayPanelProps) {
             {xray.city_exposure_usd.toFixed(2)}
           </div>
           {xray.latest_metar && (
-            <div className="text-[10px] font-mono-tabular text-emerald-400/90 mt-1">
-              {xray.latest_metar.raw_report}
+            <div
+              data-testid="xray-metar-line"
+              className="text-[10px] font-mono-tabular text-emerald-400/90 mt-1"
+            >
+              {xray.latest_metar.raw_report}{" "}
+              <span className="text-slate-400">
+                {formatMetarMinutesAgo(xray.latest_metar.observed_at_utc, effectiveNowMs)}
+              </span>
             </div>
           )}
         </div>
@@ -124,7 +243,7 @@ export function CityXRayPanel({ xray }: CityXRayPanelProps) {
                     </div>
                   </td>
 
-                  <td className="px-2.5 py-1.5 text-right font-mono-tabular">
+                  <td className="px-2.5 py-1.5 text-right font-mono-tabular whitespace-nowrap">
                     <span className="text-emerald-400">{fmtPrice(b.best_bid)}</span>
                     <span className="text-slate-600 mx-1">/</span>
                     <span className="text-rose-400">{fmtPrice(b.best_ask)}</span>
@@ -153,7 +272,7 @@ export function CityXRayPanel({ xray }: CityXRayPanelProps) {
                     </div>
                   </td>
 
-                  <td className="px-2.5 py-1.5 text-right font-mono-tabular">
+                  <td className="px-2.5 py-1.5 text-right font-mono-tabular whitespace-nowrap">
                     <span
                       className={
                         b.net_edge >= 0.05 ? "text-emerald-400 font-semibold" : "text-slate-400"
@@ -163,20 +282,20 @@ export function CityXRayPanel({ xray }: CityXRayPanelProps) {
                     </span>
                   </td>
 
-                  <td className="px-2.5 py-1.5 text-right">
+                  <td className="px-2.5 py-1.5 text-right whitespace-nowrap">
                     <div className="inline-flex items-center gap-1 font-mono-tabular text-[10px]">
                       {b.is_impossible && (
-                        <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
+                        <span className="inline-block whitespace-nowrap px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 border border-slate-700">
                           ZEROED
                         </span>
                       )}
                       {b.resting_order && (
-                        <span className="px-1.5 py-0.5 rounded bg-sky-950/80 text-sky-300 border border-sky-700">
+                        <span className="inline-block whitespace-nowrap px-1.5 py-0.5 rounded bg-sky-950/80 text-sky-300 border border-sky-700">
                           {b.resting_order.side} {fmtPrice(b.resting_order.limit_price)}
                         </span>
                       )}
                       {b.open_position && (
-                        <span className="px-1.5 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-700">
+                        <span className="inline-block whitespace-nowrap px-1.5 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-700">
                           POS {b.open_position.shares.toFixed(0)}sh
                         </span>
                       )}
@@ -189,47 +308,85 @@ export function CityXRayPanel({ xray }: CityXRayPanelProps) {
         </table>
       </div>
 
-      <EnsembleFanChart fan={xray.ensemble_fan} />
+      <EnsembleFanChart
+        fan={xray.ensemble_fan}
+        stationTimezone={xray.event.station.timezone}
+        serverTimeUtc={serverTimeUtc}
+        nowMs={effectiveNowMs}
+        latestMetarTempInUnit={latestMetarTempInUnit}
+      />
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <div className="rounded border border-[#1c2638] bg-[#0a101b] p-3">
+        <div
+          data-testid="unified-orders-positions-panel"
+          className="rounded border border-[#1c2638] bg-[#0a101b] p-3"
+        >
           <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-300 mb-2">
-            Resting Maker Orders & Open Positions
+            Resting Maker Orders & Open Positions ({unifiedOrders.length + unifiedPositions.length})
           </h3>
-          {restingOrders.length === 0 && openPositions.length === 0 ? (
+          {unifiedOrders.length === 0 && unifiedPositions.length === 0 ? (
             <p className="text-xs text-slate-500">No resting orders or open positions for this filter.</p>
           ) : (
-            <div className="space-y-1.5 text-xs font-mono-tabular">
-              {restingOrders.map((o) => (
-                <div
-                  key={o.order_id}
-                  className="flex items-center justify-between px-2 py-1.5 rounded bg-[#0f1726] border border-[#1c2638]"
-                >
-                  <span className="text-sky-300">
-                    ORDER {o.side} {o.size_shares}sh @ {fmtPrice(o.limit_price)}
-                  </span>
-                  <span className="text-slate-400">
-                    ${o.size_usd.toFixed(2)} • {o.phase}
-                  </span>
-                </div>
-              ))}
-              {openPositions.map((p) => (
-                <div
-                  key={p.position_id}
-                  className="flex items-center justify-between px-2 py-1.5 rounded bg-[#0f1726] border border-[#1c2638]"
-                >
-                  <span className="text-emerald-300">
-                    POS {p.bucket_label} ({p.shares.toFixed(1)}sh @ {fmtPrice(p.avg_entry_price)})
-                  </span>
-                  <span
-                    className={
-                      p.unrealized_pnl_usd >= 0 ? "text-emerald-400" : "text-rose-400"
-                    }
+            <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1 text-xs font-mono-tabular">
+              {unifiedOrders.map(({ order: o, stationIcao, city, eventId, bucketLabel }) => {
+                const isSelectedCity = eventId === xray.event.event_id;
+                const phaseLabel = o.phase === "INTRADAY_REPRICING" ? "INTRADAY" : "PREMARKET";
+                return (
+                  <button
+                    key={o.order_id}
+                    type="button"
+                    onClick={() => onSelectEvent?.(eventId)}
+                    className={`w-full text-left flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-2 py-1.5 rounded bg-[#0f1726] border transition-colors ${
+                      isSelectedCity
+                        ? "border-sky-700/70 bg-[#121e33]"
+                        : "border-[#1c2638] hover:border-slate-600"
+                    }`}
                   >
-                    uPnL {p.unrealized_pnl_usd >= 0 ? "+" : ""}${p.unrealized_pnl_usd.toFixed(2)}
-                  </span>
-                </div>
-              ))}
+                    <span className="text-sky-300">
+                      <span className="font-semibold">{stationIcao}</span>{" "}
+                      <span className="text-slate-400">{city}</span> • {bucketLabel} • ORDER{" "}
+                      {o.side} {Number(o.size_shares.toFixed(2))}sh @ {fmtPrice(o.limit_price)}
+                    </span>
+                    <span className="flex items-center gap-1.5 text-slate-400 shrink-0">
+                      <span>${o.size_usd.toFixed(2)}</span>
+                      <span
+                        data-testid="order-phase-badge"
+                        className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700"
+                      >
+                        {phaseLabel}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
+              {unifiedPositions.map(({ position: p, stationIcao, city, eventId }) => {
+                const isSelectedCity = eventId === xray.event.event_id;
+                return (
+                  <button
+                    key={p.position_id}
+                    type="button"
+                    onClick={() => onSelectEvent?.(eventId)}
+                    className={`w-full text-left flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-2 py-1.5 rounded bg-[#0f1726] border transition-colors ${
+                      isSelectedCity
+                        ? "border-emerald-700/70 bg-[#0f1f24]"
+                        : "border-[#1c2638] hover:border-slate-600"
+                    }`}
+                  >
+                    <span className="text-emerald-300">
+                      <span className="font-semibold">{stationIcao}</span>{" "}
+                      <span className="text-slate-400">{city}</span> • POS {p.bucket_label} (
+                      {p.shares.toFixed(1)}sh @ {fmtPrice(p.avg_entry_price)})
+                    </span>
+                    <span
+                      className={`shrink-0 ${
+                        p.unrealized_pnl_usd >= 0 ? "text-emerald-400" : "text-rose-400"
+                      }`}
+                    >
+                      uPnL {p.unrealized_pnl_usd >= 0 ? "+" : ""}${p.unrealized_pnl_usd.toFixed(2)}
+                    </span>
+                  </button>
+                );
+              })}
             </div>
           )}
         </div>

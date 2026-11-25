@@ -303,6 +303,11 @@ def _build_ensemble_fan(
     ensemble: EnsembleSnapshot | None,
     metars: list[MetarObservation],
 ) -> EnsembleFanSeries:
+    try:
+        tz: Any = ZoneInfo(event.station.timezone)
+    except ZoneInfoNotFoundError:
+        tz = timezone.utc
+
     points = [
         MetarChartPoint(
             observed_at_utc=_ensure_utc(m.observed_at_utc),
@@ -311,15 +316,10 @@ def _build_ensemble_fan(
             has_remark_tenths=m.has_remark_tenths,
         )
         for m in sorted(metars, key=lambda x: _ensure_utc(x.observed_at_utc))
-        if m.is_routine
+        if m.is_routine and _ensure_utc(m.observed_at_utc).astimezone(tz).date() == event.local_date
     ]
     if ensemble is None or not ensemble.hourly_timestamps_utc or not ensemble.member_temps_c:
         return EnsembleFanSeries(metar_points=points, unit=event.unit)
-
-    try:
-        tz: Any = ZoneInfo(event.station.timezone)
-    except ZoneInfoNotFoundError:
-        tz = timezone.utc
 
     indices = [
         i

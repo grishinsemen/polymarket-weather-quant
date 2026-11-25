@@ -256,7 +256,7 @@ class AutonomousRuntime:
                 "fills_count": fills_count,
             }
 
-    def start(self, interval_seconds: int = 600) -> None:
+    def start(self, interval_seconds: int = 60) -> None:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._loop(interval_seconds))
 

@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { CityXRayPanel } from "./CityXRayPanel";
 import { EdgeScreenerTable } from "./EdgeScreenerTable";
 import { ExperimentLabPanel } from "./ExperimentLabPanel";
@@ -52,6 +52,20 @@ export function WeatherQuantTerminal({
   onRunReplay,
   onPromoteRun,
 }: WeatherQuantTerminalProps) {
+  const [nowMs, setNowMs] = useState<number>(() =>
+    new Date(snapshot.server_time_utc).getTime(),
+  );
+
+  useEffect(() => {
+    const baseMs = new Date(snapshot.server_time_utc).getTime();
+    const mountWallMs = Date.now();
+    setNowMs(baseMs);
+    const interval = setInterval(() => {
+      setNowMs(baseMs + (Date.now() - mountWallMs));
+    }, 1_000);
+    return () => clearInterval(interval);
+  }, [snapshot.server_time_utc]);
+
   const effectiveEventId =
     selectedEventId && snapshot.xrays[selectedEventId]
       ? selectedEventId
@@ -92,6 +106,7 @@ export function WeatherQuantTerminal({
               <EdgeScreenerTable
                 rows={snapshot.screener}
                 selectedEventId={effectiveEventId}
+                nowMs={nowMs}
                 onSelectEvent={onSelectEvent}
               />
 
@@ -120,7 +135,14 @@ export function WeatherQuantTerminal({
             </div>
 
             <div className="xl:col-span-7">
-              <CityXRayPanel xray={activeXRay} />
+              <CityXRayPanel
+                xray={activeXRay}
+                allXrays={snapshot.xrays}
+                screenerOrder={snapshot.screener.map((r) => r.event_id)}
+                serverTimeUtc={snapshot.server_time_utc}
+                nowMs={nowMs}
+                onSelectEvent={onSelectEvent}
+              />
             </div>
           </div>
         ) : (

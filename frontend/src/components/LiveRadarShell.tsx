@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { TerminalTab, WsStatus } from "@/components/TopPortfolioBar";
 import { WeatherQuantTerminal } from "@/components/WeatherQuantTerminal";
 import type { ExperimentRunSummary, TerminalSnapshotResponse } from "@/types/terminal";
@@ -52,8 +52,22 @@ export function LiveRadarShell() {
   const [promotingRunId, setPromotingRunId] = useState<string | null>(null);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
+  const versionsRef = useRef({
+    mv: selectedModelVersion,
+    sv: selectedStrategyVersion,
+  });
+  versionsRef.current = { mv: selectedModelVersion, sv: selectedStrategyVersion };
+  const initializedRef = useRef(false);
+  const bgInFlightRef = useRef(false);
+
   const fetchSnapshot = useCallback(
-    async (mv?: string, sv?: string) => {
+    async (mv?: string, sv?: string, isBackground = false) => {
+      if (isBackground && bgInFlightRef.current) {
+        return;
+      }
+      if (isBackground) {
+        bgInFlightRef.current = true;
+      }
       try {
         const params = new URLSearchParams();
         if (mv) params.set("model_version", mv);
@@ -64,12 +78,19 @@ export function LiveRadarShell() {
         if (resp.ok) {
           const data = (await resp.json()) as TerminalSnapshotResponse;
           setSnapshot(data);
-          setSelectedModelVersion(data.portfolio.active_model_version);
-          setSelectedStrategyVersion(data.portfolio.active_strategy_version);
+          if (!initializedRef.current) {
+            initializedRef.current = true;
+            setSelectedModelVersion(data.portfolio.active_model_version);
+            setSelectedStrategyVersion(data.portfolio.active_strategy_version);
+          }
           setErrorBanner(null);
         }
       } catch {
         // Backend may still be booting; WebSocket reconnects below
+      } finally {
+        if (isBackground) {
+          bgInFlightRef.current = false;
+        }
       }
     },
     [],
@@ -91,7 +112,7 @@ export function LiveRadarShell() {
         setWsStatus("connected");
       };
       socket.onmessage = () => {
-        void fetchSnapshot(selectedModelVersion, selectedStrategyVersion);
+        void fetchSnapshot(versionsRef.current.mv, versionsRef.current.sv, true);
       };
       socket.onclose = () => {
         setWsStatus("disconnected");
@@ -106,27 +127,36 @@ export function LiveRadarShell() {
 
     connect();
 
+    const pollTimer = setInterval(() => {
+      void fetchSnapshot(versionsRef.current.mv, versionsRef.current.sv, true);
+    }, 5_000);
+
     return () => {
       isDisposed = true;
+      clearInterval(pollTimer);
       if (reconnectTimer) clearTimeout(reconnectTimer);
       socket?.close();
     };
-  }, [fetchSnapshot, selectedModelVersion, selectedStrategyVersion]);
+  }, [fetchSnapshot]);
 
   const handleFilterModel = useCallback(
     (mv: string) => {
+      initializedRef.current = true;
+      versionsRef.current = { mv, sv: versionsRef.current.sv };
       setSelectedModelVersion(mv);
-      void fetchSnapshot(mv, selectedStrategyVersion);
+      void fetchSnapshot(mv, versionsRef.current.sv);
     },
-    [fetchSnapshot, selectedStrategyVersion],
+    [fetchSnapshot],
   );
 
   const handleFilterStrategy = useCallback(
     (sv: string) => {
+      initializedRef.current = true;
+      versionsRef.current = { mv: versionsRef.current.mv, sv };
       setSelectedStrategyVersion(sv);
-      void fetchSnapshot(selectedModelVersion, sv);
+      void fetchSnapshot(versionsRef.current.mv, sv);
     },
-    [fetchSnapshot, selectedModelVersion],
+    [fetchSnapshot],
   );
 
   const handleTogglePause = useCallback(async () => {
@@ -196,6 +226,8 @@ export function LiveRadarShell() {
           }),
         });
         if (resp.ok) {
+          initializedRef.current = true;
+          versionsRef.current = { mv: run.model_version, sv: run.strategy_version };
           setSelectedModelVersion(run.model_version);
           setSelectedStrategyVersion(run.strategy_version);
           await fetchSnapshot(run.model_version, run.strategy_version);
