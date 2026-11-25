@@ -68,7 +68,10 @@ export function TopPortfolioBar({
           ),
         )
       : 0;
-  const exposurePct = Math.min(100, (portfolio.total_city_exposure_usd / cityCap) * 100);
+  const exposurePct =
+    portfolio.reference_bankroll_usd > 0
+      ? Math.min(100, (portfolio.total_city_exposure_usd / portfolio.reference_bankroll_usd) * 100)
+      : 0;
   const clvCents = portfolio.avg_clv !== null ? portfolio.avg_clv * 100 : null;
 
   return (

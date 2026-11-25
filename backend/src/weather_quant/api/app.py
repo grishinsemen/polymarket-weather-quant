@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import importlib
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
+from weather_quant.api.runtime import AutonomousRuntime
 from weather_quant.api.service import RadarStateResponse, StationRadarService
+from weather_quant.archive.parquet_store import ParquetArchiveStore
+from weather_quant.clob.orderbook_ws import ClobOrderBookStream
 from weather_quant.domain.clock import Clock, SystemClock
 from weather_quant.domain.ports import WorldFeedPort
 from weather_quant.metar.fetcher import HttpWorldFeed
@@ -27,14 +31,19 @@ OPTIONAL_ROUTER_MODULES = [
 
 
 def create_app(
-    db_path: str = "data/weather_quant.db",
+    db_path: str | None = None,
     world_feed: WorldFeedPort | None = None,
     clock: Clock | None = None,
     enable_background_poll: bool = True,
     poll_interval_seconds: int = 600,
+    archive_dir: str | None = None,
 ) -> FastAPI:
     """Create configured FastAPI app with versioned DB, CORS, WS stream, and routers."""
-    db = Database(db_path=db_path)
+    resolved_db_path = db_path if db_path is not None else os.getenv("WEATHER_QUANT_DB_PATH", "data/weather_quant.db")
+    resolved_archive_dir = (
+        archive_dir if archive_dir is not None else os.getenv("WEATHER_QUANT_ARCHIVE_DIR", "data/archive")
+    )
+    db = Database(db_path=resolved_db_path)
     feed: WorldFeedPort = world_feed or HttpWorldFeed()
     app_clock: Clock = clock or SystemClock()
     radar_service = StationRadarService(
@@ -48,10 +57,23 @@ def create_app(
     async def lifespan(app_instance: FastAPI) -> AsyncIterator[None]:
         await db.initialize()
         if enable_background_poll:
-            radar_service.start_background_poll()
+            stream: ClobOrderBookStream | None = getattr(app_instance.state, "clob_stream", None)
+            if stream is not None:
+                stream.start()
+            bot = getattr(app_instance.state, "telegram_bot", None)
+            if bot is not None and getattr(bot, "enabled", False):
+                bot.start_polling()
+            app_instance.state.autonomous_runtime.start(poll_interval_seconds)
         try:
             yield
         finally:
+            await app_instance.state.autonomous_runtime.stop()
+            stream = getattr(app_instance.state, "clob_stream", None)
+            if stream is not None:
+                await stream.stop()
+            bot = getattr(app_instance.state, "telegram_bot", None)
+            if bot is not None:
+                await bot.stop_polling()
             await radar_service.stop_background_poll()
             await db.close()
 
@@ -62,7 +84,12 @@ def create_app(
     )
     fastapi_app.state.db = db
     fastapi_app.state.clock = app_clock
+    fastapi_app.state.archive_dir = resolved_archive_dir
     fastapi_app.state.radar_service = radar_service
+    if resolved_db_path != ":memory:":
+        fastapi_app.state.parquet_archive = ParquetArchiveStore(base_dir=resolved_archive_dir)
+    fastapi_app.state.clob_stream = ClobOrderBookStream(clock=app_clock)
+    fastapi_app.state.autonomous_runtime = AutonomousRuntime(fastapi_app)
 
     fastapi_app.add_middleware(
         CORSMiddleware,
@@ -117,6 +144,8 @@ def create_app(
             raise
         if hasattr(mod, "router"):
             fastapi_app.include_router(mod.router)
+        if mod_name == "routes_telegram" and hasattr(mod, "attach_telegram_bot"):
+            mod.attach_telegram_bot(fastapi_app)
 
     return fastapi_app
 

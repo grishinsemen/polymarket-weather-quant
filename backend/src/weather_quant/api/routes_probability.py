@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from weather_quant.domain.clock import Clock
 from weather_quant.domain.models import EnsembleSnapshot, EventProbabilitySnapshot
+from weather_quant.ml.quantile_mos import load_mos_provider_for_version
 from weather_quant.probability.engine import (
     DailyBiasObservation,
     EnsembleProbabilityEngine,
@@ -104,6 +105,11 @@ async def recompute_probabilities(
 
     req = body or ProbabilityRecomputeRequest()
     target_version = req.model_version or (await db.get_active_model_version()).model_version
+    mos_provider = await load_mos_provider_for_version(
+        db,
+        target_version,
+        existing_provider=getattr(request.app.state, "mos_provider", None),
+    )
     active_events = await db.list_weather_events(active_only=True)
     if req.event_ids is not None:
         wanted = set(req.event_ids)
@@ -126,15 +132,25 @@ async def recompute_probabilities(
             else []
         )
         intraday_metars = await list_station_routine_metars(db, event.station.icao)
-        snapshot = engine.compute_probabilities(
-            station=event.station,
-            event=event,
-            ensemble=ensemble,
-            recent_bias_obs=bias_obs,
-            intraday_metars=intraday_metars,
-            clock=clock,
-            model_version=target_version,
-        )
+        if mos_provider is not None and mos_provider.is_station_covered(event.station.icao):
+            snapshot = mos_provider.compute_probabilities(
+                station=event.station,
+                event=event,
+                ensemble=ensemble,
+                recent_bias_obs=bias_obs,
+                intraday_metars=intraday_metars,
+                clock=clock,
+            )
+        else:
+            snapshot = engine.compute_probabilities(
+                station=event.station,
+                event=event,
+                ensemble=ensemble,
+                recent_bias_obs=bias_obs,
+                intraday_metars=intraday_metars,
+                clock=clock,
+                model_version=target_version,
+            )
         await save_event_probability_snapshot(db, snapshot)
         snapshots.append(snapshot)
 

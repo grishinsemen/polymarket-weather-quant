@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from statistics import mean, pstdev
 from typing import Any, Protocol, Sequence
 
 import httpx
@@ -44,17 +46,23 @@ def _parse_iso_utc(raw_ts: str) -> datetime:
 
 def _extract_hourly_trajectories(
     payload: dict[str, Any] | list[dict[str, Any]],
-) -> tuple[list[datetime], list[list[float]], list[str]]:
+) -> tuple[list[datetime], list[list[float]], list[str], dict[str, Any]]:
     """Normalize single-dict or multi-model-list Open-Meteo Ensemble JSON payloads."""
     blocks = payload if isinstance(payload, list) else [payload]
     reference_times: list[datetime] = []
     trajectories: list[list[float]] = []
     discovered_models: list[str] = []
+    model_extremes_c: dict[str, float] = {}
+    wind_speed_vals: list[float] = []
+    wind_dir_vals: list[float] = []
+    cloud_cover_vals: list[float] = []
+    rh_vals: list[float] = []
 
-    for block in blocks:
+    for block_idx, block in enumerate(blocks):
         if not isinstance(block, dict):
             continue
         model_name = block.get("model")
+        resolved_model = str(model_name) if isinstance(model_name, str) and model_name else f"model_{block_idx}"
         if isinstance(model_name, str) and model_name:
             discovered_models.append(model_name)
 
@@ -71,8 +79,23 @@ def _extract_hourly_trajectories(
 
         # Align block timestamps to reference_times when multiple models are returned
         time_index = {ts: idx for idx, ts in enumerate(parsed_times)}
+        model_member_maxes: list[float] = []
         for key, series in hourly.items():
-            if not key.startswith("temperature_2m") or not isinstance(series, list):
+            if not isinstance(series, list):
+                continue
+            if key.startswith("wind_speed_10m"):
+                wind_speed_vals.extend(float(v) for v in series if v is not None)
+                continue
+            if key.startswith("wind_direction_10m"):
+                wind_dir_vals.extend(float(v) for v in series if v is not None)
+                continue
+            if key.startswith("cloud_cover"):
+                cloud_cover_vals.extend(float(v) for v in series if v is not None)
+                continue
+            if key.startswith("relative_humidity_2m"):
+                rh_vals.extend(float(v) for v in series if v is not None)
+                continue
+            if not key.startswith("temperature_2m"):
                 continue
             aligned: list[float] = []
             valid = True
@@ -84,8 +107,26 @@ def _extract_hourly_trajectories(
                 aligned.append(float(series[pos]))
             if valid and len(aligned) == len(reference_times):
                 trajectories.append(aligned)
+                model_member_maxes.append(max(aligned))
+        if model_member_maxes:
+            model_extremes_c[resolved_model] = round(mean(model_member_maxes), 4)
 
-    return reference_times, trajectories, discovered_models
+    extra_meta: dict[str, Any] = {}
+    if model_extremes_c:
+        extra_meta["model_extremes_c"] = model_extremes_c
+        extra_meta["model_spread_c"] = (
+            round(pstdev(list(model_extremes_c.values())), 4) if len(model_extremes_c) > 1 else 0.0
+        )
+    if wind_speed_vals:
+        extra_meta["wind_speed_10m"] = wind_speed_vals
+    if wind_dir_vals:
+        extra_meta["wind_direction_10m"] = wind_dir_vals
+    if cloud_cover_vals:
+        extra_meta["cloud_cover"] = cloud_cover_vals
+    if rh_vals:
+        extra_meta["relative_humidity_2m"] = rh_vals
+
+    return reference_times, trajectories, discovered_models, extra_meta
 
 
 class OpenMeteoEnsembleFetcher:
@@ -121,7 +162,7 @@ class OpenMeteoEnsembleFetcher:
             "latitude": station.lat,
             "longitude": station.lon,
             "elevation": station.elevation_m,
-            "hourly": "temperature_2m",
+            "hourly": "temperature_2m,wind_speed_10m,wind_direction_10m,cloud_cover,relative_humidity_2m",
             "models": ",".join(self._models),
             "timezone": "UTC",
         }
@@ -142,8 +183,16 @@ class OpenMeteoEnsembleFetcher:
             if owns_client:
                 await client.aclose()
 
-        timestamps_utc, member_temps_c, discovered_models = _extract_hourly_trajectories(payload)
+        timestamps_utc, member_temps_c, discovered_models, extra_meta = _extract_hourly_trajectories(payload)
         ingested_at = self._clock.now()
+
+        meta_payload: dict[str, Any] = {
+            "source": OPEN_METEO_ENSEMBLE_URL,
+            "latitude": station.lat,
+            "longitude": station.lon,
+            "elevation_m": station.elevation_m,
+        }
+        meta_payload.update(extra_meta)
 
         snapshot = EnsembleSnapshot(
             event_id=event_id,
@@ -154,16 +203,11 @@ class OpenMeteoEnsembleFetcher:
             member_count=len(member_temps_c),
             hourly_timestamps_utc=timestamps_utc,
             member_temps_c=member_temps_c,
-            metadata={
-                "source": OPEN_METEO_ENSEMBLE_URL,
-                "latitude": station.lat,
-                "longitude": station.lon,
-                "elevation_m": station.elevation_m,
-            },
+            metadata=meta_payload,
         )
 
         if self._archive_dir is not None:
-            self.archive_snapshot(snapshot)
+            await asyncio.to_thread(self.archive_snapshot, snapshot)
 
         return snapshot
 

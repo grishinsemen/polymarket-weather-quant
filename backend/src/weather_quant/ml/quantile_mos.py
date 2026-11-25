@@ -6,6 +6,7 @@ import asyncio
 import json
 import math
 from datetime import datetime, timezone
+from pathlib import Path
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, Sequence
 from zoneinfo import ZoneInfo
@@ -19,6 +20,7 @@ from weather_quant.domain.clock import (
     SystemClock,
     TemporalIntegrityError,
     assert_before_decision,
+    ensure_utc,
 )
 from weather_quant.domain.models import (
     Bucket,
@@ -43,8 +45,8 @@ from weather_quant.probability.engine import (
     DEFAULT_MODEL_VERSION,
     DailyBiasObservation,
     EnsembleProbabilityEngine,
-    _map_extremes_to_probabilities,
-    _to_event_unit,
+    map_extremes_to_probabilities,
+    to_event_unit,
 )
 
 if TYPE_CHECKING:
@@ -106,9 +108,7 @@ class ChronologicalBenchmarkReport(BaseModel):
 
 
 def _ensure_utc(ts: datetime) -> datetime:
-    if ts.tzinfo is None:
-        return ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc)
+    return ensure_utc(ts)
 
 
 def split_chronologically(
@@ -409,14 +409,14 @@ class QuantileMosModel:
         impossible_mask = [False] * len(event.buckets)
         if today_metars:
             obs_temps_c = [
-                EnsembleProbabilityEngine._obs_settlement_temp_c(obs, event.remark_tenths_enabled)
+                EnsembleProbabilityEngine.obs_settlement_temp_c(obs, event.remark_tenths_enabled)
                 for obs in today_metars
             ]
             realized_extreme_c = (
                 max(obs_temps_c) if event.polarity == Polarity.HIGHEST else min(obs_temps_c)
             )
-            realized_extreme_unit = _to_event_unit(realized_extreme_c, event.unit)
-            impossible_mask = EnsembleProbabilityEngine._compute_impossible_mask(
+            realized_extreme_unit = to_event_unit(realized_extreme_c, event.unit)
+            impossible_mask = EnsembleProbabilityEngine.compute_impossible_mask(
                 event.buckets,
                 event.polarity,
                 realized_extreme_unit,
@@ -427,8 +427,8 @@ class QuantileMosModel:
             else:
                 mos_extremes_c = [min(x, realized_extreme_c) for x in mos_extremes_c]
 
-        mos_extremes_unit = [_to_event_unit(x, event.unit) for x in mos_extremes_c]
-        mos_probs = _map_extremes_to_probabilities(
+        mos_extremes_unit = [to_event_unit(x, event.unit) for x in mos_extremes_c]
+        mos_probs = map_extremes_to_probabilities(
             mos_extremes_unit,
             event.buckets,
             impossible_mask,
@@ -555,12 +555,12 @@ def _evaluate_split(
         no_impossible = [False] * len(buckets)
 
         mos_extremes = mos_model.quantiles_to_extremes(q_map)
-        m_probs = _map_extremes_to_probabilities(mos_extremes, buckets, no_impossible, smoothing_alpha=0.001)
+        m_probs = map_extremes_to_probabilities(mos_extremes, buckets, no_impossible, smoothing_alpha=0.001)
         mos_bucket_probs.append(m_probs)
 
         dist = NormalDist(mu=sample.baseline_mean_c, sigma=max(sample.baseline_std_c, 0.35))
         base_extremes = [dist.inv_cdf(float(p)) for p in grid_probs]
-        b_probs = _map_extremes_to_probabilities(base_extremes, buckets, no_impossible, smoothing_alpha=0.001)
+        b_probs = map_extremes_to_probabilities(base_extremes, buckets, no_impossible, smoothing_alpha=0.001)
         base_bucket_probs.append(b_probs)
 
         for q in mos_model.quantiles:
@@ -695,6 +695,90 @@ async def register_model_version(
     return stored
 
 
+DEFAULT_MODELS_DIR = Path("data/models")
+
+
+def save_mos_model(
+    mos_model: QuantileMosModel,
+    models_dir: Path | str = DEFAULT_MODELS_DIR,
+) -> Path:
+    """Persist trained QuantileMosModel LightGBM boosters as JSON artifact."""
+    out_dir = Path(models_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = mos_model.model_version.replace("/", "_").replace("\\", "_")
+    path = out_dir / f"{safe_name}.json"
+    payload = {
+        "model_version": mos_model.model_version,
+        "quantiles": list(mos_model.quantiles),
+        "covered_stations": list(mos_model.covered_stations),
+        "feature_columns": list(mos_model.feature_columns),
+        "lgbm_params": mos_model.lgbm_params,
+        "boosters": {str(q): booster.model_to_string() for q, booster in mos_model.boosters.items()},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def load_mos_model(
+    model_version: str,
+    models_dir: Path | str = DEFAULT_MODELS_DIR,
+) -> QuantileMosModel | None:
+    """Load persisted QuantileMosModel from disk if present."""
+    safe_name = model_version.replace("/", "_").replace("\\", "_")
+    path = Path(models_dir) / f"{safe_name}.json"
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    boosters = {
+        float(q): lgb.Booster(model_str=model_str)
+        for q, model_str in (payload.get("boosters") or {}).items()
+    }
+    if not boosters:
+        return None
+    return QuantileMosModel(
+        model_version=str(payload["model_version"]),
+        quantiles=[float(q) for q in payload["quantiles"]],
+        boosters=boosters,
+        covered_stations=payload.get("covered_stations") or TOP_LIQUIDITY_STATIONS,
+        feature_columns=payload.get("feature_columns") or FEATURE_COLUMNS,
+        lgbm_params=payload.get("lgbm_params"),
+    )
+
+
+async def load_mos_provider_for_version(
+    db: Database,
+    model_version: str,
+    *,
+    existing_provider: MosProbabilityProvider | None = None,
+    models_dir: Path | str = DEFAULT_MODELS_DIR,
+) -> MosProbabilityProvider | None:
+    """Resolve a MosProbabilityProvider for model_version from memory or persisted boosters."""
+    if existing_provider is not None and existing_provider.mos_model is not None:
+        if existing_provider.mos_model.model_version == model_version:
+            return existing_provider
+    versions = await db.list_model_versions()
+    rec = next((v for v in versions if v.model_version == model_version), None)
+    if rec is None or ("mos" not in rec.model_type.lower() and "mos" not in rec.model_version.lower()):
+        return None
+    artifact_path = (rec.config_json or {}).get("artifact_path")
+    if artifact_path and Path(artifact_path).exists():
+        payload = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
+        boosters = {float(q): lgb.Booster(model_str=s) for q, s in (payload.get("boosters") or {}).items()}
+        loaded = QuantileMosModel(
+            model_version=str(payload["model_version"]),
+            quantiles=[float(q) for q in payload["quantiles"]],
+            boosters=boosters,
+            covered_stations=payload.get("covered_stations") or TOP_LIQUIDITY_STATIONS,
+            feature_columns=payload.get("feature_columns") or FEATURE_COLUMNS,
+            lgbm_params=payload.get("lgbm_params"),
+        ) if boosters else None
+    else:
+        loaded = await asyncio.to_thread(load_mos_model, model_version, models_dir)
+    if loaded is None:
+        return None
+    return MosProbabilityProvider(mos_model=loaded, covered_stations=loaded.covered_stations)
+
+
 async def train_and_register_mos(
     *,
     db: Database,
@@ -708,6 +792,7 @@ async def train_and_register_mos(
     lgbm_params: dict[str, Any] | None = None,
     activate: bool = False,
     clock: Clock | None = None,
+    models_dir: Path | str | None = DEFAULT_MODELS_DIR,
 ) -> tuple[QuantileMosModel, ModelVersionRecord, ChronologicalBenchmarkReport]:
     """Run out-of-band Quantile LightGBM training via asyncio.to_thread and register Model Version."""
     # Pre-check immutability before running training work
@@ -730,12 +815,17 @@ async def train_and_register_mos(
         lgbm_params=lgbm_params,
     )
 
+    artifact_path: Path | None = None
+    if models_dir is not None:
+        artifact_path = await asyncio.to_thread(save_mos_model, mos_model, models_dir)
+
     now_utc = _ensure_utc((clock or SystemClock()).now())
     config_payload: dict[str, Any] = {
         "quantiles": list(mos_model.quantiles),
         "covered_stations": list(mos_model.covered_stations),
         "feature_columns": list(mos_model.feature_columns),
         "lgbm_params": mos_model.lgbm_params,
+        "artifact_path": str(artifact_path) if artifact_path is not None else None,
         "reliability_curve": [b.model_dump(mode="json") for b in report.test_mos.reliability_curve],
         "benchmark": report.model_dump(mode="json"),
     }

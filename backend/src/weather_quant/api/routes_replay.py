@@ -17,7 +17,7 @@ from weather_quant.api.routes_ml import _get_provider
 from weather_quant.api.routes_strategy import get_strategy_engine
 from weather_quant.clob.fees import calculate_net_edge
 from weather_quant.discovery.stations import get_station
-from weather_quant.domain.clock import Clock, SystemClock, TemporalIntegrityError
+from weather_quant.domain.clock import Clock, SystemClock, TemporalIntegrityError, ensure_utc
 from weather_quant.domain.models import (
     Bucket,
     BucketFairProbability,
@@ -40,11 +40,13 @@ from weather_quant.domain.models import (
     WeatherEvent,
 )
 from weather_quant.ml.dataset_builder import TOP_LIQUIDITY_STATIONS
+from weather_quant.ml.quantile_mos import load_mos_provider_for_version
 from weather_quant.probability.engine import (
     EnsembleProbabilityEngine,
     get_latest_event_probability_snapshot,
     list_station_routine_metars,
     save_event_probability_snapshot,
+    to_event_unit,
 )
 from weather_quant.replay.runner import (
     ReplayEquityPoint,
@@ -58,6 +60,7 @@ from weather_quant.storage.database import Database
 from weather_quant.strategy.engine import (
     PHASE_INTRADAY,
     PHASE_PREMARKET,
+    StrategyParams,
     StrategyStore,
     settlement_close_utc,
 )
@@ -255,9 +258,7 @@ class SeedDemoResponse(BaseModel):
 
 
 def _ensure_utc(ts: datetime) -> datetime:
-    if ts.tzinfo is None:
-        return ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc)
+    return ensure_utc(ts)
 
 
 def _explain_reasons(reasons: list[str]) -> str:
@@ -305,7 +306,7 @@ def _build_ensemble_fan(
     points = [
         MetarChartPoint(
             observed_at_utc=_ensure_utc(m.observed_at_utc),
-            temp_c=m.temp_c,
+            temp_c=round(to_event_unit(m.temp_c, event.unit), 2),
             raw_report=m.raw_report,
             has_remark_tenths=m.has_remark_tenths,
         )
@@ -342,9 +343,9 @@ def _build_ensemble_fan(
             continue
         arr = np.asarray(vals, dtype=np.float64)
         timestamps.append(_ensure_utc(ensemble.hourly_timestamps_utc[idx]))
-        p10.append(round(float(np.percentile(arr, 10)), 2))
-        p50.append(round(float(np.percentile(arr, 50)), 2))
-        p90.append(round(float(np.percentile(arr, 90)), 2))
+        p10.append(round(to_event_unit(float(np.percentile(arr, 10)), event.unit), 2))
+        p50.append(round(to_event_unit(float(np.percentile(arr, 50)), event.unit), 2))
+        p90.append(round(to_event_unit(float(np.percentile(arr, 90)), event.unit), 2))
 
     return EnsembleFanSeries(
         timestamps=timestamps,
@@ -367,55 +368,7 @@ async def _version_filtered_portfolio(
     model_version: str,
     now: datetime,
 ) -> PortfolioSummary:
-    sv = strategy_manifest.strategy_version
-    filled_map = await store.filled_shares_by_order()
-    resting = [
-        o
-        for o in await store.list_resting_orders()
-        if o.model_version == model_version and o.strategy_version == sv
-    ]
-    resting_buy_usd = 0.0
-    for o in resting:
-        if o.side != "BUY":
-            continue
-        rem = max(0.0, o.size_shares - filled_map.get(o.order_id, 0.0))
-        resting_buy_usd += rem * o.limit_price
-
-    all_positions = [
-        p
-        for p in await store.list_positions()
-        if p.model_version == model_version and p.strategy_version == sv
-    ]
-    open_positions = [p for p in all_positions if p.status == "OPEN"]
-    open_cost = sum(p.cost_basis_usd for p in open_positions)
-    total_committed = resting_buy_usd + open_cost
-    realized = sum(p.realized_pnl_usd for p in all_positions)
-    unrealized = sum(p.unrealized_pnl_usd for p in open_positions)
-    cash = strategy_manifest.reference_bankroll + realized - total_committed
-    reserve = strategy_manifest.intraday_cash_reserve_ratio * strategy_manifest.reference_bankroll
-
-    clvs = [
-        c.clv
-        for c in await store.list_clv(limit=1000)
-        if c.model_version == model_version and c.strategy_version == sv
-    ]
-    avg_clv = round(sum(clvs) / len(clvs), 6) if clvs else None
-
-    return PortfolioSummary(
-        reference_bankroll_usd=strategy_manifest.reference_bankroll,
-        cash_balance_usd=round(cash, 4),
-        equity_usd=round(strategy_manifest.reference_bankroll + realized + unrealized, 4),
-        realized_pnl_usd=round(realized, 4),
-        unrealized_pnl_usd=round(unrealized, 4),
-        total_city_exposure_usd=round(total_committed, 4),
-        intraday_cash_reserve_usd=round(reserve, 4),
-        available_premarket_usd=round(max(0.0, cash - reserve), 4),
-        avg_clv=avg_clv,
-        active_model_version=model_version,
-        active_strategy_version=sv,
-        is_paused=await store.is_paused(),
-        as_of_utc=now,
-    )
+    return await store.portfolio_summary(strategy_manifest, model_version, now)
 
 
 def _make_11_buckets(event_id: str, center_c: int) -> list[Bucket]:
@@ -1310,11 +1263,20 @@ async def promote_experiment_pair(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    # Refresh in-memory StrategyEngine manifest if initialized
+    # Refresh in-memory StrategyEngine manifest/params & MOS provider if initialized
     engine = getattr(request.app.state, "strategy_engine", None)
     if engine is not None:
         active_strat = await db.get_active_strategy_version()
         engine.manifest = active_strat
+        engine.params = StrategyParams.from_manifest(active_strat)
+
+    loaded_provider = await load_mos_provider_for_version(
+        db,
+        body.model_version,
+        existing_provider=getattr(request.app.state, "mos_provider", None),
+    )
+    if loaded_provider is not None:
+        request.app.state.mos_provider = loaded_provider
 
     return PromoteResponse(**res)
 
@@ -1330,29 +1292,7 @@ async def seed_terminal_demo(request: Request) -> SeedDemoResponse:
     await store.ensure_schema()
 
     for mv in bundle["model_versions"]:
-        await db.conn.execute(
-            """
-            INSERT OR IGNORE INTO model_versions (
-                model_version, model_type, description, feature_schema_hash,
-                train_start_utc, train_end_utc, brier_score, pinball_loss,
-                config_json, is_active, created_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                mv.model_version,
-                mv.model_type,
-                mv.description,
-                mv.feature_schema_hash,
-                mv.train_start_utc.isoformat() if mv.train_start_utc else None,
-                mv.train_end_utc.isoformat() if mv.train_end_utc else None,
-                mv.brier_score,
-                mv.pinball_loss,
-                json.dumps(mv.config_json),
-                int(mv.is_active),
-                mv.created_at_utc.isoformat(),
-            ),
-        )
-    await db.conn.commit()
+        await store.register_model_version(mv)
 
     for sv in bundle["strategy_versions"]:
         await store.register_strategy_version(sv)
@@ -1414,25 +1354,11 @@ async def seed_terminal_demo(request: Request) -> SeedDemoResponse:
     await archive_store.awrite_metar_observations(all_metars)
 
     for o in bundle["orders"]:
-        await db.conn.execute("DELETE FROM orders WHERE order_id = ?", (o.order_id,))
         await store.insert_order(o)
     for f in bundle["fills"]:
-        await db.conn.execute("DELETE FROM fills WHERE fill_id = ?", (f.fill_id,))
-        await db.conn.execute(
-            """
-            INSERT INTO fills (
-                fill_id, order_id, event_id, station_icao, bucket_id, side, fill_price,
-                fill_shares, fill_usd, fee_usd, is_maker, model_version, strategy_version, filled_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                f.fill_id, f.order_id, f.event_id, f.station_icao, f.bucket_id, f.side,
-                f.fill_price, f.fill_shares, f.fill_usd, f.fee_usd, int(f.is_maker),
-                f.model_version, f.strategy_version, f.filled_at_utc.isoformat(),
-            ),
-        )
+        await store.insert_fill(f, commit=False)
     for p in bundle["positions"]:
-        await store._upsert_position(p)
+        await store.upsert_position(p)
     for c in bundle["clvs"]:
         await store.insert_clv(c)
     for a in bundle["audit_entries"]:

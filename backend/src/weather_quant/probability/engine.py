@@ -39,18 +39,18 @@ class DailyBiasObservation(BaseModel):
     is_routine: bool = True
 
 
-def _to_event_unit(temp_c: float, unit: Literal["C", "F"]) -> float:
+def to_event_unit(temp_c: float, unit: Literal["C", "F"]) -> float:
     return temp_c * 9.0 / 5.0 + 32.0 if unit == "F" else temp_c
 
 
-def _round_half_away(value: float) -> int:
+def round_half_away(value: float) -> int:
     """Round to nearest integer matching aviation METAR whole-degree rounding."""
     if value >= 0:
         return int(math.floor(value + 0.5))
     return -int(math.floor(-value + 0.5))
 
 
-def _bucket_effective_bounds(bucket: Bucket) -> tuple[float, float, bool]:
+def bucket_effective_bounds(bucket: Bucket) -> tuple[float, float, bool]:
     """Return (low, high, is_integer_grid) continuous interval for a Bucket."""
     bounds = [b for b in (bucket.lower_bound, bucket.upper_bound) if b is not None]
     is_integer = all(float(b).is_integer() for b in bounds)
@@ -63,7 +63,7 @@ def _bucket_effective_bounds(bucket: Bucket) -> tuple[float, float, bool]:
     return low, high, is_integer
 
 
-def _bucket_distance(value: float, low: float, high: float) -> float:
+def bucket_distance(value: float, low: float, high: float) -> float:
     if value < low:
         return low - value
     if value >= high:
@@ -71,7 +71,7 @@ def _bucket_distance(value: float, low: float, high: float) -> float:
     return 0.0
 
 
-def _map_extremes_to_probabilities(
+def map_extremes_to_probabilities(
     extremes_unit: Sequence[float],
     buckets: Sequence[Bucket],
     impossible_mask: Sequence[bool],
@@ -82,13 +82,13 @@ def _map_extremes_to_probabilities(
     if n_buckets == 0:
         return []
 
-    bounds = [_bucket_effective_bounds(b) for b in buckets]
+    bounds = [bucket_effective_bounds(b) for b in buckets]
     possible_indices = [i for i in range(n_buckets) if not impossible_mask[i]]
 
     if not possible_indices:
         # Degenerate safeguard: concentrate on bucket closest to median extreme
         anchor = sorted(extremes_unit)[len(extremes_unit) // 2] if extremes_unit else 0.0
-        best_idx = min(range(n_buckets), key=lambda i: _bucket_distance(anchor, bounds[i][0], bounds[i][1]))
+        best_idx = min(range(n_buckets), key=lambda i: bucket_distance(anchor, bounds[i][0], bounds[i][1]))
         return [1.0 if i == best_idx else 0.0 for i in range(n_buckets)]
 
     counts = [0.0] * n_buckets
@@ -106,7 +106,7 @@ def _map_extremes_to_probabilities(
             else:
                 nearest = min(
                     possible_indices,
-                    key=lambda i: _bucket_distance(val, bounds[i][0], bounds[i][1]),
+                    key=lambda i: bucket_distance(val, bounds[i][0], bounds[i][1]),
                 )
                 counts[nearest] += 1.0
         total_members = float(len(extremes_unit))
@@ -242,27 +242,30 @@ class EnsembleProbabilityEngine:
         return valid
 
     @staticmethod
-    def _obs_settlement_temp_c(obs: MetarObservation, remark_tenths_enabled: bool) -> float:
+    def obs_settlement_temp_c(obs: MetarObservation, remark_tenths_enabled: bool) -> float:
         if remark_tenths_enabled and obs.has_remark_tenths and obs.remark_tenths_c is not None:
             return float(obs.remark_tenths_c)
         return float(obs.whole_temp_c)
 
     @staticmethod
-    def _compute_impossible_mask(
+    def compute_impossible_mask(
         buckets: Sequence[Bucket],
         polarity: Polarity,
         realized_extreme_unit: float,
     ) -> list[bool]:
         mask: list[bool] = []
         for bucket in buckets:
-            _, _, is_integer = _bucket_effective_bounds(bucket)
-            threshold = float(_round_half_away(realized_extreme_unit)) if is_integer else realized_extreme_unit
+            _, _, is_integer = bucket_effective_bounds(bucket)
+            threshold = float(round_half_away(realized_extreme_unit)) if is_integer else realized_extreme_unit
             if polarity == Polarity.HIGHEST:
                 impossible = bucket.upper_bound is not None and bucket.upper_bound < threshold
             else:
                 impossible = bucket.lower_bound is not None and bucket.lower_bound > threshold
             mask.append(impossible)
         return mask
+
+    _obs_settlement_temp_c = obs_settlement_temp_c
+    _compute_impossible_mask = compute_impossible_mask
 
     @staticmethod
     def _ensemble_stats_at_time(
@@ -317,8 +320,8 @@ class EnsembleProbabilityEngine:
         )
         if not valid_obs:
             no_impossible = [False] * len(event.buckets)
-            probs = _map_extremes_to_probabilities(
-                [_to_event_unit(x, event.unit) for x in bias_extremes_c],
+            probs = map_extremes_to_probabilities(
+                [to_event_unit(x, event.unit) for x in bias_extremes_c],
                 event.buckets,
                 no_impossible,
                 smoothing_alpha=self.smoothing_alpha,
@@ -326,14 +329,14 @@ class EnsembleProbabilityEngine:
             return probs, no_impossible
 
         obs_temps_c = [
-            self._obs_settlement_temp_c(obs, event.remark_tenths_enabled)
+            self.obs_settlement_temp_c(obs, event.remark_tenths_enabled)
             for obs in valid_obs
         ]
         realized_extreme_c = (
             max(obs_temps_c) if event.polarity == Polarity.HIGHEST else min(obs_temps_c)
         )
-        realized_extreme_unit = _to_event_unit(realized_extreme_c, event.unit)
-        impossible_mask = self._compute_impossible_mask(
+        realized_extreme_unit = to_event_unit(realized_extreme_c, event.unit)
+        impossible_mask = self.compute_impossible_mask(
             event.buckets,
             event.polarity,
             realized_extreme_unit,
@@ -377,8 +380,8 @@ class EnsembleProbabilityEngine:
             else:
                 intraday_extremes_c.append(min([realized_extreme_c, *future_vals]))
 
-        intraday_probs = _map_extremes_to_probabilities(
-            [_to_event_unit(x, event.unit) for x in intraday_extremes_c],
+        intraday_probs = map_extremes_to_probabilities(
+            [to_event_unit(x, event.unit) for x in intraday_extremes_c],
             event.buckets,
             impossible_mask,
             smoothing_alpha=self.smoothing_alpha,
@@ -438,9 +441,9 @@ class EnsembleProbabilityEngine:
             max(traj) if event.polarity == Polarity.HIGHEST else min(traj)
             for traj in day_trajectories
         ]
-        raw_extremes_unit = [_to_event_unit(x, event.unit) for x in raw_extremes_c]
+        raw_extremes_unit = [to_event_unit(x, event.unit) for x in raw_extremes_c]
         no_impossible = [False] * len(event.buckets)
-        raw_probs = _map_extremes_to_probabilities(
+        raw_probs = map_extremes_to_probabilities(
             raw_extremes_unit,
             event.buckets,
             no_impossible,
@@ -472,8 +475,8 @@ class EnsembleProbabilityEngine:
             max(traj) if event.polarity == Polarity.HIGHEST else min(traj)
             for traj in bias_trajectories
         ]
-        bias_extremes_unit = [_to_event_unit(x, event.unit) for x in bias_extremes_c]
-        bias_probs = _map_extremes_to_probabilities(
+        bias_extremes_unit = [to_event_unit(x, event.unit) for x in bias_extremes_c]
+        bias_probs = map_extremes_to_probabilities(
             bias_extremes_unit,
             event.buckets,
             no_impossible,

@@ -16,6 +16,7 @@ from weather_quant.domain.clock import (
     TemporalIntegrityError,
     VirtualClock,
     assert_before_decision,
+    ensure_utc,
 )
 from weather_quant.domain.models import (
     EnsembleSnapshot,
@@ -31,14 +32,18 @@ from weather_quant.domain.models import (
     StrategyVersionRecord,
     WeatherEvent,
 )
-from weather_quant.ml.quantile_mos import MosProbabilityProvider, QuantileMosModel
+from weather_quant.ml.quantile_mos import (
+    MosProbabilityProvider,
+    QuantileMosModel,
+    load_mos_provider_for_version,
+)
 from weather_quant.probability.engine import (
     DailyBiasObservation,
     EnsembleProbabilityEngine,
-    _bucket_distance,
-    _bucket_effective_bounds,
-    _round_half_away,
-    _to_event_unit,
+    bucket_distance,
+    bucket_effective_bounds,
+    round_half_away,
+    to_event_unit,
 )
 from weather_quant.storage.database import Database
 from weather_quant.strategy.engine import (
@@ -91,9 +96,7 @@ class ExperimentReplayResult(BaseModel):
 
 
 def _ensure_utc(ts: datetime) -> datetime:
-    if ts.tzinfo is None:
-        return ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc)
+    return ensure_utc(ts)
 
 
 def _deterministic_run_id(
@@ -166,23 +169,23 @@ def _resolve_winning_bucket_index(
         if obs_utc.astimezone(station_tz).date() != event.local_date:
             continue
         day_temps_c.append(
-            EnsembleProbabilityEngine._obs_settlement_temp_c(obs, event.remark_tenths_enabled)
+            EnsembleProbabilityEngine.obs_settlement_temp_c(obs, event.remark_tenths_enabled)
         )
 
     if not day_temps_c or not event.buckets:
         return None
 
     extreme_c = max(day_temps_c) if event.polarity == Polarity.HIGHEST else min(day_temps_c)
-    extreme_unit = _to_event_unit(extreme_c, event.unit)
+    extreme_unit = to_event_unit(extreme_c, event.unit)
 
-    bounds = [_bucket_effective_bounds(b) for b in event.buckets]
+    bounds = [bucket_effective_bounds(b) for b in event.buckets]
     is_integer = any(b[2] for b in bounds)
-    test_val = float(_round_half_away(extreme_unit)) if is_integer else extreme_unit
+    test_val = float(round_half_away(extreme_unit)) if is_integer else extreme_unit
 
     for idx, (low, high, _) in enumerate(bounds):
         if low <= test_val < high:
             return idx
-    return min(range(len(bounds)), key=lambda i: _bucket_distance(test_val, bounds[i][0], bounds[i][1]))
+    return min(range(len(bounds)), key=lambda i: bucket_distance(test_val, bounds[i][0], bounds[i][1]))
 
 
 def _compute_brier_score(
@@ -239,7 +242,7 @@ async def _settle_expired_events(
             pos.unrealized_pnl_usd = 0.0
             pos.status = "SETTLED"
             pos.updated_at_utc = now_utc
-            await store._upsert_position(pos)
+            await store.upsert_position(pos)
         await store.db.conn.commit()
 
 
@@ -737,6 +740,11 @@ async def run_experiment_replay(
     model_rec = models.get(model_version)
     if model_rec is None:
         raise ValueError(f"Unknown model_version: {model_version!r}")
+
+    if mos_model is None:
+        loaded_provider = await load_mos_provider_for_version(db, model_version)
+        if loaded_provider is not None:
+            mos_model = loaded_provider.mos_model
 
     strategies = {s.strategy_version: s for s in await db.list_strategy_versions()}
     strategy_rec = strategies.get(strategy_version)

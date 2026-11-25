@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from weather_quant.api.routes_strategy import get_strategy_engine as _get_strategy_engine_from_request
 from weather_quant.clob.orderbook_ws import ClobOrderBookStream
 from weather_quant.discovery.stations import get_station
 from weather_quant.domain.clock import Clock, SystemClock
@@ -23,8 +24,7 @@ from weather_quant.domain.models import (
     WeatherEvent,
 )
 from weather_quant.storage.database import Database
-from weather_quant.strategy.engine import StrategyEngine, StrategyStore
-from weather_quant.strategy.paper_executor import PaperExecutor
+from weather_quant.strategy.engine import StrategyEngine
 from weather_quant.telegram.radar_bot import (
     FeedHealthSnapshot,
     TelegramRadarBot,
@@ -88,28 +88,11 @@ class TelegramCommandResponse(BaseModel):
 
 
 async def _get_strategy_engine_from_app(app: FastAPI) -> StrategyEngine:
-    db: Database = app.state.db
-    clock: Clock = getattr(app.state, "clock", None) or SystemClock()
+    class _AppRequestShim:
+        def __init__(self, target_app: FastAPI) -> None:
+            self.app = target_app
 
-    store: StrategyStore | None = getattr(app.state, "strategy_store", None)
-    if store is None:
-        store = StrategyStore(db)
-        app.state.strategy_store = store
-
-    executor = getattr(app.state, "paper_executor", None)
-    if executor is None:
-        executor = PaperExecutor(db=db, clock=clock, store=store)
-        app.state.paper_executor = executor
-
-    engine: StrategyEngine | None = getattr(app.state, "strategy_engine", None)
-    if engine is None:
-        engine = StrategyEngine(db=db, executor=executor, clock=clock, store=store)
-        app.state.strategy_engine = engine
-
-    if not getattr(app.state, "_strategy_initialized", False):
-        await engine.initialize()
-        app.state._strategy_initialized = True
-    return engine
+    return await _get_strategy_engine_from_request(_AppRequestShim(app))  # type: ignore[arg-type]
 
 
 class _FastApiTelegramStateProvider:

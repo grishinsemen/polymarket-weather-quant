@@ -5,7 +5,10 @@ import type { TerminalTab, WsStatus } from "@/components/TopPortfolioBar";
 import { WeatherQuantTerminal } from "@/components/WeatherQuantTerminal";
 import type { ExperimentRunSummary, TerminalSnapshotResponse } from "@/types/terminal";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_BASE_URL ??
+  process.env.NEXT_PUBLIC_API_URL ??
+  "http://localhost:8000";
 
 const EMPTY_SNAPSHOT: TerminalSnapshotResponse = {
   status: "ok",

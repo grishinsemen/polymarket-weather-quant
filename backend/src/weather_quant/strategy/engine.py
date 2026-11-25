@@ -393,7 +393,7 @@ class StrategyStore:
     async def insert_order(self, o: MakerOrder) -> None:
         await self.db.conn.execute(
             """
-            INSERT INTO orders (
+            INSERT OR REPLACE INTO orders (
                 order_id, event_id, station_icao, bucket_id, token_id, side, limit_price,
                 size_shares, size_usd, post_only, phase, status, model_version,
                 strategy_version, created_at_utc, updated_at_utc
@@ -563,7 +563,7 @@ class StrategyStore:
         await self.db.conn.commit()
         return pos
 
-    async def _upsert_position(self, p: PositionRecord) -> None:
+    async def upsert_position(self, p: PositionRecord) -> None:
         await self.db.conn.execute(
             """
             INSERT INTO positions (
@@ -599,6 +599,65 @@ class StrategyStore:
                 _iso(p.updated_at_utc),
             ),
         )
+
+    _upsert_position = upsert_position
+
+    async def insert_fill(self, fill: FillRecord, *, commit: bool = True) -> None:
+        """Persist an execution FillRecord via the StrategyStore seam."""
+        await self.db.conn.execute(
+            """
+            INSERT OR REPLACE INTO fills (
+                fill_id, order_id, event_id, station_icao, bucket_id, side, fill_price,
+                fill_shares, fill_usd, fee_usd, is_maker, model_version, strategy_version,
+                filled_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                fill.fill_id,
+                fill.order_id,
+                fill.event_id,
+                fill.station_icao,
+                fill.bucket_id,
+                fill.side,
+                fill.fill_price,
+                fill.fill_shares,
+                fill.fill_usd,
+                fill.fee_usd,
+                int(fill.is_maker),
+                fill.model_version,
+                fill.strategy_version,
+                _iso(fill.filled_at_utc),
+            ),
+        )
+        if commit:
+            await self.db.conn.commit()
+
+    async def register_model_version(self, mv: ModelVersionRecord) -> ModelVersionRecord:
+        """Insert a ModelVersionRecord idempotently without raw SQL in API handlers."""
+        await self.db.conn.execute(
+            """
+            INSERT OR IGNORE INTO model_versions (
+                model_version, model_type, description, feature_schema_hash,
+                train_start_utc, train_end_utc, brier_score, pinball_loss,
+                config_json, is_active, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                mv.model_version,
+                mv.model_type,
+                mv.description,
+                mv.feature_schema_hash,
+                mv.train_start_utc.isoformat() if mv.train_start_utc else None,
+                mv.train_end_utc.isoformat() if mv.train_end_utc else None,
+                mv.brier_score,
+                mv.pinball_loss,
+                json.dumps(mv.config_json),
+                int(mv.is_active),
+                mv.created_at_utc.isoformat(),
+            ),
+        )
+        await self.db.conn.commit()
+        return mv
 
     @staticmethod
     def _row_to_position(r: Any) -> PositionRecord:
@@ -749,34 +808,83 @@ class StrategyStore:
         ]
 
     # ---- exposure / cash ------------------------------------------------------------------
-    async def resting_buy_usd_by_bucket(self) -> dict[tuple[str, str], float]:
+    async def resting_buy_usd_by_bucket(
+        self,
+        *,
+        model_version: str | None = None,
+        strategy_version: str | None = None,
+    ) -> dict[tuple[str, str], float]:
         """Unfilled USD still committed by resting BUY Maker Orders, keyed by (event, bucket)."""
         filled = await self.filled_shares_by_order()
         out: dict[tuple[str, str], float] = {}
         for o in await self.list_resting_orders():
             if o.side != "BUY":
                 continue
+            if model_version is not None and o.model_version != model_version:
+                continue
+            if strategy_version is not None and o.strategy_version != strategy_version:
+                continue
             remaining = max(0.0, o.size_shares - filled.get(o.order_id, 0.0))
             key = (o.event_id, o.bucket_id)
             out[key] = out.get(key, 0.0) + remaining * o.limit_price
         return out
 
-    async def commitments(self) -> tuple[dict[tuple[str, str], float], float]:
+    async def commitments(
+        self,
+        *,
+        model_version: str | None = None,
+        strategy_version: str | None = None,
+    ) -> tuple[dict[tuple[str, str], float], float]:
         """Return (USD at risk per (event, bucket), total USD at risk) across positions + resting BUYs."""
-        per_bucket = await self.resting_buy_usd_by_bucket()
+        per_bucket = await self.resting_buy_usd_by_bucket(
+            model_version=model_version,
+            strategy_version=strategy_version,
+        )
         for pos in await self.list_positions(status="OPEN"):
+            if model_version is not None and pos.model_version != model_version:
+                continue
+            if strategy_version is not None and pos.strategy_version != strategy_version:
+                continue
             key = (pos.event_id, pos.bucket_id)
             per_bucket[key] = per_bucket.get(key, 0.0) + pos.cost_basis_usd
         return per_bucket, sum(per_bucket.values())
 
-    async def realized_pnl(self) -> float:
-        async with self.db.conn.execute("SELECT COALESCE(SUM(realized_pnl_usd), 0) AS v FROM positions") as cur:
+    async def realized_pnl(
+        self,
+        *,
+        model_version: str | None = None,
+        strategy_version: str | None = None,
+    ) -> float:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if model_version is not None:
+            clauses.append("model_version = ?")
+            params.append(model_version)
+        if strategy_version is not None:
+            clauses.append("strategy_version = ?")
+            params.append(strategy_version)
+        sql = "SELECT COALESCE(SUM(realized_pnl_usd), 0) AS v FROM positions"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        async with self.db.conn.execute(sql, params) as cur:
             row = await cur.fetchone()
         return float(row["v"])
 
-    async def cash_balance(self, reference_bankroll: float) -> float:
-        _, total = await self.commitments()
-        return reference_bankroll + await self.realized_pnl() - total
+    async def cash_balance(
+        self,
+        reference_bankroll: float,
+        *,
+        model_version: str | None = None,
+        strategy_version: str | None = None,
+    ) -> float:
+        _, total = await self.commitments(
+            model_version=model_version,
+            strategy_version=strategy_version,
+        )
+        return reference_bankroll + await self.realized_pnl(
+            model_version=model_version,
+            strategy_version=strategy_version,
+        ) - total
 
     async def portfolio_summary(
         self,
@@ -784,13 +892,24 @@ class StrategyStore:
         model_version: str,
         now: datetime,
     ) -> PortfolioSummary:
-        per_bucket, total_committed = await self.commitments()
-        realized = await self.realized_pnl()
-        open_positions = await self.list_positions(status="OPEN")
+        sv = manifest.strategy_version
+        per_bucket, total_committed = await self.commitments(
+            model_version=model_version,
+            strategy_version=sv,
+        )
+        realized = await self.realized_pnl(model_version=model_version, strategy_version=sv)
+        open_positions = [
+            p
+            for p in await self.list_positions(status="OPEN")
+            if p.model_version == model_version and p.strategy_version == sv
+        ]
         unrealized = sum(p.unrealized_pnl_usd for p in open_positions)
         cash = manifest.reference_bankroll + realized - total_committed
         reserve = manifest.intraday_cash_reserve_ratio * manifest.reference_bankroll
-        async with self.db.conn.execute("SELECT AVG(clv) AS v FROM clv_snapshots") as cur:
+        async with self.db.conn.execute(
+            "SELECT AVG(clv) AS v FROM clv_snapshots WHERE model_version = ? AND strategy_version = ?",
+            (model_version, sv),
+        ) as cur:
             row = await cur.fetchone()
         avg_clv = None if row is None or row["v"] is None else float(row["v"])
         return PortfolioSummary(
@@ -804,7 +923,7 @@ class StrategyStore:
             available_premarket_usd=round(max(0.0, cash - reserve), 6),
             avg_clv=avg_clv,
             active_model_version=model_version,
-            active_strategy_version=manifest.strategy_version,
+            active_strategy_version=sv,
             is_paused=await self.is_paused(),
             as_of_utc=now,
         )
@@ -887,6 +1006,7 @@ class StrategyEngine:
         self.db = db
         self.executor = executor
         self.clock = clock
+        self._explicit_manifest = manifest is not None
         self.manifest = manifest or default_strategy_manifest(clock.now())
         self.params = StrategyParams.from_manifest(self.manifest)
         self.store = store or StrategyStore(db)
@@ -894,6 +1014,13 @@ class StrategyEngine:
 
     async def initialize(self) -> None:
         await self.store.ensure_schema()
+        if not self._explicit_manifest:
+            try:
+                self.manifest = await self.db.get_active_strategy_version()
+                self.params = StrategyParams.from_manifest(self.manifest)
+                return
+            except RuntimeError:
+                pass
         await self.store.register_strategy_version(self.manifest)
 
     # ---- operator controls ----------------------------------------------------------------

@@ -43,10 +43,13 @@ class VirtualClock:
         return self._now
 
 
-def _ensure_utc(ts: datetime) -> datetime:
+def ensure_utc(ts: datetime) -> datetime:
     if ts.tzinfo is None:
         return ts.replace(tzinfo=timezone.utc)
     return ts.astimezone(timezone.utc)
+
+
+_ensure_utc = ensure_utc
 
 
 def assert_before_decision(

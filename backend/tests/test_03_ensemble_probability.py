@@ -96,7 +96,7 @@ async def test_open_meteo_ensemble_fetcher_queries_runway_coords_and_extracts_12
     assert float(params["latitude"]) == pytest.approx(station.lat)
     assert float(params["longitude"]) == pytest.approx(station.lon)
     assert float(params["elevation"]) == pytest.approx(station.elevation_m)
-    assert params["hourly"] == "temperature_2m"
+    assert params["hourly"] == "temperature_2m,wind_speed_10m,wind_direction_10m,cloud_cover,relative_humidity_2m"
     assert "ecmwf_ifs025" in params["models"]
     assert "gfs_seamless" in params["models"]
     assert "icon_seamless" in params["models"]
