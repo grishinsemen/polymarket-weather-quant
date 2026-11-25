@@ -87,13 +87,16 @@ def _get_clock(request: Request) -> Clock:
     return request.app.state.clock
 
 
-def _get_provider(request: Request) -> MosProbabilityProvider:
+def get_mos_provider(request: Request) -> MosProbabilityProvider:
     provider = getattr(request.app.state, "mos_provider", None)
     if isinstance(provider, MosProbabilityProvider):
         return provider
     provider = MosProbabilityProvider()
     request.app.state.mos_provider = provider
     return provider
+
+
+_get_provider = get_mos_provider
 
 
 def _get_historical_fetcher(request: Request, clock: Clock) -> HistoricalArchiveFetcherPort:
@@ -136,7 +139,7 @@ async def list_ml_versions(request: Request) -> MlVersionsResponse:
 @router.get("/covered-stations", response_model=CoveredStationsResponse)
 async def get_covered_stations(request: Request) -> CoveredStationsResponse:
     """Return top-liquidity Stations covered by Quantile ML MOS and provider status."""
-    provider = _get_provider(request)
+    provider = get_mos_provider(request)
     stations = get_top_liquidity_stations()
     mos_active = provider.mos_model is not None
     active_version = provider.mos_model.model_version if provider.mos_model is not None else DEFAULT_MODEL_VERSION
@@ -169,7 +172,7 @@ async def train_mos_model(
     """Train Quantile LightGBM MOS out-of-band, evaluate chronologically, and register Model Version."""
     db = _get_db(request)
     clock = _get_clock(request)
-    provider = _get_provider(request)
+    provider = get_mos_provider(request)
     req = body or MlTrainRequest()
 
     now_utc = clock.now()

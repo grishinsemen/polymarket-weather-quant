@@ -74,12 +74,17 @@ if (-not (Test-Path $NodeModulesDir)) {
     }
 }
 
-# 5. Launch FastAPI backend in a labelled PowerShell window
+# 5. Ensure logs directory exists and launch FastAPI backend + Next.js with Tee-Object logging
+$LogsDir = Join-Path $RepoRoot "logs"
+New-Item -ItemType Directory -Force -Path $LogsDir | Out-Null
+$BackendLog = Join-Path $LogsDir "backend.log"
+$FrontendLog = Join-Path $LogsDir "frontend.log"
+
 $BackendCmd = @"
 `$Host.UI.RawUI.WindowTitle = 'WeatherQuant Backend (FastAPI :8000)'
 Set-Location '$RepoRoot'
 `$env:PYTHONPATH = '$($env:PYTHONPATH)'
-& '$VenvPython' -m uvicorn weather_quant.api.app:app --host 127.0.0.1 --port 8000
+& '$VenvPython' -m uvicorn weather_quant.api.app:app --host 127.0.0.1 --port 8000 2>&1 | Tee-Object -FilePath '$BackendLog' -Append
 "@
 Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $BackendCmd) | Out-Null
 
@@ -88,7 +93,7 @@ $FrontendCmd = @"
 `$Host.UI.RawUI.WindowTitle = 'WeatherQuant Terminal (Next.js :3000)'
 Set-Location '$FrontendDir'
 `$env:NEXT_PUBLIC_API_BASE_URL = '$($env:NEXT_PUBLIC_API_BASE_URL)'
-npm run dev
+npm run dev 2>&1 | Tee-Object -FilePath '$FrontendLog' -Append
 "@
 Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", $FrontendCmd) | Out-Null
 
@@ -132,4 +137,5 @@ Write-Host "  Pro Web Terminal (Веб-терминал):    http://localhost:30
 Write-Host "  Backend API Docs (Swagger UI):      http://127.0.0.1:8000/docs" -ForegroundColor Cyan
 Write-Host "  Health Check (Статус движка):       http://127.0.0.1:8000/api/health" -ForegroundColor Cyan
 Write-Host "  Telegram Radar (Статус радара):     http://127.0.0.1:8000/api/telegram/status" -ForegroundColor Cyan
+Write-Host "  Runtime Logs (Логи серверов):       logs\backend.log  |  logs\frontend.log" -ForegroundColor DarkGray
 Write-Host "==================================================================" -ForegroundColor DarkCyan
