@@ -77,6 +77,20 @@ Pop-Location
    - История прогонов: `GET http://127.0.0.1:8000/api/replay/runs`
    - Промоут победителя: `POST http://127.0.0.1:8000/api/replay/promote`
 
+## Запуск проверок, pre-commit и CI
+
+Единая проверка всего проекта (бэкенд-тесты + архитектурные предохранители, проверка типов TypeScript и тесты фронтенда):
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1
+```
+
+Установить локальный Git `pre-commit` хук (запускает `scripts\check.ps1` автоматически перед каждым коммитом):
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-git-hooks.ps1
+```
+
+При запуске через `start-terminal.bat` живые логи обоих серверов пишутся в `logs\backend.log` и `logs\frontend.log` (папка `logs/` игнорируется git). На GitHub настроен workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
 ## Подключение к GitHub и безопасный Push
 
 Файл `.gitignore` уже исключает `.env`, `.env.*` (кроме `.env.example`), `.venv/`, `node_modules/`, `.next/`, локальные базы `data/*.db*` и архивы `data/*.parquet`.

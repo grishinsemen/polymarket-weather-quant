@@ -1,20 +1,27 @@
 # AGENTS.md
 
-Polymarket Daily Weather Quant Engine & Pro Terminal (`backend/` Python 3.11 + FastAPI + LightGBM/CatBoost, `frontend/` Next.js + React).
+Polymarket Daily Weather Quant Engine & Pro Terminal (`backend/` Python 3.11 + FastAPI + LightGBM, `frontend/` Next.js + React).
 
-## Domain & Architecture Pointers
+## Navigation & Standards Pointers
 
-- Read `GLOSSARY.md` before naming types, modules, API fields, or tests so code speaks the exact domain vocabulary.
-- Read `docs/adr/` before changing station eligibility, weather/ML data sources, order execution rules, or the backend/frontend boundary.
+- **Domain vocabulary:** Read `GLOSSARY.md` before naming types, modules, API fields, or tests.
+- **Architectural trade-offs:** Read `docs/adr/` before altering station eligibility, data sources, execution rules, or backend/frontend boundaries.
+- **Runtime wiring & `app.state`:** Read `docs/architecture/runtime-wiring.md` before adding routers, background workers, or `app.state` services.
+- **Code review standards:** Read `CODING_STANDARDS.md` during `/code-review` (mechanical import/SQL/env checks are enforced automatically by `backend/tests/test_09_architecture_guardrails.py`).
+- **Live diagnostics:** Check `logs/backend.log` and `logs/frontend.log` when investigating local server errors.
 
-## Core Engineering Standards
+## Verification & Environment Rules
 
-- **Temporal integrity (zero data leakage):** Build ML features strictly from historical model forecasts (`historical-forecast-api.open-meteo.com`) and observations timestamped strictly prior to decision time. Split train/validation/backtest datasets chronologically (`train_end < val_start < test_start`).
-- **Exact station truth:** Query weather forecasts at exact ICAO airport runway coordinates and elevation. Parse routine hourly `METAR` reports only (including tenths-of-degree `RMK` groups where present) and discard `SPECI` special reports.
-- **Reactive hot path:** Perform all network I/O inside `asyncio` loops using async clients (`httpx`, `websockets`, `aiosqlite`). Offload CPU-heavy ML training and Parquet batch jobs outside the live orderbook loop.
-- **Deep modules & high seams:** Hide external API schemas, fee math, and METAR parsing quirks behind narrow typed Pydantic/TypeScript interfaces. Test observable behavior at module boundaries using deterministic fixtures (`tdd`).
-- **Realistic paper execution:** Fill simulated `Post-Only` maker orders only when the live Polymarket `CLOB` opposing side touches or trades through our limit price, and enforce bankroll risk caps (`0.2x` Fractional Kelly, $5/bucket, $8/city, 40% intraday cash reserve).
-- **Sanctioned API usage only:** Use documented public endpoints (`gamma-api`, `clob`, `open-meteo`, `aviationweather.gov`, `mesonet.agron.iastate.edu`) without geo-restriction circumvention or proxy spoofing.
+- **Single verification command:** Run `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\check.ps1` (runs backend `pytest` + architecture guardrails, `tsc --noEmit`, and frontend `vitest`).
+- **Windows PowerShell 5.1:** Chain commands with `;` under `$ErrorActionPreference = 'Stop'` and check `$LASTEXITCODE` (never use `&&`); pipe multi-line Python snippets via `@' ... '@ | .\.venv\Scripts\python.exe -`.
+- **Subagent quota discipline:** Launch at most one heavy `self` implementer subagent at a time and commit green TDD slices frequently inside worktrees.
+
+## Non-Negotiable Domain Guardrails
+
+- **Temporal integrity:** Build ML features strictly from archived forecasts (`historical-forecast-api.open-meteo.com`) and observations with `timestamp < decision_time`, using chronological splits (`train_end < val_start < test_start`).
+- **Exact station truth:** Query ensembles at ICAO runway coordinates/elevation; accept routine `METAR` observations (including `RMK` tenths) and discard `SPECI` reports.
+- **Realistic paper execution:** Fill `Post-Only` maker orders only on opposing `CLOB` touch or trade-through; enforce `0.2x` Fractional Kelly, `$5` per `Bucket`, `$8` `City Exposure`, and `40%` `Intraday Cash Reserve`.
+- **Sanctioned APIs only:** Use documented public endpoints (`gamma-api`, `clob`, `open-meteo`, `aviationweather.gov`, `mesonet.agron.iastate.edu`) with zero geo-restriction circumvention.
 
 ## Agent skills
 

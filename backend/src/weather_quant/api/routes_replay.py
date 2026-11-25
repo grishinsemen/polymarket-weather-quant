@@ -13,7 +13,7 @@ from fastapi import APIRouter, Body, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from weather_quant.api.routes_clob import get_archive_store, get_clob_stream
-from weather_quant.api.routes_ml import _get_provider
+from weather_quant.api.routes_ml import get_mos_provider
 from weather_quant.api.routes_strategy import get_strategy_engine
 from weather_quant.clob.fees import calculate_net_edge
 from weather_quant.discovery.stations import get_station
@@ -1215,7 +1215,7 @@ async def trigger_replay_run(
         wanted = set(req.event_ids)
         events = [e for e in events if e.event_id in wanted]
 
-    provider = _get_provider(request)
+    provider = get_mos_provider(request)
     mos_model = (
         provider.mos_model
         if provider.mos_model is not None and provider.mos_model.model_version == target_mv
