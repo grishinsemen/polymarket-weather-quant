@@ -219,12 +219,13 @@ class ResidualMosModel(QuantileMosModel):
 
         results: list[dict[float, float]] = []
         cap = self.max_residual_delta_c
+        median_q = min(self.quantiles, key=lambda q: abs(q - 0.5))
         for idx, feat in enumerate(feature_dicts):
             emos_base = float(feat["ensemble_mean_c"]) + float(feat.get("rolling_bias_c", 0.0))
-            deltas = sorted(
-                max(-cap, min(cap, float(raw_by_q[q][idx])))
-                for q in self.quantiles
-            )
+            raw_median = float(raw_by_q[median_q][idx])
+            clamped_median = max(-cap, min(cap, raw_median))
+            shift_adj = clamped_median - raw_median
+            deltas = sorted(float(raw_by_q[q][idx]) + shift_adj for q in self.quantiles)
             results.append({q: emos_base + d for q, d in zip(self.quantiles, deltas)})
         return results
 

@@ -1510,6 +1510,10 @@ class StrategyEngine:
         executor = self.executor
         sim = executor if isinstance(executor, SimulatedExecutor) else None
         prob_by_bucket: dict[str, BucketFairProbability] = {b.bucket_id: b for b in probabilities.buckets}
+        raw_fair_by_bucket: dict[str, float] = {
+            b.bucket_id: (0.0 if b.is_impossible else b.fair_probability)
+            for b in probabilities.buckets
+        }
         label_by_bucket = {b.bucket_id: b.label for b in event.buckets}
         bucket_by_id = {b.bucket_id: b for b in event.buckets}
 
@@ -1747,11 +1751,12 @@ class StrategyEngine:
 
             # 1) Evaluate BUY YES
             fair_yes = 0.0 if prob.is_impossible else prob.fair_probability
+            raw_fair_yes = raw_fair_by_bucket.get(bucket.bucket_id, fair_yes)
             if (
                 self.params.max_anomaly_divergence is not None
                 and not prob.is_impossible
                 and book.midpoint is not None
-                and abs(fair_yes - book.midpoint) > self.params.max_anomaly_divergence + _EPS
+                and abs(raw_fair_yes - book.midpoint) > self.params.max_anomaly_divergence + _EPS
                 and not intraday
             ):
                 await self._skip(
@@ -1760,7 +1765,7 @@ class StrategyEngine:
                     bucket.bucket_id,
                     [R_ANOMALY_DIVERGENCE],
                     prob.model_version,
-                    {"fair": fair_yes, "midpoint": book.midpoint},
+                    {"raw_fair": raw_fair_yes, "shrunk_fair": fair_yes, "midpoint": book.midpoint},
                 )
                 continue
             limit_yes = self._passive_buy_limit(book, fair_yes)
@@ -2263,6 +2268,7 @@ class StrategyEngine:
         stream: Any,
         latest_metars: Mapping[str, MetarObservation] | None = None,
         model_version: str | None = None,
+        speci_alerts: Mapping[str, SpeciCancelAlert] | None = None,
     ) -> list[TickResult]:
         """Evaluate events against the latest persisted probabilities and live ``ClobOrderBookStream``."""
         from weather_quant.probability.engine import get_latest_event_probability_snapshot
@@ -2299,7 +2305,8 @@ class StrategyEngine:
                 if book is not None:
                     books[bucket.bucket_id] = book
             metar = (latest_metars or {}).get(event.station.icao)
-            out.append(await self.tick_event(event, snap, books, metar))
+            speci = (speci_alerts or {}).get(event.station.icao.upper())
+            out.append(await self.tick_event(event, snap, books, metar, speci_alert=speci))
             ticked_event_ids.add(event.event_id)
 
         # Ensure any remaining OPEN positions (e.g. inactive/expired events) still reflect ZEROED losses

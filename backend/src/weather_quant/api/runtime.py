@@ -127,6 +127,8 @@ class AutonomousRuntime:
         if not getattr(self.app.state, "_strategy_initialized", False):
             await engine.initialize()
             self.app.state._strategy_initialized = True
+        if isinstance(engine.executor, PaperExecutor):
+            engine.executor.strict_maker_fills = engine.params.strict_maker_fills
         return engine
 
     async def _archive_new_metars(
@@ -445,6 +447,7 @@ class AutonomousRuntime:
                 stream,
                 latest_metars=latest_metars,
                 model_version=active_mv,
+                speci_alerts=getattr(radar, "latest_speci_alerts", None),
             )
             event_by_id = {e.event_id: e for e in events}
             signals_count = 0

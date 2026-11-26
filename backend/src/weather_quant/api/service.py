@@ -21,7 +21,7 @@ from weather_quant.domain.models import (
     WeatherEvent,
 )
 from weather_quant.domain.ports import WorldFeedPort
-from weather_quant.metar.parser import parse_metar_line
+from weather_quant.metar.parser import SpeciCancelAlert, parse_metar_line, parse_speci_cancel_trigger
 from weather_quant.storage.database import Database
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,7 @@ class StationRadarService:
         self._poll_task: asyncio.Task[None] | None = None
         self._sync_lock = asyncio.Lock()
         self._last_live_tick_mono: float = 0.0
+        self.latest_speci_alerts: dict[str, SpeciCancelAlert] = {}
 
     async def sync_once(self) -> RadarStateResponse:
         """Fetch Weather Events and Routine METARs once, persist, and broadcast."""
@@ -93,6 +94,7 @@ class StationRadarService:
                 )
                 if target_icaos:
                     raw_metars = await self.world_feed.fetch_metar_reports(target_icaos)
+                    fresh_specis: dict[str, SpeciCancelAlert] = {}
                     for line in raw_metars:
                         obs = parse_metar_line(
                             line,
@@ -101,6 +103,13 @@ class StationRadarService:
                         )
                         if obs is not None and obs.is_routine:
                             await self.db.insert_metar_observation(obs)
+                            continue
+                        speci = parse_speci_cancel_trigger(line, reference_time_utc=now_utc)
+                        if speci is not None and (now_utc - speci.observed_at_utc).total_seconds() <= 1800:
+                            prev = fresh_specis.get(speci.station_icao)
+                            if prev is None or speci.observed_at_utc > prev.observed_at_utc:
+                                fresh_specis[speci.station_icao] = speci
+                    self.latest_speci_alerts = fresh_specis
 
                 self.last_sync_utc = now_utc
                 self.last_sync_error = None

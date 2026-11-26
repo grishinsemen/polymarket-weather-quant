@@ -177,12 +177,12 @@ def solve_multi_outcome_kelly(
 
     for idx_pos, bucket_idx in enumerate(yes_active):
         edge = float(p[bucket_idx] - q_yes[bucket_idx])  # type: ignore[operator]
-        mult = min(kelly_fraction, baker_mchale_shrinkage(edge, model_prob_std))
+        mult = kelly_fraction * baker_mchale_shrinkage(edge, model_prob_std)
         yes_out[bucket_idx] = float(sol[idx_pos]) * mult
 
     for idx_pos, bucket_idx in enumerate(no_active):
         edge = float((1.0 - p[bucket_idx]) - q_no[bucket_idx])  # type: ignore[operator]
-        mult = min(kelly_fraction, baker_mchale_shrinkage(edge, model_prob_std))
+        mult = kelly_fraction * baker_mchale_shrinkage(edge, model_prob_std)
         no_out[bucket_idx] = float(sol[n_yes + idx_pos]) * mult
 
     total_alloc = sum(yes_out) + sum(no_out)

@@ -68,7 +68,7 @@ def evaluate_residual_drift(
     ks_res = stats.ks_2samp(baseline, recent)
     ks_stat = float(ks_res.statistic)
     ks_pval = float(ks_res.pvalue)
-    ks_triggered = ks_pval < ks_alpha and abs(mean_shift) >= mean_shift_threshold_c
+    ks_triggered = (ks_pval < ks_alpha) or (abs(mean_shift) >= mean_shift_threshold_c)
 
     # Two-sided CUSUM on centered recent residuals
     c_pos = 0.0
