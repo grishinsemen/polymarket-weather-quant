@@ -82,3 +82,56 @@ export function formatMetarMinutesAgo(observedAtUtc: string | Date, nowMs: numbe
   const mins = Math.max(0, Math.floor((nowMs - obsMs) / 60_000));
   return `(${mins} мин назад)`;
 }
+
+const SHORT_MONTHS = [
+  "Jan",
+  "Feb",
+  "Mar",
+  "Apr",
+  "May",
+  "Jun",
+  "Jul",
+  "Aug",
+  "Sep",
+  "Oct",
+  "Nov",
+  "Dec",
+];
+
+/**
+ * Format an ISO local settlement date (YYYY-MM-DD) with relative day prefix
+ * ("Today", "Tomorrow", "+2d", "Yesterday") against the reference clock in the given timezone.
+ */
+export function formatScreenerDateLabel(
+  localDateIso: string,
+  nowMs: number,
+  timeZone = "Europe/Moscow",
+): string {
+  const [targetYear, targetMonth, targetDay] = localDateIso.split("-").map(Number);
+  if (!targetYear || !targetMonth || !targetDay) return localDateIso;
+
+  const shortDate = `${SHORT_MONTHS[targetMonth - 1] ?? String(targetMonth)} ${targetDay}`;
+
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(nowMs));
+  const lookup = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  const curYear = Number(lookup.year);
+  const curMonth = Number(lookup.month);
+  const curDay = Number(lookup.day);
+
+  const dayDelta = Math.round(
+    (Date.UTC(targetYear, targetMonth - 1, targetDay) -
+      Date.UTC(curYear, curMonth - 1, curDay)) /
+      86_400_000,
+  );
+
+  if (dayDelta === 0) return `Today · ${shortDate}`;
+  if (dayDelta === 1) return `Tomorrow · ${shortDate}`;
+  if (dayDelta === 2) return `+2d · ${shortDate}`;
+  if (dayDelta === -1) return `Yesterday · ${shortDate}`;
+  return shortDate;
+}

@@ -1,7 +1,11 @@
 "use client";
 
 import React, { useMemo, useState } from "react";
-import { formatMoscowHhMm, formatStationLocalClock } from "@/lib/time";
+import {
+  formatMoscowHhMm,
+  formatScreenerDateLabel,
+  formatStationLocalClock,
+} from "@/lib/time";
 import type { ScreenerRow } from "@/types/terminal";
 
 type SortKey = "net_edge" | "spread" | "top_liquidity_usd" | "countdown_seconds";
@@ -22,6 +26,7 @@ export function EdgeScreenerTable({
   const [sortKey, setSortKey] = useState<SortKey>("net_edge");
   const [sortAsc, setSortAsc] = useState<boolean>(false);
   const [showSettled, setShowSettled] = useState<boolean>(false);
+  const [selectedDate, setSelectedDate] = useState<string>("ALL");
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -47,12 +52,33 @@ export function EdgeScreenerTable({
     return map;
   }, [rows, nowMs]);
 
-  const { sortedRows, settledCount } = useMemo(() => {
+  const { sortedRows, settledCount, baseCount, dateOptions, effectiveSelectedDate } = useMemo(() => {
     const isSettled = (r: ScreenerRow) =>
       (liveClockByEventId?.get(r.event_id)?.remainingSeconds ?? r.countdown_seconds) <= 0;
     const totalSettled = rows.filter(isSettled).length;
     const hasActive = totalSettled < rows.length;
-    const filtered = !showSettled && hasActive ? rows.filter((r) => !isSettled(r)) : [...rows];
+    const baseRows = !showSettled && hasActive ? rows.filter((r) => !isSettled(r)) : [...rows];
+
+    const dateCounts = new Map<string, number>();
+    for (const row of baseRows) {
+      dateCounts.set(row.local_date, (dateCounts.get(row.local_date) ?? 0) + 1);
+    }
+    const refMs = nowMs ?? Date.now();
+    const sortedDates = Array.from(dateCounts.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, count]) => ({
+        date,
+        count,
+        label: formatScreenerDateLabel(date, refMs),
+      }));
+
+    const activeDate =
+      selectedDate !== "ALL" && dateCounts.has(selectedDate) ? selectedDate : "ALL";
+
+    const filtered =
+      activeDate === "ALL"
+        ? [...baseRows]
+        : baseRows.filter((r) => r.local_date === activeDate);
 
     filtered.sort((a, b) => {
       const aSettled = isSettled(a);
@@ -71,8 +97,14 @@ export function EdgeScreenerTable({
       if (av === bv) return a.station_icao.localeCompare(b.station_icao);
       return sortAsc ? av - bv : bv - av;
     });
-    return { sortedRows: filtered, settledCount: totalSettled };
-  }, [rows, sortKey, sortAsc, liveClockByEventId, showSettled]);
+    return {
+      sortedRows: filtered,
+      settledCount: totalSettled,
+      baseCount: baseRows.length,
+      dateOptions: sortedDates,
+      effectiveSelectedDate: activeDate,
+    };
+  }, [rows, sortKey, sortAsc, liveClockByEventId, showSettled, selectedDate, nowMs]);
 
   const arrow = (key: SortKey) => (sortKey === key ? (sortAsc ? " ↑" : " ↓") : "");
 
@@ -98,6 +130,49 @@ export function EdgeScreenerTable({
           Click any Station to inspect 11-Bucket X-Ray
         </span>
       </div>
+
+      {dateOptions.length > 0 && (
+        <div
+          data-testid="screener-date-filter"
+          className="px-4 py-1.5 border-b border-[#1c2638] bg-[#0a101b]/70 flex flex-wrap items-center gap-1.5"
+        >
+          <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-500 mr-1">
+            Date
+          </span>
+          <button
+            type="button"
+            data-testid="date-filter-all"
+            aria-pressed={effectiveSelectedDate === "ALL"}
+            onClick={() => setSelectedDate("ALL")}
+            className={`text-[10px] font-mono-tabular px-2 py-0.5 rounded border transition-colors whitespace-nowrap ${
+              effectiveSelectedDate === "ALL"
+                ? "bg-sky-950/70 text-sky-300 border-sky-500/70"
+                : "bg-[#0f1726] text-slate-400 border-[#25324a] hover:text-slate-200 hover:border-sky-800"
+            }`}
+          >
+            All ({baseCount})
+          </button>
+          {dateOptions.map((opt) => {
+            const isActive = effectiveSelectedDate === opt.date;
+            return (
+              <button
+                key={opt.date}
+                type="button"
+                data-testid={`date-filter-${opt.date}`}
+                aria-pressed={isActive}
+                onClick={() => setSelectedDate(opt.date)}
+                className={`text-[10px] font-mono-tabular px-2 py-0.5 rounded border transition-colors whitespace-nowrap ${
+                  isActive
+                    ? "bg-sky-950/70 text-sky-300 border-sky-500/70"
+                    : "bg-[#0f1726] text-slate-400 border-[#25324a] hover:text-slate-200 hover:border-sky-800"
+                }`}
+              >
+                {opt.label} ({opt.count})
+              </button>
+            );
+          })}
+        </div>
+      )}
 
       {sortedRows.length === 0 ? (
         <div className="p-6 text-center text-xs text-slate-500">

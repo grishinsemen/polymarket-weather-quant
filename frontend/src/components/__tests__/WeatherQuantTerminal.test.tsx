@@ -741,4 +741,105 @@ describe("WeatherQuantTerminal", () => {
     fireEvent.mouseLeave(fanSvg);
     expect(screen.queryByTestId("ensemble-hover-crosshair")).not.toBeInTheDocument();
   });
+
+  it("filters screener events by settlement date pills (Today, Tomorrow, +2d) and resets when hiding settled", () => {
+    const todayRow = {
+      ...FIXTURE_SNAPSHOT.screener[0],
+      event_id: "evt-mmmx-today",
+      station_icao: "MMMX",
+      city: "Mexico City",
+      timezone: "America/Mexico_City",
+      local_date: "2026-11-26",
+      countdown_seconds: 50_000,
+    };
+    const tomorrowRow = {
+      ...FIXTURE_SNAPSHOT.screener[1],
+      event_id: "evt-rksi-tomorrow",
+      station_icao: "RKSI",
+      city: "Seoul",
+      timezone: "Asia/Seoul",
+      local_date: "2026-11-27",
+      countdown_seconds: 90_000,
+    };
+    const plus2dRow = {
+      ...FIXTURE_SNAPSHOT.screener[1],
+      event_id: "evt-kmia-plus2d",
+      station_icao: "KMIA",
+      city: "Miami",
+      timezone: "America/New_York",
+      local_date: "2026-11-28",
+      countdown_seconds: 150_000,
+    };
+    const settledRow = {
+      ...FIXTURE_SNAPSHOT.screener[0],
+      event_id: "evt-eddm-settled",
+      station_icao: "EDDM",
+      city: "Munich",
+      timezone: "Europe/Berlin",
+      local_date: "2026-11-24",
+      countdown_seconds: 0,
+      countdown_label: "SETTLED",
+    };
+
+    const multiDateSnapshot: TerminalSnapshotResponse = {
+      ...FIXTURE_SNAPSHOT,
+      server_time_utc: "2026-11-26T10:30:00Z", // 13:30 MSK on 2026-11-26
+      screener: [settledRow, todayRow, tomorrowRow, plus2dRow],
+    };
+
+    render(
+      <WeatherQuantTerminal
+        snapshot={multiDateSnapshot}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    const dateBar = screen.getByTestId("screener-date-filter");
+    expect(within(dateBar).getByTestId("date-filter-all")).toHaveTextContent("All (3)");
+    expect(within(dateBar).getByTestId("date-filter-2026-11-26")).toHaveTextContent(
+      "Today · Nov 26 (1)",
+    );
+    expect(within(dateBar).getByTestId("date-filter-2026-11-27")).toHaveTextContent(
+      "Tomorrow · Nov 27 (1)",
+    );
+    expect(within(dateBar).getByTestId("date-filter-2026-11-28")).toHaveTextContent(
+      "+2d · Nov 28 (1)",
+    );
+
+    // Filter to Today
+    fireEvent.click(screen.getByTestId("date-filter-2026-11-26"));
+    expect(screen.getAllByTestId("screener-city-row")).toHaveLength(1);
+    expect(within(screen.getAllByTestId("screener-city-row")[0]).getByText("MMMX")).toBeInTheDocument();
+
+    // Filter to +2d
+    fireEvent.click(screen.getByTestId("date-filter-2026-11-28"));
+    expect(screen.getAllByTestId("screener-city-row")).toHaveLength(1);
+    expect(within(screen.getAllByTestId("screener-city-row")[0]).getByText("KMIA")).toBeInTheDocument();
+
+    // Reset to All
+    fireEvent.click(screen.getByTestId("date-filter-all"));
+    expect(screen.getAllByTestId("screener-city-row")).toHaveLength(3);
+
+    // Reveal settled, select settled-only date, then hide settled -> falls back to All (3)
+    fireEvent.click(screen.getByTestId("toggle-settled-btn"));
+    fireEvent.click(screen.getByTestId("date-filter-2026-11-24"));
+    expect(screen.getAllByTestId("screener-city-row")).toHaveLength(1);
+    expect(within(screen.getAllByTestId("screener-city-row")[0]).getByText("EDDM")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("toggle-settled-btn"));
+    expect(screen.getAllByTestId("screener-city-row")).toHaveLength(3);
+  });
 });
