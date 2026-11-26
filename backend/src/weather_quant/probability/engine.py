@@ -21,6 +21,7 @@ from weather_quant.domain.models import (
     Station,
     WeatherEvent,
 )
+from weather_quant.probability.censored_max import simulate_censored_extreme
 
 if TYPE_CHECKING:
     from weather_quant.storage.database import Database
@@ -55,7 +56,7 @@ def round_half_away(value: float) -> int:
 
 
 def bucket_effective_bounds(bucket: Bucket) -> tuple[float, float, bool]:
-    """Return (low, high, is_integer_grid) continuous interval for a Bucket."""
+    """Return (low, high, is_integer_grid) continuous interval for a Bucket in its native unit."""
     bounds = [b for b in (bucket.lower_bound, bucket.upper_bound) if b is not None]
     is_integer = all(float(b).is_integer() for b in bounds)
     if is_integer:
@@ -65,6 +66,123 @@ def bucket_effective_bounds(bucket: Bucket) -> tuple[float, float, bool]:
         low = bucket.lower_bound if bucket.lower_bound is not None else -math.inf
         high = bucket.upper_bound if bucket.upper_bound is not None else math.inf
     return low, high, is_integer
+
+
+def _fahrenheit_int_min_tenth_c(target_f: int) -> float:
+    """Smallest 0.1°C tenth whose half-up °F conversion rounds to >= target_f."""
+    approx_k = int(math.floor(((target_f - 0.5 - 32.0) * 5.0 / 9.0) * 10.0)) - 3
+    k = approx_k
+    while round_half_away((k / 10.0) * 9.0 / 5.0 + 32.0) < target_f:
+        k += 1
+    return k / 10.0
+
+
+def _fahrenheit_int_max_tenth_c(target_f: int) -> float:
+    """Largest 0.1°C tenth whose half-up °F conversion rounds to <= target_f."""
+    approx_k = int(math.ceil(((target_f + 0.5 - 32.0) * 5.0 / 9.0) * 10.0)) + 3
+    k = approx_k
+    while round_half_away((k / 10.0) * 9.0 / 5.0 + 32.0) > target_f:
+        k -= 1
+    return k / 10.0
+
+
+def bucket_effective_bounds_c(
+    bucket: Bucket,
+    *,
+    remark_tenths_enabled: bool = True,
+) -> tuple[float, float, bool]:
+    """Return exact continuous (low_c, high_c, is_integer_grid) interval in °C.
+
+    For US integer °F Buckets with Routine METAR ``RMK`` tenths (0.1°C), this computes
+    exact quantization bounds ``[c_min - 0.05, c_max + 0.05)`` capturing the 18°F cycle
+    asymmetry where every 9th 2°F bucket spans 1.20°C (12 tenths) instead of 1.10°C (11 tenths).
+    """
+    low_native, high_native, is_integer = bucket_effective_bounds(bucket)
+    if bucket.unit == "C":
+        return low_native, high_native, is_integer
+
+    if is_integer and remark_tenths_enabled:
+        low_c = (
+            round(_fahrenheit_int_min_tenth_c(int(bucket.lower_bound)) - 0.05, 6)
+            if bucket.lower_bound is not None
+            else -math.inf
+        )
+        high_c = (
+            round(_fahrenheit_int_max_tenth_c(int(bucket.upper_bound)) + 0.05, 6)
+            if bucket.upper_bound is not None
+            else math.inf
+        )
+        return low_c, high_c, True
+
+    low_c = (low_native - 32.0) * 5.0 / 9.0 if math.isfinite(low_native) else -math.inf
+    high_c = (high_native - 32.0) * 5.0 / 9.0 if math.isfinite(high_native) else math.inf
+    return low_c, high_c, is_integer
+
+
+def map_extremes_c_to_probabilities(
+    extremes_c: Sequence[float],
+    buckets: Sequence[Bucket],
+    impossible_mask: Sequence[bool],
+    *,
+    remark_tenths_enabled: bool = True,
+    smoothing_alpha: float = 0.001,
+) -> list[float]:
+    """Map continuous °C extremes onto Bucket slices using exact °C/°F quantization bounds."""
+    n_buckets = len(buckets)
+    if n_buckets == 0:
+        return []
+
+    bounds = [
+        bucket_effective_bounds_c(b, remark_tenths_enabled=remark_tenths_enabled)
+        for b in buckets
+    ]
+    possible_indices = [i for i in range(n_buckets) if not impossible_mask[i]]
+
+    if not possible_indices:
+        anchor = sorted(extremes_c)[len(extremes_c) // 2] if extremes_c else 0.0
+        best_idx = min(range(n_buckets), key=lambda i: bucket_distance(anchor, bounds[i][0], bounds[i][1]))
+        return [1.0 if i == best_idx else 0.0 for i in range(n_buckets)]
+
+    counts = [0.0] * n_buckets
+    if extremes_c:
+        for val in extremes_c:
+            matching = [
+                i
+                for i in possible_indices
+                if bounds[i][0] <= val < bounds[i][1]
+            ]
+            if matching:
+                share = 1.0 / len(matching)
+                for idx in matching:
+                    counts[idx] += share
+            else:
+                nearest = min(
+                    possible_indices,
+                    key=lambda i: bucket_distance(val, bounds[i][0], bounds[i][1]),
+                )
+                counts[nearest] += 1.0
+        total_members = float(len(extremes_c))
+    else:
+        total_members = 1.0
+        uniform = 1.0 / len(possible_indices)
+        for idx in possible_indices:
+            counts[idx] = uniform
+
+    probs = [0.0] * n_buckets
+    for idx in possible_indices:
+        probs[idx] = (counts[idx] / total_members) + smoothing_alpha
+
+    total_prob = sum(probs)
+    if total_prob <= 0.0:
+        uniform = 1.0 / len(possible_indices)
+        return [uniform if not impossible_mask[i] else 0.0 for i in range(n_buckets)]
+
+    normalized = [p / total_prob if not impossible_mask[i] else 0.0 for i, p in enumerate(probs)]
+    drift = 1.0 - sum(normalized)
+    if drift != 0.0:
+        anchor_idx = max(possible_indices, key=lambda i: normalized[i])
+        normalized[anchor_idx] = max(0.0, normalized[anchor_idx] + drift)
+    return normalized
 
 
 def bucket_distance(value: float, low: float, high: float) -> float:
@@ -153,12 +271,14 @@ class EnsembleProbabilityEngine:
         intraday_decay_hours: float = 6.0,
         obs_noise_c: float = 0.4,
         default_spread_inflation: float = DEFAULT_SPREAD_INFLATION,
+        use_censored_max: bool = True,
     ) -> None:
         self.smoothing_alpha = smoothing_alpha
         self.bias_window_days = bias_window_days
         self.intraday_decay_hours = intraday_decay_hours
         self.obs_noise_c = obs_noise_c
         self.default_spread_inflation = max(1.0, float(default_spread_inflation))
+        self.use_censored_max = use_censored_max
 
     def _compute_station_bias(
         self,
@@ -427,10 +547,11 @@ class EnsembleProbabilityEngine:
         )
         if not valid_obs:
             no_impossible = [False] * len(event.buckets)
-            probs = map_extremes_to_probabilities(
-                [to_event_unit(x, event.unit) for x in bias_extremes_c],
+            probs = map_extremes_c_to_probabilities(
+                bias_extremes_c,
                 event.buckets,
                 no_impossible,
+                remark_tenths_enabled=event.remark_tenths_enabled,
                 smoothing_alpha=self.smoothing_alpha,
             )
             return probs, no_impossible
@@ -455,30 +576,66 @@ class EnsembleProbabilityEngine:
             if latest_obs.observed_at_utc.tzinfo
             else latest_obs.observed_at_utc.replace(tzinfo=timezone.utc)
         ).astimezone(timezone.utc)
-        latest_temp_c = obs_temps_c[-1]
-        shifted_trajectories, _, _ = self.compute_intraday_shifted_trajectories(
-            day_timestamps,
-            bias_trajectories,
-            latest_obs_utc,
-            latest_temp_c,
-        )
 
-        future_indices = [
-            idx for idx, ts in enumerate(day_timestamps) if ts > latest_obs_utc
-        ]
+        if self.use_censored_max and day_timestamps and bias_trajectories:
+            n_members = len(bias_trajectories)
+            n_hours = len(day_timestamps)
+            prior_mean_curve_c: list[float] = []
+            prior_std_curve_c: list[float] = []
+            for h in range(n_hours):
+                col = [bias_trajectories[m][h] for m in range(n_members)]
+                col_mean = sum(col) / n_members
+                col_var = sum((v - col_mean) ** 2 for v in col) / n_members
+                prior_mean_curve_c.append(col_mean)
+                prior_std_curve_c.append(math.sqrt(col_var))
 
-        intraday_extremes_c: list[float] = []
-        for shifted_traj in shifted_trajectories:
-            future_vals = [shifted_traj[idx] for idx in future_indices]
-            if event.polarity == Polarity.HIGHEST:
-                intraday_extremes_c.append(max([realized_extreme_c, *future_vals]))
-            else:
-                intraday_extremes_c.append(min([realized_extreme_c, *future_vals]))
+            obs_points = [
+                (
+                    (
+                        obs.observed_at_utc
+                        if obs.observed_at_utc.tzinfo
+                        else obs.observed_at_utc.replace(tzinfo=timezone.utc)
+                    ).astimezone(timezone.utc),
+                    temp_c,
+                )
+                for obs, temp_c in zip(valid_obs, obs_temps_c)
+            ]
+            cm_res = simulate_censored_extreme(
+                day_timestamps=day_timestamps,
+                prior_mean_curve_c=prior_mean_curve_c,
+                prior_std_curve_c=prior_std_curve_c,
+                obs_points=obs_points,
+                polarity=event.polarity,
+                seed_key=f"{event.event_id}:{latest_obs_utc.isoformat()}",
+                obs_noise_c=min(self.obs_noise_c, 0.35),
+            )
+            intraday_extremes_c = cm_res.simulated_extremes_c
+        else:
+            latest_temp_c = obs_temps_c[-1]
+            shifted_trajectories, _, _ = self.compute_intraday_shifted_trajectories(
+                day_timestamps,
+                bias_trajectories,
+                latest_obs_utc,
+                latest_temp_c,
+            )
 
-        intraday_probs = map_extremes_to_probabilities(
-            [to_event_unit(x, event.unit) for x in intraday_extremes_c],
+            future_indices = [
+                idx for idx, ts in enumerate(day_timestamps) if ts > latest_obs_utc
+            ]
+
+            intraday_extremes_c = []
+            for shifted_traj in shifted_trajectories:
+                future_vals = [shifted_traj[idx] for idx in future_indices]
+                if event.polarity == Polarity.HIGHEST:
+                    intraday_extremes_c.append(max([realized_extreme_c, *future_vals]))
+                else:
+                    intraday_extremes_c.append(min([realized_extreme_c, *future_vals]))
+
+        intraday_probs = map_extremes_c_to_probabilities(
+            intraday_extremes_c,
             event.buckets,
             impossible_mask,
+            remark_tenths_enabled=event.remark_tenths_enabled,
             smoothing_alpha=self.smoothing_alpha,
         )
         return intraday_probs, impossible_mask
@@ -536,12 +693,12 @@ class EnsembleProbabilityEngine:
             max(traj) if event.polarity == Polarity.HIGHEST else min(traj)
             for traj in day_trajectories
         ]
-        raw_extremes_unit = [to_event_unit(x, event.unit) for x in raw_extremes_c]
         no_impossible = [False] * len(event.buckets)
-        raw_probs = map_extremes_to_probabilities(
-            raw_extremes_unit,
+        raw_probs = map_extremes_c_to_probabilities(
+            raw_extremes_c,
             event.buckets,
             no_impossible,
+            remark_tenths_enabled=event.remark_tenths_enabled,
             smoothing_alpha=self.smoothing_alpha,
         )
 
@@ -562,11 +719,11 @@ class EnsembleProbabilityEngine:
             max(traj) if event.polarity == Polarity.HIGHEST else min(traj)
             for traj in bias_trajectories
         ]
-        bias_extremes_unit = [to_event_unit(x, event.unit) for x in bias_extremes_c]
-        bias_probs = map_extremes_to_probabilities(
-            bias_extremes_unit,
+        bias_probs = map_extremes_c_to_probabilities(
+            bias_extremes_c,
             event.buckets,
             no_impossible,
+            remark_tenths_enabled=event.remark_tenths_enabled,
             smoothing_alpha=self.smoothing_alpha,
         )
 

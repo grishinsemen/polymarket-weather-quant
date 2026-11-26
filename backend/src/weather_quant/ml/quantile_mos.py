@@ -41,10 +41,12 @@ from weather_quant.ml.dataset_builder import (
     extract_features_from_ensemble,
     features_to_vector,
 )
+from weather_quant.probability.censored_max import simulate_censored_extreme
 from weather_quant.probability.engine import (
     DEFAULT_MODEL_VERSION,
     DailyBiasObservation,
     EnsembleProbabilityEngine,
+    map_extremes_c_to_probabilities,
     map_extremes_to_probabilities,
     to_event_unit,
 )
@@ -471,35 +473,43 @@ class QuantileMosModel:
                     scale=mos_scale,
                 )
                 latest_obs_utc = _ensure_utc(today_metars[-1].observed_at_utc)
-                latest_temp_c = obs_temps_c[-1]
-                shifted_trajectories, _, _ = prob_engine.compute_intraday_shifted_trajectories(
-                    day_timestamps,
-                    mos_trajectories,
-                    latest_obs_utc,
-                    latest_temp_c,
-                )
-                future_indices = [
-                    idx for idx, ts in enumerate(day_timestamps) if ts > latest_obs_utc
+                n_members = len(mos_trajectories)
+                n_hours = len(day_timestamps)
+                prior_mean_curve_c = [
+                    sum(mos_trajectories[m][h] for m in range(n_members)) / n_members
+                    for h in range(n_hours)
                 ]
-                intraday_extremes_c: list[float] = []
-                for shifted_traj in shifted_trajectories:
-                    future_vals = [shifted_traj[idx] for idx in future_indices]
-                    if event.polarity == Polarity.HIGHEST:
-                        intraday_extremes_c.append(max([realized_extreme_c, *future_vals]))
-                    else:
-                        intraday_extremes_c.append(min([realized_extreme_c, *future_vals]))
-                mos_extremes_c = intraday_extremes_c
+                prior_std_curve_c = [
+                    math.sqrt(
+                        sum((mos_trajectories[m][h] - prior_mean_curve_c[h]) ** 2 for m in range(n_members))
+                        / n_members
+                    )
+                    for h in range(n_hours)
+                ]
+                obs_points = [
+                    (_ensure_utc(obs.observed_at_utc), temp_c)
+                    for obs, temp_c in zip(today_metars, obs_temps_c)
+                ]
+                cm_res = simulate_censored_extreme(
+                    day_timestamps=day_timestamps,
+                    prior_mean_curve_c=prior_mean_curve_c,
+                    prior_std_curve_c=prior_std_curve_c,
+                    obs_points=obs_points,
+                    polarity=event.polarity,
+                    seed_key=f"{event.event_id}:{self.model_version}:{latest_obs_utc.isoformat()}",
+                )
+                mos_extremes_c = cm_res.simulated_extremes_c
             else:
                 if event.polarity == Polarity.HIGHEST:
                     mos_extremes_c = [max(x, realized_extreme_c) for x in mos_extremes_c]
                 else:
                     mos_extremes_c = [min(x, realized_extreme_c) for x in mos_extremes_c]
 
-        mos_extremes_unit = [to_event_unit(x, event.unit) for x in mos_extremes_c]
-        mos_probs = map_extremes_to_probabilities(
-            mos_extremes_unit,
+        mos_probs = map_extremes_c_to_probabilities(
+            mos_extremes_c,
             event.buckets,
             impossible_mask,
+            remark_tenths_enabled=event.remark_tenths_enabled,
             smoothing_alpha=0.001,
         )
 
