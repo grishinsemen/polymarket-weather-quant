@@ -326,6 +326,8 @@ class ExperimentRunSummary(BaseModel):
     dataset_start_utc: datetime
     dataset_end_utc: datetime
     brier_score: float
+    log_loss: float | None = None
+    sharpe_ratio: float | None = None
     avg_clv: float
     fill_rate: float
     trade_count: int

@@ -6,6 +6,8 @@ import { EdgeScreenerTable } from "./EdgeScreenerTable";
 import { ExperimentLabPanel } from "./ExperimentLabPanel";
 import { TopPortfolioBar, type TerminalTab, type WsStatus } from "./TopPortfolioBar";
 import type {
+  CalibrationEvaluationReport,
+  ExitModeComparisonResult,
   ExperimentRunSummary,
   ReplayProgressStatus,
   TerminalSnapshotResponse,
@@ -25,6 +27,10 @@ interface WeatherQuantTerminalProps {
   isActivatingPair?: boolean;
   promotingRunId?: string | null;
   replayWindowHours?: number | null;
+  exitComparison?: ExitModeComparisonResult | null;
+  isComparingExits?: boolean;
+  calibrationReport?: CalibrationEvaluationReport | null;
+  isRunningCalibration?: boolean;
   errorBanner?: string | null;
   onSelectEvent: (eventId: string) => void;
   onSelectTab: (tab: TerminalTab) => void;
@@ -35,6 +41,12 @@ interface WeatherQuantTerminalProps {
   onSync: () => Promise<void>;
   onSeedDemo: () => Promise<void>;
   onRunReplay: (modelVersion: string, strategyVersion: string) => Promise<void>;
+  onCompareExitModes?: (
+    modelVersion: string,
+    strategyVersion: string,
+    enableBuyNo: boolean,
+  ) => Promise<void>;
+  onRunCalibrationAudit?: () => Promise<void>;
   onActivatePair?: (modelVersion: string, strategyVersion: string) => Promise<void>;
   onPromoteRun: (run: ExperimentRunSummary) => Promise<void>;
 }
@@ -53,6 +65,10 @@ export function WeatherQuantTerminal({
   isActivatingPair = false,
   promotingRunId = null,
   replayWindowHours = 24,
+  exitComparison = null,
+  isComparingExits = false,
+  calibrationReport = null,
+  isRunningCalibration = false,
   errorBanner = null,
   onSelectEvent,
   onSelectTab,
@@ -63,6 +79,8 @@ export function WeatherQuantTerminal({
   onSync,
   onSeedDemo,
   onRunReplay,
+  onCompareExitModes,
+  onRunCalibrationAudit,
   onActivatePair,
   onPromoteRun,
 }: WeatherQuantTerminalProps) {
@@ -85,6 +103,13 @@ export function WeatherQuantTerminal({
       ? selectedEventId
       : snapshot.screener[0]?.event_id ?? null;
   const activeXRay = effectiveEventId ? snapshot.xrays[effectiveEventId] ?? null : null;
+
+  const liveActiveModelVersion =
+    snapshot.model_versions.find((m) => m.is_active)?.model_version ??
+    snapshot.portfolio.active_model_version;
+  const liveActiveStrategyVersion =
+    snapshot.strategy_versions.find((s) => s.is_active)?.strategy_version ??
+    snapshot.portfolio.active_strategy_version;
 
   return (
     <div className="min-h-screen bg-[#070b12] text-slate-200 flex flex-col">
@@ -167,17 +192,23 @@ export function WeatherQuantTerminal({
             strategyVersions={snapshot.strategy_versions}
             selectedModelVersion={selectedModelVersion}
             selectedStrategyVersion={selectedStrategyVersion}
-            activeModelVersion={snapshot.portfolio.active_model_version}
-            activeStrategyVersion={snapshot.portfolio.active_strategy_version}
+            activeModelVersion={liveActiveModelVersion}
+            activeStrategyVersion={liveActiveStrategyVersion}
             isRunningReplay={isRunningReplay}
             replayProgress={replayProgress}
             isActivatingPair={isActivatingPair}
             promotingRunId={promotingRunId}
             replayWindowHours={replayWindowHours}
+            exitComparison={exitComparison}
+            isComparingExits={isComparingExits}
+            calibrationReport={calibrationReport}
+            isRunningCalibration={isRunningCalibration}
             onSelectModelVersion={onFilterModelVersion}
             onSelectStrategyVersion={onFilterStrategyVersion}
             onSelectReplayWindow={onSelectReplayWindow}
             onRunReplay={onRunReplay}
+            onCompareExitModes={onCompareExitModes}
+            onRunCalibrationAudit={onRunCalibrationAudit}
             onActivatePair={onActivatePair}
             onPromoteRun={onPromoteRun}
           />

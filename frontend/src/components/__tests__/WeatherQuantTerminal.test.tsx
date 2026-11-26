@@ -1371,4 +1371,263 @@ describe("WeatherQuantTerminal", () => {
     expect(screen.queryByTestId("ensemble-position-dropline-pos-evt-rksi-6")).not.toBeInTheDocument();
     expect(screen.queryByTestId("ensemble-position-time-pos-evt-rksi-6")).not.toBeInTheDocument();
   });
+
+  it("sorts Experiment Lab runs by clicking Brier Score and Avg CLV column headers", () => {
+    const multiRunSnapshot: TerminalSnapshotResponse = {
+      ...FIXTURE_SNAPSHOT,
+      experiment_runs: [
+        {
+          ...FIXTURE_SNAPSHOT.experiment_runs[0],
+          run_id: "exp-high-brier-neg-clv",
+          brier_score: 0.48,
+          avg_clv: -0.015,
+        },
+        {
+          ...FIXTURE_SNAPSHOT.experiment_runs[1],
+          run_id: "exp-low-brier-pos-clv",
+          brier_score: 0.14,
+          avg_clv: 0.065,
+        },
+        {
+          ...FIXTURE_SNAPSHOT.experiment_runs[0],
+          run_id: "exp-mid-brier-small-clv",
+          brier_score: 0.25,
+          avg_clv: 0.012,
+        },
+      ],
+    };
+
+    render(
+      <WeatherQuantTerminal
+        snapshot={multiRunSnapshot}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="experiments"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    expect(screen.queryByTestId("experiment-lab-filters")).not.toBeInTheDocument();
+
+    // 1st click on Brier Score -> ascending (lowest Brier 0.140 first)
+    fireEvent.click(screen.getByTestId("sort-runs-brier"));
+    let rows = screen.getAllByTestId("experiment-run-row");
+    expect(within(rows[0]).getByText("exp-low-brier-pos-clv")).toBeInTheDocument();
+    expect(within(rows[2]).getByText("exp-high-brier-neg-clv")).toBeInTheDocument();
+
+    // 2nd click on Brier Score -> descending (highest Brier 0.480 first)
+    fireEvent.click(screen.getByTestId("sort-runs-brier"));
+    rows = screen.getAllByTestId("experiment-run-row");
+    expect(within(rows[0]).getByText("exp-high-brier-neg-clv")).toBeInTheDocument();
+
+    // 1st click on Avg CLV -> descending (highest CLV +6.5¢ first)
+    fireEvent.click(screen.getByTestId("sort-runs-clv"));
+    rows = screen.getAllByTestId("experiment-run-row");
+    expect(within(rows[0]).getByText("exp-low-brier-pos-clv")).toBeInTheDocument();
+    expect(within(rows[2]).getByText("exp-high-brier-neg-clv")).toBeInTheDocument();
+
+    // 2nd click on Avg CLV -> ascending (lowest CLV -1.5¢ first)
+    fireEvent.click(screen.getByTestId("sort-runs-clv"));
+    rows = screen.getAllByTestId("experiment-run-row");
+    expect(within(rows[0]).getByText("exp-high-brier-neg-clv")).toBeInTheDocument();
+  });
+
+  it("renders Log-Loss/Sharpe sorting, Exit Mode Comparison, Model Calibration Audit, and Russian target cheat sheet", () => {
+    const onCompareExitModes = vi.fn(async () => {});
+    const onRunCalibrationAudit = vi.fn(async () => {});
+
+    const diagSnapshot: TerminalSnapshotResponse = {
+      ...FIXTURE_SNAPSHOT,
+      experiment_runs: [
+        {
+          ...FIXTURE_SNAPSHOT.experiment_runs[0],
+          run_id: "exp-legacy-null",
+          log_loss: null,
+          sharpe_ratio: null,
+        },
+        {
+          ...FIXTURE_SNAPSHOT.experiment_runs[1],
+          run_id: "exp-sharp-low-ll",
+          log_loss: 1.62,
+          sharpe_ratio: 1.85,
+        },
+        {
+          ...FIXTURE_SNAPSHOT.experiment_runs[0],
+          run_id: "exp-weak-high-ll",
+          log_loss: 2.34,
+          sharpe_ratio: 0.42,
+        },
+      ],
+    };
+
+    render(
+      <WeatherQuantTerminal
+        snapshot={diagSnapshot}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="experiments"
+        selectedModelVersion="mos-lgbm-v1"
+        selectedStrategyVersion="aggressive-kelly-100-v2"
+        exitComparison={{
+          model_version: "mos-lgbm-v1",
+          base_strategy_version: "aggressive-kelly-100-v2",
+          enable_buy_no: false,
+          take_profit_min_profit: 0.03,
+          take_profit_premium: 0.02,
+          hold_to_expiry: {
+            mode: "hold_to_expiry",
+            strategy_version: "aggressive-kelly-100-v2",
+            net_pnl_usd: -1.25,
+            net_return_pct: -1.25,
+            max_drawdown_usd: 4.1,
+            sharpe_ratio: -0.4,
+            trade_count: 8,
+            fill_rate: 0.5,
+            avg_clv: 0.01,
+            avg_expected_edge: 0.09,
+            avg_actual_edge: -0.02,
+            summary: FIXTURE_SNAPSHOT.experiment_runs[0],
+          },
+          dynamic_early_exit: {
+            mode: "dynamic_early_exit",
+            strategy_version: "aggressive-kelly-100-v2",
+            net_pnl_usd: 3.45,
+            net_return_pct: 3.45,
+            max_drawdown_usd: 1.9,
+            sharpe_ratio: 1.72,
+            trade_count: 11,
+            fill_rate: 0.62,
+            avg_clv: 0.03,
+            avg_expected_edge: 0.09,
+            avg_actual_edge: 0.06,
+            summary: FIXTURE_SNAPSHOT.experiment_runs[1],
+          },
+          delta_pnl_usd: 4.7,
+          delta_max_drawdown_usd: -2.2,
+          delta_sharpe_ratio: 2.12,
+          winner_by_sharpe: "dynamic_early_exit",
+          summary_log: "Hold vs Dynamic",
+        }}
+        calibrationReport={{
+          generated_at_utc: "2026-11-26T18:00:00Z",
+          tail_price_threshold: 0.1,
+          overall_raw: {
+            sample_count: 18,
+            brier_score: 0.521,
+            log_loss: 2.31,
+            coverage_p10_p90: 0.611,
+            tail_brier_score: 0.041,
+            tail_bucket_count: 72,
+            mean_bias_c: 0.85,
+            mae_c: 1.42,
+            rmse_c: 1.78,
+          },
+          overall_calibrated: {
+            sample_count: 18,
+            brier_score: 0.382,
+            log_loss: 1.74,
+            coverage_p10_p90: 0.778,
+            tail_brier_score: 0.023,
+            tail_bucket_count: 68,
+            mean_bias_c: 0.12,
+            mae_c: 1.05,
+            rmse_c: 1.31,
+          },
+          stations: [
+            {
+              station_icao: "LFPB",
+              city: "Paris",
+              sample_count: 10,
+              learned_bias_c: 0.35,
+              learned_spread_scale: 1.25,
+              raw: {
+                sample_count: 10,
+                brier_score: 0.51,
+                log_loss: 2.2,
+                coverage_p10_p90: 0.6,
+                tail_brier_score: 0.04,
+                tail_bucket_count: 40,
+                mean_bias_c: 0.8,
+                mae_c: 1.3,
+                rmse_c: 1.65,
+              },
+              calibrated: {
+                sample_count: 10,
+                brier_score: 0.37,
+                log_loss: 1.68,
+                coverage_p10_p90: 0.8,
+                tail_brier_score: 0.021,
+                tail_bucket_count: 38,
+                mean_bias_c: 0.1,
+                mae_c: 0.95,
+                rmse_c: 1.18,
+              },
+            },
+          ],
+        }}
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onCompareExitModes={onCompareExitModes}
+        onRunCalibrationAudit={onRunCalibrationAudit}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    // Log-Loss sort (ascending first, missing nulls pushed to bottom)
+    fireEvent.click(screen.getByTestId("sort-runs-logloss"));
+    let rows = screen.getAllByTestId("experiment-run-row");
+    expect(within(rows[0]).getByText("exp-sharp-low-ll")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("1.620")).toBeInTheDocument();
+    expect(within(rows[2]).getByText("exp-legacy-null")).toBeInTheDocument();
+
+    // Sharpe sort (descending first, missing nulls pushed to bottom)
+    fireEvent.click(screen.getByTestId("sort-runs-sharpe"));
+    rows = screen.getAllByTestId("experiment-run-row");
+    expect(within(rows[0]).getByText("exp-sharp-low-ll")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("+1.85")).toBeInTheDocument();
+    expect(within(rows[2]).getByText("exp-legacy-null")).toBeInTheDocument();
+
+    // Exit Mode Comparison card + BUY NO toggle
+    const exitCard = screen.getByTestId("exit-mode-comparison-card");
+    expect(within(exitCard).getByText("Hold-to-Expiry")).toBeInTheDocument();
+    expect(within(exitCard).getByText("Dynamic Early-Exit")).toBeInTheDocument();
+    expect(within(exitCard).getByText("Winner: dynamic_early_exit")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("compare-buy-no-toggle"));
+    fireEvent.click(screen.getByTestId("compare-exit-modes-btn"));
+    expect(onCompareExitModes).toHaveBeenCalledWith("mos-lgbm-v1", "aggressive-kelly-100-v2", false);
+
+    // Model Calibration Audit card + expandable stations
+    const calCard = screen.getByTestId("model-calibration-card");
+    expect(within(calCard).getByText("Raw (Layer 1)")).toBeInTheDocument();
+    expect(within(calCard).getByText("Calibrated (EMOS)")).toBeInTheDocument();
+    expect(within(calCard).getByText("77.8%")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("run-calibration-audit-btn"));
+    expect(onRunCalibrationAudit).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(calCard).getByText("Per-station breakdown ▾"));
+    expect(within(calCard).getByText("LFPB")).toBeInTheDocument();
+
+    // Russian target metrics cheat sheet
+    const sheet = screen.getByTestId("metrics-target-cheatsheet");
+    expect(within(sheet).getByText("Brier Score (11 бакетов)")).toBeInTheDocument();
+    expect(within(sheet).getByText("Log-Loss")).toBeInTheDocument();
+    expect(within(sheet).getByText("P10–P90 Coverage")).toBeInTheDocument();
+    expect(within(sheet).getByText("Avg CLV")).toBeInTheDocument();
+    expect(within(sheet).getByText("Sharpe Ratio")).toBeInTheDocument();
+  });
 });

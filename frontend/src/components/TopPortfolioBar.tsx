@@ -56,6 +56,11 @@ export function TopPortfolioBar({
   const activeStrategy = strategyVersions.find(
     (s) => s.strategy_version === selectedStrategyVersion,
   );
+  const liveModelVersion = modelVersions.find((m) => m.is_active)?.model_version;
+  const liveStrategyVersion = strategyVersions.find((s) => s.is_active)?.strategy_version;
+  const isViewingLive =
+    (!liveModelVersion || selectedModelVersion === liveModelVersion) &&
+    (!liveStrategyVersion || selectedStrategyVersion === liveStrategyVersion);
   const cityCap = activeStrategy?.max_city_exposure_usd ?? 8.0;
   const reserveRatio = activeStrategy?.intraday_cash_reserve_ratio ?? 0.4;
   const reservePct = Math.round(reserveRatio * 100);
@@ -274,7 +279,33 @@ export function TopPortfolioBar({
             </div>
           </div>
 
-          <div className="rounded bg-[#0f1726] border border-[#1c2638] px-2.5 py-1.5 flex flex-col justify-between gap-1">
+          <div
+            className={`rounded bg-[#0f1726] border px-2.5 py-1.5 flex flex-col justify-between gap-1 ${
+              isViewingLive ? "border-[#1c2638]" : "border-amber-600/70"
+            }`}
+          >
+            <div className="flex items-center justify-between gap-1 text-[9px] font-mono-tabular uppercase tracking-wider">
+              {isViewingLive ? (
+                <span className="text-emerald-400">● Live Active</span>
+              ) : (
+                <>
+                  <span className="text-amber-300" title="Viewing filtered version; live trading uses the LIVE version">
+                    Filter View
+                  </span>
+                  <button
+                    type="button"
+                    data-testid="reset-to-live-versions-btn"
+                    onClick={() => {
+                      if (liveModelVersion) onFilterModelVersion(liveModelVersion);
+                      if (liveStrategyVersion) onFilterStrategyVersion(liveStrategyVersion);
+                    }}
+                    className="text-sky-400 hover:text-sky-300 underline"
+                  >
+                    → Live
+                  </button>
+                </>
+              )}
+            </div>
             <label className="flex items-center justify-between gap-1 text-[10px] text-slate-500 uppercase">
               <span>Model</span>
               <select
@@ -285,7 +316,7 @@ export function TopPortfolioBar({
               >
                 {modelVersions.map((m) => (
                   <option key={m.model_version} value={m.model_version}>
-                    {m.model_version}
+                    {m.is_active ? `${m.model_version} (LIVE)` : m.model_version}
                   </option>
                 ))}
               </select>
@@ -300,7 +331,7 @@ export function TopPortfolioBar({
               >
                 {strategyVersions.map((s) => (
                   <option key={s.strategy_version} value={s.strategy_version}>
-                    {s.strategy_version}
+                    {s.is_active ? `${s.strategy_version} (LIVE)` : s.strategy_version}
                   </option>
                 ))}
               </select>

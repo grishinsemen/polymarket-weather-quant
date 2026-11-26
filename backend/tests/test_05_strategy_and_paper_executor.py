@@ -1708,6 +1708,59 @@ async def test_dynamic_pre_resolution_take_profit_repricing_and_edge_logging() -
         await db.close()
 
 
+@pytest.mark.asyncio
+async def test_resting_buy_cancelled_before_fill_on_zeroed_bucket_and_crash_ask() -> None:
+    """Regression for NZWN 14°C & CYYZ 3°C: resting BUY must be cancelled BEFORE PaperExecutor
+    evaluates fills when the bucket is ZEROED or when best_ask crashes to <= 2c."""
+    from weather_quant.strategy.engine import R_CRASH_CANCEL
+
+    clock = VirtualClock(datetime(2026, 11, 26, 9, 0, tzinfo=timezone.utc))
+    db = Database(":memory:")
+    await db.initialize()
+    try:
+        executor = PaperExecutor(db=db, clock=clock)
+        engine = StrategyEngine(db=db, executor=executor, clock=clock)
+        await engine.initialize()
+
+        event = _make_event(event_id="evt-adverse-guard", icao="NZWN", city="Wellington", bucket_count=2)
+        b0 = event.buckets[0].bucket_id
+        b1 = event.buckets[1].bucket_id
+        now = clock.now()
+
+        # Place two valid resting BUYs at 15c (b0) and 16c (b1)
+        probs_open = _make_probs(event, [0.35, 0.36], computed_at=now - timedelta(minutes=1))
+        books_open = {
+            b0: _make_book(event, 0, bid=0.14, ask=0.18, bid_size=100.0, ask_size=100.0, ingested_at=now),
+            b1: _make_book(event, 1, bid=0.15, ask=0.19, bid_size=100.0, ask_size=100.0, ingested_at=now),
+        }
+        res_open = await engine.tick_event(event, probs_open, books_open)
+        assert len(res_open.placed) == 2
+        ord_b0 = next(o for o in res_open.placed if o.bucket_id == b0)
+        ord_b1 = next(o for o in res_open.placed if o.bucket_id == b1)
+
+        # Next tick:
+        # - b0 becomes ZEROED (METAR breached, like NZWN 13°C killing 14°C) and ask drops to 0.01
+        # - b1 is NOT yet marked ZEROED (METAR poll lag, like CYYZ 3°C), but ask crashes to 0.01
+        # BOTH resting BUYs MUST be cancelled BEFORE sim.on_books -> ZERO fills!
+        clock.advance(timedelta(minutes=5))
+        t2 = clock.now()
+        probs_crash = _make_probs(event, [0.0, 0.36], computed_at=t2 - timedelta(minutes=1), impossible=[True, False])
+        books_crash = {
+            b0: _make_book(event, 0, bid=0.0, ask=0.01, bid_size=0.0, ask_size=200.0, ingested_at=t2),
+            b1: _make_book(event, 1, bid=0.0, ask=0.01, bid_size=0.0, ask_size=200.0, ingested_at=t2),
+        }
+        res_crash = await engine.tick_event(event, probs_crash, books_crash)
+        assert res_crash.fills == []
+        assert ord_b0.order_id in res_crash.cancelled
+        assert ord_b1.order_id in res_crash.cancelled
+        assert await engine.store.list_positions(status="OPEN", event_id=event.event_id) == []
+
+        audits = await engine.store.list_audit(event_id=event.event_id)
+        assert any(a.bucket_id == b1 and R_CRASH_CANCEL in a.reason_codes for a in audits)
+    finally:
+        await db.close()
+
+
 
 
 

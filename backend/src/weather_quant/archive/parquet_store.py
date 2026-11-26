@@ -283,29 +283,229 @@ class ParquetArchiveStore:
         end_utc: datetime | None = None,
         event_id: str | None = None,
         station_icao: str | None = None,
+        dedupe_by_station_fetch: bool = False,
     ) -> list[EnsembleSnapshot]:
-        rows = self._read_rows(
-            "ensemble",
-            decision_time=decision_time,
-            start_utc=start_utc,
-            end_utc=end_utc,
-        )
-        items = [_row_to_ensemble(r) for r in rows]
-        if event_id is not None:
-            items = [i for i in items if i.event_id == event_id]
-        if station_icao is not None:
-            target = station_icao.upper()
-            items = [i for i in items if i.station_icao == target]
+        kind_dir = self.base_dir / "ensemble"
+        if not kind_dir.exists():
+            return []
+
+        decision_utc = _ensure_utc(decision_time) if decision_time is not None else None
+        start_norm = _ensure_utc(start_utc) if start_utc is not None else None
+        end_norm = _ensure_utc(end_utc) if end_utc is not None else None
+        target_icao = station_icao.upper() if station_icao is not None else None
+
+        max_date = decision_utc.date().isoformat() if decision_utc is not None else None
+        if end_norm is not None:
+            end_date = end_norm.date().isoformat()
+            max_date = end_date if max_date is None or end_date < max_date else max_date
+        min_date = start_norm.date().isoformat() if start_norm is not None else None
+
+        selected_by_file: dict[Path, list[int]] = {}
+        seen_keys: set[tuple[str, str]] = set()
+
+        for part_dir in sorted(kind_dir.glob("dt=*")):
+            dt_str = part_dir.name.removeprefix("dt=")
+            if min_date is not None and dt_str < min_date:
+                continue
+            if max_date is not None and dt_str > max_date:
+                continue
+            for file_path in sorted(part_dir.glob("*.parquet")):
+                meta = pq.read_table(
+                    file_path,
+                    columns=["event_id", "station_icao", "fetched_at_utc", "ingested_at_utc"],
+                )
+                if meta.num_rows == 0:
+                    continue
+                ev_col = meta.column("event_id").to_pylist()
+                st_col = meta.column("station_icao").to_pylist()
+                ft_col = meta.column("fetched_at_utc").to_pylist()
+                in_col = meta.column("ingested_at_utc").to_pylist()
+                matched_indices: list[int] = []
+                for idx in range(meta.num_rows):
+                    ingested = _ensure_utc(in_col[idx])
+                    if decision_utc is not None and ingested >= decision_utc:
+                        continue
+                    if start_norm is not None and ingested < start_norm:
+                        continue
+                    if end_norm is not None and ingested > end_norm:
+                        continue
+                    if event_id is not None and ev_col[idx] != event_id:
+                        continue
+                    icao_val = str(st_col[idx]).upper()
+                    if target_icao is not None and icao_val != target_icao:
+                        continue
+                    if dedupe_by_station_fetch:
+                        dkey = (icao_val, _ensure_utc(ft_col[idx]).isoformat())
+                        if dkey in seen_keys:
+                            continue
+                        seen_keys.add(dkey)
+                    matched_indices.append(idx)
+                if matched_indices:
+                    selected_by_file[file_path] = matched_indices
+
+        items: list[EnsembleSnapshot] = []
+        for file_path, indices in selected_by_file.items():
+            table = pq.read_table(file_path)
+            if len(indices) < table.num_rows:
+                table = table.take(indices)
+            for row in table.to_pylist():
+                items.append(_row_to_ensemble(row))
+
+        items.sort(key=lambda s: _ensure_utc(s.ingested_at_utc))
+        return items
+
+    def read_latest_ensemble_snapshots(
+        self,
+        *,
+        start_utc: datetime | None = None,
+        end_utc: datetime | None = None,
+        dedupe_by: Literal["station", "station_day"] = "station",
+        keep: Literal["latest", "earliest"] = "latest",
+    ) -> list[EnsembleSnapshot]:
+        """Fast metadata-first ensemble reader that skips giant JSON payloads for non-selected files."""
+        kind_dir = self.base_dir / "ensemble"
+        if not kind_dir.exists():
+            return []
+
+        start_norm = _ensure_utc(start_utc) if start_utc is not None else None
+        end_norm = _ensure_utc(end_utc) if end_utc is not None else None
+        min_date = start_norm.date().isoformat() if start_norm is not None else None
+        max_date = end_norm.date().isoformat() if end_norm is not None else None
+
+        # key -> (rank_ts, file_path, row_idx)
+        winners: dict[tuple[str, ...], tuple[datetime, Path, int]] = {}
+
+        for part_dir in sorted(kind_dir.glob("dt=*")):
+            dt_str = part_dir.name.removeprefix("dt=")
+            if min_date is not None and dt_str < min_date:
+                continue
+            if max_date is not None and dt_str > max_date:
+                continue
+            for file_path in sorted(part_dir.glob("*.parquet")):
+                meta = pq.read_table(
+                    file_path,
+                    columns=["station_icao", "fetched_at_utc", "ingested_at_utc"],
+                )
+                if meta.num_rows == 0:
+                    continue
+                st_col = meta.column("station_icao").to_pylist()
+                ft_col = meta.column("fetched_at_utc").to_pylist()
+                in_col = meta.column("ingested_at_utc").to_pylist()
+                for idx in range(meta.num_rows):
+                    ingested = _ensure_utc(in_col[idx])
+                    if start_norm is not None and ingested < start_norm:
+                        continue
+                    if end_norm is not None and ingested > end_norm:
+                        continue
+                    icao = str(st_col[idx]).upper()
+                    fetched = _ensure_utc(ft_col[idx])
+                    key: tuple[str, ...] = (
+                        (icao,)
+                        if dedupe_by == "station"
+                        else (icao, ingested.date().isoformat())
+                    )
+                    rank_ts = fetched if keep == "latest" else ingested
+                    prev = winners.get(key)
+                    if prev is None:
+                        winners[key] = (rank_ts, file_path, idx)
+                    elif keep == "latest" and rank_ts > prev[0]:
+                        winners[key] = (rank_ts, file_path, idx)
+                    elif keep == "earliest" and rank_ts < prev[0]:
+                        winners[key] = (rank_ts, file_path, idx)
+
+        by_file: dict[Path, list[int]] = defaultdict(list)
+        for _, file_path, idx in winners.values():
+            by_file[file_path].append(idx)
+
+        items: list[EnsembleSnapshot] = []
+        for file_path, indices in by_file.items():
+            table = pq.read_table(file_path)
+            if len(indices) < table.num_rows:
+                table = table.take(indices)
+            for row in table.to_pylist():
+                items.append(_row_to_ensemble(row))
+
+        items.sort(key=lambda s: _ensure_utc(s.ingested_at_utc))
+        return items
+
+    def read_latest_orderbook_snapshots(
+        self,
+        *,
+        start_utc: datetime | None = None,
+        end_utc: datetime | None = None,
+        event_ids: set[str] | None = None,
+    ) -> list[OrderBookSnapshot]:
+        """Fast metadata-first reader returning only the latest OrderBookSnapshot per (event_id, bucket_id)."""
+        kind_dir = self.base_dir / "orderbook"
+        if not kind_dir.exists():
+            return []
+
+        start_norm = _ensure_utc(start_utc) if start_utc is not None else None
+        end_norm = _ensure_utc(end_utc) if end_utc is not None else None
+        min_date = start_norm.date().isoformat() if start_norm is not None else None
+        max_date = end_norm.date().isoformat() if end_norm is not None else None
+
+        winners: dict[tuple[str, str], tuple[datetime, Path, int]] = {}
+
+        for part_dir in sorted(kind_dir.glob("dt=*")):
+            dt_str = part_dir.name.removeprefix("dt=")
+            if min_date is not None and dt_str < min_date:
+                continue
+            if max_date is not None and dt_str > max_date:
+                continue
+            for file_path in sorted(part_dir.glob("*.parquet")):
+                meta = pq.read_table(
+                    file_path,
+                    columns=["event_id", "bucket_id", "ingested_at_utc"],
+                )
+                if meta.num_rows == 0:
+                    continue
+                ev_col = meta.column("event_id").to_pylist()
+                bk_col = meta.column("bucket_id").to_pylist()
+                in_col = meta.column("ingested_at_utc").to_pylist()
+                for idx in range(meta.num_rows):
+                    ev_id = str(ev_col[idx])
+                    if event_ids is not None and ev_id not in event_ids:
+                        continue
+                    ingested = _ensure_utc(in_col[idx])
+                    if start_norm is not None and ingested < start_norm:
+                        continue
+                    if end_norm is not None and ingested > end_norm:
+                        continue
+                    key = (ev_id, str(bk_col[idx]))
+                    prev = winners.get(key)
+                    if prev is None or ingested >= prev[0]:
+                        winners[key] = (ingested, file_path, idx)
+
+        by_file: dict[Path, list[int]] = defaultdict(list)
+        for _, file_path, idx in winners.values():
+            by_file[file_path].append(idx)
+
+        items: list[OrderBookSnapshot] = []
+        for file_path, indices in by_file.items():
+            table = pq.read_table(file_path)
+            if len(indices) < table.num_rows:
+                table = table.take(indices)
+            for row in table.to_pylist():
+                items.append(_row_to_orderbook(row))
+
+        items.sort(key=lambda b: _ensure_utc(b.ingested_at_utc))
         return items
 
     async def aread_orderbook_snapshots(self, **kwargs: Any) -> list[OrderBookSnapshot]:
         return await asyncio.to_thread(self.read_orderbook_snapshots, **kwargs)
+
+    async def aread_latest_orderbook_snapshots(self, **kwargs: Any) -> list[OrderBookSnapshot]:
+        return await asyncio.to_thread(self.read_latest_orderbook_snapshots, **kwargs)
 
     async def aread_metar_observations(self, **kwargs: Any) -> list[MetarObservation]:
         return await asyncio.to_thread(self.read_metar_observations, **kwargs)
 
     async def aread_ensemble_snapshots(self, **kwargs: Any) -> list[EnsembleSnapshot]:
         return await asyncio.to_thread(self.read_ensemble_snapshots, **kwargs)
+
+    async def aread_latest_ensemble_snapshots(self, **kwargs: Any) -> list[EnsembleSnapshot]:
+        return await asyncio.to_thread(self.read_latest_ensemble_snapshots, **kwargs)
 
     def get_health(self) -> ArchiveHealth:
         """Inspect Parquet partitions, file counts, byte footprint, and UTC timestamp bounds."""

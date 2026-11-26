@@ -571,11 +571,16 @@ def test_terminal_snapshot_demo_fallback_seed_replay_and_promote(tmp_path: Path)
         run_payload = run_resp.json()
         run_id = run_payload["run"]["run_id"]
         assert run_payload["run"]["model_version"] == cand_mv
+        assert run_payload["run"]["log_loss"] is not None
+        assert run_payload["run"]["sharpe_ratio"] is not None
 
         # 5. List runs via GET /api/replay/runs
         runs_resp = client.get("/api/replay/runs")
         assert runs_resp.status_code == 200
-        assert any(r["run_id"] == run_id for r in runs_resp.json()["runs"])
+        matching_runs = [r for r in runs_resp.json()["runs"] if r["run_id"] == run_id]
+        assert len(matching_runs) == 1
+        assert matching_runs[0]["log_loss"] == pytest.approx(run_payload["run"]["log_loss"])
+        assert matching_runs[0]["sharpe_ratio"] == pytest.approx(run_payload["run"]["sharpe_ratio"])
 
         # 6. Promote winning pair via POST /api/replay/promote
         prom_resp = client.post(
@@ -702,4 +707,19 @@ async def test_compare_exit_modes_hold_to_expiry_vs_dynamic_early_exit_and_api(t
         assert "sharpe_ratio" in payload["hold_to_expiry"]
         assert "sharpe_ratio" in payload["dynamic_early_exit"]
         assert "summary_log" in payload
+
+        # Verify on-demand Model Calibration Audit endpoint POST /api/replay/calibration-audit
+        cal_resp = client.post(
+            "/api/replay/calibration-audit",
+            json={"lookback_days": 30, "tail_price_threshold": 0.10, "min_metars_per_day": 1},
+        )
+        assert cal_resp.status_code == 200
+        cal_report = cal_resp.json()["report"]
+        assert "overall_raw" in cal_report
+        assert "overall_calibrated" in cal_report
+        assert "brier_score" in cal_report["overall_calibrated"]
+        assert "log_loss" in cal_report["overall_calibrated"]
+        assert "coverage_p10_p90" in cal_report["overall_calibrated"]
+        assert isinstance(cal_report["stations"], list)
+
 

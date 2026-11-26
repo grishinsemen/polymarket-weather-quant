@@ -347,6 +347,29 @@ def _compute_brier_score(
     return round(sum(scores) / len(scores), 6)
 
 
+def _compute_log_loss(
+    events: Sequence[WeatherEvent],
+    latest_probs: Mapping[str, EventProbabilitySnapshot],
+    metars: Sequence[MetarObservation],
+    dataset_end_utc: datetime,
+) -> float | None:
+    losses: list[float] = []
+    for event in events:
+        snap = latest_probs.get(event.event_id)
+        if snap is None or not snap.buckets:
+            continue
+        true_idx = _resolve_winning_bucket_index(event, metars, dataset_end_utc)
+        if true_idx is None or true_idx >= len(event.buckets):
+            continue
+        prob_by_bucket = {b.bucket_id: b.fair_probability for b in snap.buckets}
+        true_bucket_id = event.buckets[true_idx].bucket_id
+        p_true = prob_by_bucket.get(true_bucket_id, 0.0)
+        losses.append(-math.log(max(1e-6, min(1.0, p_true))))
+    if not losses:
+        return None
+    return round(sum(losses) / len(losses), 6)
+
+
 async def _settle_expired_events(
     store: StrategyStore,
     events: Sequence[WeatherEvent],
@@ -531,6 +554,7 @@ async def _execute_replay_isolated(
 
         latest_books: dict[str, dict[str, OrderBookSnapshot]] = {}
         latest_ensembles: dict[str, EnsembleSnapshot] = {}
+        latest_ensembles_by_station: dict[str, EnsembleSnapshot] = {}
         metars_by_station: dict[str, list[MetarObservation]] = {}
         latest_probs: dict[str, EventProbabilitySnapshot] = {}
         last_prob_input_stamp: dict[str, tuple[datetime | None, int]] = {}
@@ -579,7 +603,11 @@ async def _execute_replay_isolated(
                 e = ensembles_sorted[ens_idx]
                 assert_before_decision(e.ingested_at_utc, tick_time, label="ensemble")
                 latest_ensembles[e.event_id] = e
+                icao_up = e.station_icao.upper()
+                latest_ensembles_by_station[icao_up] = e
                 dirty_events.add(e.event_id)
+                for ev_id in events_by_icao.get(icao_up, ()):
+                    dirty_events.add(ev_id)
                 ens_idx += 1
 
             while metar_idx < len(metars_sorted) and _ensure_utc(metars_sorted[metar_idx].ingested_at_utc) < tick_time:
@@ -605,7 +633,9 @@ async def _execute_replay_isolated(
             for event in events_sorted:
                 if event.event_id not in dirty_events:
                     continue
-                ens = latest_ensembles.get(event.event_id)
+                ens = latest_ensembles.get(event.event_id) or latest_ensembles_by_station.get(
+                    event.station.icao.upper()
+                )
                 if ens is None:
                     continue
 
@@ -771,6 +801,7 @@ async def _execute_replay_isolated(
 
         avg_clv = round(sum(c.clv for c in clvs) / len(clvs), 6) if clvs else 0.0
         brier_score = _compute_brier_score(events_sorted, latest_probs, metars_sorted, end_utc)
+        log_loss = _compute_log_loss(events_sorted, latest_probs, metars_sorted, end_utc)
 
         net_pnl = round(final_portfolio.equity_usd - strategy_rec.reference_bankroll, 6)
         net_return_pct = (
@@ -786,6 +817,8 @@ async def _execute_replay_isolated(
             dataset_start_utc=start_utc,
             dataset_end_utc=end_utc,
             brier_score=brier_score,
+            log_loss=log_loss,
+            sharpe_ratio=sharpe_ratio,
             avg_clv=avg_clv,
             fill_rate=fill_rate,
             trade_count=len(fills_chron),
@@ -820,11 +853,13 @@ async def save_experiment_run(db: Database, summary: ExperimentRunSummary) -> No
         """
         INSERT INTO experiment_runs (
             run_id, model_version, strategy_version, dataset_start_utc, dataset_end_utc,
-            brier_score, avg_clv, fill_rate, trade_count, max_drawdown_usd,
-            net_pnl_usd, net_return_pct, is_promoted, created_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            brier_score, log_loss, sharpe_ratio, avg_clv, fill_rate, trade_count,
+            max_drawdown_usd, net_pnl_usd, net_return_pct, is_promoted, created_at_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(run_id) DO UPDATE SET
             brier_score = excluded.brier_score,
+            log_loss = excluded.log_loss,
+            sharpe_ratio = excluded.sharpe_ratio,
             avg_clv = excluded.avg_clv,
             fill_rate = excluded.fill_rate,
             trade_count = excluded.trade_count,
@@ -840,6 +875,8 @@ async def save_experiment_run(db: Database, summary: ExperimentRunSummary) -> No
             _ensure_utc(summary.dataset_start_utc).isoformat(),
             _ensure_utc(summary.dataset_end_utc).isoformat(),
             summary.brier_score,
+            summary.log_loss,
+            summary.sharpe_ratio,
             summary.avg_clv,
             summary.fill_rate,
             summary.trade_count,
@@ -877,6 +914,13 @@ async def list_experiment_runs(
 
     async with db.conn.execute(sql, params) as cur:
         rows = await cur.fetchall()
+    def _opt_float(row: Any, key: str) -> float | None:
+        try:
+            val = row[key]
+            return None if val is None else float(val)
+        except (KeyError, IndexError):
+            return None
+
     return [
         ExperimentRunSummary(
             run_id=str(r["run_id"]),
@@ -885,6 +929,8 @@ async def list_experiment_runs(
             dataset_start_utc=_ensure_utc(datetime.fromisoformat(str(r["dataset_start_utc"]))),
             dataset_end_utc=_ensure_utc(datetime.fromisoformat(str(r["dataset_end_utc"]))),
             brier_score=float(r["brier_score"]),
+            log_loss=_opt_float(r, "log_loss"),
+            sharpe_ratio=_opt_float(r, "sharpe_ratio"),
             avg_clv=float(r["avg_clv"]),
             fill_rate=float(r["fill_rate"]),
             trade_count=int(r["trade_count"]),
@@ -936,8 +982,8 @@ async def promote_versions(
     )
 
     promoted_run_id = run_id
+    await db.conn.execute("UPDATE experiment_runs SET is_promoted = 0")
     if run_id is not None:
-        await db.conn.execute("UPDATE experiment_runs SET is_promoted = 0")
         await db.conn.execute(
             "UPDATE experiment_runs SET is_promoted = 1 WHERE run_id = ?",
             (run_id,),
@@ -954,7 +1000,6 @@ async def promote_versions(
             match = await cur.fetchone()
         if match is not None:
             promoted_run_id = str(match["run_id"])
-            await db.conn.execute("UPDATE experiment_runs SET is_promoted = 0")
             await db.conn.execute(
                 "UPDATE experiment_runs SET is_promoted = 1 WHERE run_id = ?",
                 (promoted_run_id,),
@@ -1020,6 +1065,7 @@ async def run_experiment_replay(
         all_ensembles = archive_store.read_ensemble_snapshots(
             start_utc=dataset_start_utc,
             end_utc=dataset_end_utc,
+            dedupe_by_station_fetch=True,
         )
         all_metars = archive_store.read_metar_observations(
             start_utc=dataset_start_utc,
@@ -1027,8 +1073,10 @@ async def run_experiment_replay(
         )
         if event_ids:
             all_books = [b for b in all_books if b.event_id in event_ids]
-            all_ensembles = [e for e in all_ensembles if e.event_id in event_ids]
             icaos = {e.station.icao.upper() for e in event_list}
+            all_ensembles = [
+                e for e in all_ensembles if e.event_id in event_ids or e.station_icao.upper() in icaos
+            ]
             all_metars = [m for m in all_metars if m.station_icao.upper() in icaos]
 
         all_stamps = [
@@ -1139,6 +1187,7 @@ async def compare_exit_modes(
         all_ensembles = archive_store.read_ensemble_snapshots(
             start_utc=dataset_start_utc,
             end_utc=dataset_end_utc,
+            dedupe_by_station_fetch=True,
         )
         all_metars = archive_store.read_metar_observations(
             start_utc=dataset_start_utc,
@@ -1146,8 +1195,10 @@ async def compare_exit_modes(
         )
         if event_ids:
             all_books = [b for b in all_books if b.event_id in event_ids]
-            all_ensembles = [e for e in all_ensembles if e.event_id in event_ids]
             icaos = {e.station.icao.upper() for e in event_list}
+            all_ensembles = [
+                e for e in all_ensembles if e.event_id in event_ids or e.station_icao.upper() in icaos
+            ]
             all_metars = [m for m in all_metars if m.station_icao.upper() in icaos]
 
         all_stamps = [

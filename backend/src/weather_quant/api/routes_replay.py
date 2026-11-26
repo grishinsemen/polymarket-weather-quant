@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import threading
@@ -43,6 +44,11 @@ from weather_quant.domain.models import (
 )
 from weather_quant.ml.dataset_builder import TOP_LIQUIDITY_STATIONS
 from weather_quant.ml.quantile_mos import load_mos_provider_for_version
+from weather_quant.probability.calibration import (
+    CalibrationEvaluationReport,
+    evaluate_calibration_walk_forward,
+    load_local_calibration_samples,
+)
 from weather_quant.probability.engine import (
     EnsembleProbabilityEngine,
     get_latest_event_probability_snapshot,
@@ -60,6 +66,11 @@ from weather_quant.replay.runner import (
     promote_versions,
     run_experiment_replay,
     save_experiment_run,
+)
+from weather_quant.replay.worker import (
+    calibration_audit_subprocess,
+    compare_exit_modes_subprocess,
+    run_replay_subprocess,
 )
 from weather_quant.storage.database import Database
 from weather_quant.strategy.engine import (
@@ -101,6 +112,7 @@ _REASON_EXPLANATIONS: dict[str, str] = {
     "DYNAMIC_TAKE_PROFIT_POST_ONLY": "Posted/repriced dynamic Post-Only SELL take-profit at max(entry + min_profit, fair + premium).",
     "NO_PRICE_OUT_OF_RANGE": "Skipped BUY NO because passive limit price fell outside configured [min_buy_no_price, max_buy_no_price] bounds.",
     "TRADE_EDGE_REALIZED": "Logged expected entry Edge vs actual realized Edge upon exit or settlement.",
+    "ADVERSE_SELECTION_CRASH_CANCEL": "Cancelled resting BUY before fill simulation because opposing ask crashed to <= 2c (probable live METAR breach).",
     "POST_ONLY_WOULD_CROSS": "Post-Only Maker Order rejected because limit price would cross opposing spread.",
 }
 
@@ -124,6 +136,21 @@ class CompareExitModesResponse(BaseModel):
 
     status: str = "ok"
     comparison: ExitModeComparisonResult
+
+
+class CalibrationAuditRequest(BaseModel):
+    """Parameters for on-demand walk-forward model calibration evaluation."""
+
+    lookback_days: int = Field(default=45, ge=1, le=180)
+    tail_price_threshold: float = Field(default=0.10, gt=0.0, lt=0.5)
+    min_metars_per_day: int = Field(default=6, ge=1, le=24)
+
+
+class CalibrationAuditResponse(BaseModel):
+    """Walk-forward Raw vs Calibrated model evaluation report."""
+
+    status: str = "ok"
+    report: CalibrationEvaluationReport
 
 
 class ReplayRunsResponse(BaseModel):
@@ -1461,18 +1488,31 @@ async def trigger_replay_run(
             state.update(update)
 
     try:
-        res = await run_experiment_replay(
-            db=db,
-            archive_store=archive_store,
-            model_version=target_mv,
-            strategy_version=target_sv,
-            dataset_start_utc=dataset_start_utc,
-            dataset_end_utc=dataset_end_utc,
-            events=events,
-            mos_model=mos_model,
-            persist=True,
-            progress_cb=_on_progress,
-        )
+        if db.db_path != ":memory:":
+            res = await run_replay_subprocess(
+                db_path=db.db_path,
+                archive_dir=str(archive_store.base_dir),
+                model_version=target_mv,
+                strategy_version=target_sv,
+                dataset_start_utc=dataset_start_utc,
+                dataset_end_utc=dataset_end_utc,
+                event_ids=req.event_ids,
+                progress_cb=_on_progress,
+            )
+            await save_experiment_run(db, res.summary)
+        else:
+            res = await run_experiment_replay(
+                db=db,
+                archive_store=archive_store,
+                model_version=target_mv,
+                strategy_version=target_sv,
+                dataset_start_utc=dataset_start_utc,
+                dataset_end_utc=dataset_end_utc,
+                events=events,
+                mos_model=mos_model,
+                persist=True,
+                progress_cb=_on_progress,
+            )
     except TemporalIntegrityError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1538,25 +1578,72 @@ async def trigger_compare_exit_modes(
         dataset_start_utc = resolved_end - timedelta(hours=req.lookback_hours)
 
     try:
-        comparison = await compare_exit_modes(
-            db=db,
-            archive_store=archive_store,
-            model_version=target_mv,
-            strategy_version=target_sv,
-            dataset_start_utc=dataset_start_utc,
-            dataset_end_utc=dataset_end_utc,
-            events=events,
-            mos_model=mos_model,
-            enable_buy_no=req.enable_buy_no,
-            take_profit_min_profit=req.take_profit_min_profit,
-            take_profit_premium=req.take_profit_premium,
-        )
+        if db.db_path != ":memory:":
+            comparison = await compare_exit_modes_subprocess(
+                db_path=db.db_path,
+                archive_dir=str(archive_store.base_dir),
+                model_version=target_mv,
+                strategy_version=target_sv,
+                dataset_start_utc=dataset_start_utc,
+                dataset_end_utc=dataset_end_utc,
+                event_ids=req.event_ids,
+                enable_buy_no=req.enable_buy_no,
+                take_profit_min_profit=req.take_profit_min_profit,
+                take_profit_premium=req.take_profit_premium,
+            )
+        else:
+            comparison = await compare_exit_modes(
+                db=db,
+                archive_store=archive_store,
+                model_version=target_mv,
+                strategy_version=target_sv,
+                dataset_start_utc=dataset_start_utc,
+                dataset_end_utc=dataset_end_utc,
+                events=events,
+                mos_model=mos_model,
+                enable_buy_no=req.enable_buy_no,
+                take_profit_min_profit=req.take_profit_min_profit,
+                take_profit_premium=req.take_profit_premium,
+            )
     except TemporalIntegrityError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return CompareExitModesResponse(comparison=comparison)
+
+
+@router.post("/replay/calibration-audit", response_model=CalibrationAuditResponse)
+async def trigger_calibration_audit(
+    request: Request,
+    body: CalibrationAuditRequest | None = Body(default=None),
+) -> CalibrationAuditResponse:
+    """Run leak-free walk-forward model calibration audit strictly on demand (isolated process)."""
+    db: Database = request.app.state.db
+    archive_store = get_archive_store(request)
+    req = body or CalibrationAuditRequest()
+
+    if db.db_path != ":memory:":
+        report = await calibration_audit_subprocess(
+            db_path=db.db_path,
+            archive_dir=str(archive_store.base_dir),
+            lookback_days=req.lookback_days,
+            tail_price_threshold=req.tail_price_threshold,
+            min_metars_per_day=req.min_metars_per_day,
+        )
+    else:
+        samples = await load_local_calibration_samples(
+            db,
+            archive_store,
+            lookback_days=req.lookback_days,
+            min_metars_per_day=req.min_metars_per_day,
+        )
+        report = await asyncio.to_thread(
+            evaluate_calibration_walk_forward,
+            samples,
+            tail_price_threshold=req.tail_price_threshold,
+        )
+    return CalibrationAuditResponse(report=report)
 
 
 @router.post("/replay/promote", response_model=PromoteResponse)
@@ -1846,16 +1933,19 @@ async def get_terminal_snapshot(
 
     if missing_book_events:
         missing_set = set(missing_book_events)
-        archived_books = await archive_store.aread_orderbook_snapshots(
+        archived_books = await archive_store.aread_latest_orderbook_snapshots(
             start_utc=now - timedelta(hours=12),
+            event_ids=missing_set,
         )
         for b in archived_books:
             if b.event_id in missing_set:
                 books_by_event[b.event_id][b.bucket_id] = b
 
     if missing_ens_events:
-        archived_ens = await archive_store.aread_ensemble_snapshots(
+        archived_ens = await archive_store.aread_latest_ensemble_snapshots(
             start_utc=now - timedelta(days=2),
+            dedupe_by="station",
+            keep="latest",
         )
         by_event_id: dict[str, EnsembleSnapshot] = {}
         by_icao: dict[str, EnsembleSnapshot] = {}

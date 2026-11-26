@@ -213,6 +213,8 @@ export interface ExperimentRunSummary {
   dataset_start_utc: string;
   dataset_end_utc: string;
   brier_score: number;
+  log_loss?: number | null;
+  sharpe_ratio?: number | null;
   avg_clv: number;
   fill_rate: number;
   trade_count: number;
@@ -221,6 +223,66 @@ export interface ExperimentRunSummary {
   net_return_pct: number;
   is_promoted: boolean;
   created_at_utc: string;
+}
+
+export interface ExitModeMetrics {
+  mode: "hold_to_expiry" | "dynamic_early_exit";
+  strategy_version: string;
+  net_pnl_usd: number;
+  net_return_pct: number;
+  max_drawdown_usd: number;
+  sharpe_ratio: number;
+  trade_count: number;
+  fill_rate: number;
+  avg_clv: number;
+  avg_expected_edge: number | null;
+  avg_actual_edge: number | null;
+  summary: ExperimentRunSummary;
+}
+
+export interface ExitModeComparisonResult {
+  model_version: string;
+  base_strategy_version: string;
+  enable_buy_no: boolean;
+  take_profit_min_profit: number;
+  take_profit_premium: number;
+  hold_to_expiry: ExitModeMetrics;
+  dynamic_early_exit: ExitModeMetrics;
+  delta_pnl_usd: number;
+  delta_max_drawdown_usd: number;
+  delta_sharpe_ratio: number;
+  winner_by_sharpe: "hold_to_expiry" | "dynamic_early_exit" | "tie";
+  summary_log: string;
+}
+
+export interface CalibrationMetricsSummary {
+  sample_count: number;
+  brier_score: number;
+  log_loss: number;
+  coverage_p10_p90: number;
+  tail_brier_score: number | null;
+  tail_bucket_count: number;
+  mean_bias_c: number;
+  mae_c: number;
+  rmse_c: number;
+}
+
+export interface StationCalibrationReport {
+  station_icao: string;
+  city: string;
+  sample_count: number;
+  raw: CalibrationMetricsSummary;
+  calibrated: CalibrationMetricsSummary;
+  learned_bias_c: number;
+  learned_spread_scale: number;
+}
+
+export interface CalibrationEvaluationReport {
+  generated_at_utc: string;
+  tail_price_threshold: number;
+  overall_raw: CalibrationMetricsSummary;
+  overall_calibrated: CalibrationMetricsSummary;
+  stations: StationCalibrationReport[];
 }
 
 export interface ReplayProgressStatus {

@@ -211,6 +211,7 @@ R_EXIT_DUST_HOLD = "EXIT_DUST_BELOW_MIN_SHARES"
 R_CHEAP_TAIL = "TAIL_PRICE_BELOW_MIN"
 R_NO_PRICE_BOUNDS = "NO_PRICE_OUT_OF_RANGE"
 R_TRADE_EDGE_REALIZED = "TRADE_EDGE_REALIZED"
+R_CRASH_CANCEL = "ADVERSE_SELECTION_CRASH_CANCEL"
 
 
 # --------------------------------------------------------------------------------------------
@@ -1460,65 +1461,17 @@ class StrategyEngine:
 
         executor = self.executor
         sim = executor if isinstance(executor, SimulatedExecutor) else None
-        if sim is not None:
-            sim.register_event(event)
-            on_books_fn = getattr(sim, "on_books", None)
-            if callable(on_books_fn):
-                result.fills.extend(await on_books_fn(event.event_id, books.values()))
-            else:
-                for book in books.values():
-                    result.fills.extend(await sim.on_book(book))
-
         prob_by_bucket: dict[str, BucketFairProbability] = {b.bucket_id: b for b in probabilities.buckets}
         label_by_bucket = {b.bucket_id: b.label for b in event.buckets}
         bucket_by_id = {b.bucket_id: b for b in event.buckets}
-
-        # mark open positions to liquidation value (YES ZEROED -> 0.0; NO on ZEROED -> guaranteed 1.0/best_bid)
-        open_positions = await self.store.list_positions(status="OPEN", event_id=event.event_id)
-        for pos in open_positions:
-            prob = prob_by_bucket.get(pos.bucket_id)
-            is_impossible = bool(prob is not None and prob.is_impossible)
-            yes_book = books.get(pos.bucket_id)
-            b_meta = bucket_by_id.get(pos.bucket_id)
-            eff_book = self._effective_book_for_side(
-                yes_book, pos.outcome_side, b_meta.no_token_id if b_meta else None
-            )
-            if pos.outcome_side == "YES" and is_impossible:
-                mark, _ = calculate_liquidation_mark_and_upnl(
-                    shares=pos.shares,
-                    cost_basis_usd=pos.cost_basis_usd,
-                    best_bid=None,
-                    is_impossible=True,
-                )
-                await self.store.mark_position(pos, mark, now)
-            elif pos.outcome_side == "NO" and is_impossible:
-                no_bid = eff_book.best_bid if (eff_book is not None and eff_book.best_bid and eff_book.best_bid > 0) else 1.0
-                mark, _ = calculate_liquidation_mark_and_upnl(
-                    shares=pos.shares,
-                    cost_basis_usd=pos.cost_basis_usd,
-                    best_bid=no_bid,
-                    is_impossible=False,
-                )
-                await self.store.mark_position(pos, mark, now)
-            elif eff_book is not None and (now - eff_book.ingested_at_utc).total_seconds() >= -_EPS:
-                mark, _ = calculate_liquidation_mark_and_upnl(
-                    shares=pos.shares,
-                    cost_basis_usd=pos.cost_basis_usd,
-                    best_bid=eff_book.best_bid,
-                    is_impossible=False,
-                )
-                await self.store.mark_position(pos, mark, now)
 
         close_at = settlement_close_utc(event)
         in_cutoff = now >= close_at - timedelta(minutes=self.manifest.cutoff_minutes_before_settlement)
         paused = await self.store.is_paused()
         intraday = self._is_intraday(event, latest_metar, now)
 
-        if in_cutoff and sim is not None:
-            await sim.capture_pre_settlement_clv(event.event_id, books)
-
-        # resting orders: cancel invalid-price orders, entries when disallowed/zeroed/edge-lost,
-        # and resting SELLs when the Bucket is ZEROED (for YES) or has no valid Bid >= tick_size
+        # Cancel invalid, ZEROED, edge-lost, or crash-hit resting orders BEFORE simulating fills
+        # so stale passive BUY orders never get adversely filled on a dead/ZEROED bucket crash.
         resting = await self.store.list_resting_orders(event.event_id)
         for order in resting:
             yes_book = books.get(order.bucket_id)
@@ -1571,7 +1524,16 @@ class StrategyEngine:
                 else:
                     eff_fair = 0.0 if prob.is_impossible else prob.fair_probability
                 edge = calculate_net_edge(eff_fair, order.limit_price, side="BUY", is_maker=True, event=event)
-                if edge < self.manifest.min_edge - _EPS:
+                # Adverse-selection crash guard: if ask collapsed to <= 2c on a resting >= 6c BUY,
+                # the market likely already priced in a live METAR breach ahead of our METAR poll.
+                is_crash_ask = (
+                    book.best_ask is not None
+                    and order.limit_price >= 0.06 - _EPS
+                    and book.best_ask <= 0.02 + _EPS
+                )
+                if is_crash_ask:
+                    reasons = [R_CRASH_CANCEL]
+                elif edge < self.manifest.min_edge - _EPS:
                     reasons = [R_EDGE_LOST_CANCEL]
             if reasons:
                 await executor.cancel_order(order.order_id)
@@ -1582,8 +1544,61 @@ class StrategyEngine:
                     order.model_version,
                     event_id=event.event_id,
                     bucket_id=order.bucket_id,
-                    detail={"order_id": order.order_id, "outcome_side": order.outcome_side},
+                    detail={
+                        "order_id": order.order_id,
+                        "outcome_side": order.outcome_side,
+                        "limit_price": order.limit_price,
+                        "best_ask": book.best_ask if book is not None else None,
+                    },
                 )
+
+        if sim is not None:
+            sim.register_event(event)
+            on_books_fn = getattr(sim, "on_books", None)
+            if callable(on_books_fn):
+                result.fills.extend(await on_books_fn(event.event_id, books.values()))
+            else:
+                for book in books.values():
+                    result.fills.extend(await sim.on_book(book))
+
+        # mark open positions to liquidation value (YES ZEROED -> 0.0; NO on ZEROED -> guaranteed 1.0/best_bid)
+        open_positions = await self.store.list_positions(status="OPEN", event_id=event.event_id)
+        for pos in open_positions:
+            prob = prob_by_bucket.get(pos.bucket_id)
+            is_impossible = bool(prob is not None and prob.is_impossible)
+            yes_book = books.get(pos.bucket_id)
+            b_meta = bucket_by_id.get(pos.bucket_id)
+            eff_book = self._effective_book_for_side(
+                yes_book, pos.outcome_side, b_meta.no_token_id if b_meta else None
+            )
+            if pos.outcome_side == "YES" and is_impossible:
+                mark, _ = calculate_liquidation_mark_and_upnl(
+                    shares=pos.shares,
+                    cost_basis_usd=pos.cost_basis_usd,
+                    best_bid=None,
+                    is_impossible=True,
+                )
+                await self.store.mark_position(pos, mark, now)
+            elif pos.outcome_side == "NO" and is_impossible:
+                no_bid = eff_book.best_bid if (eff_book is not None and eff_book.best_bid and eff_book.best_bid > 0) else 1.0
+                mark, _ = calculate_liquidation_mark_and_upnl(
+                    shares=pos.shares,
+                    cost_basis_usd=pos.cost_basis_usd,
+                    best_bid=no_bid,
+                    is_impossible=False,
+                )
+                await self.store.mark_position(pos, mark, now)
+            elif eff_book is not None and (now - eff_book.ingested_at_utc).total_seconds() >= -_EPS:
+                mark, _ = calculate_liquidation_mark_and_upnl(
+                    shares=pos.shares,
+                    cost_basis_usd=pos.cost_basis_usd,
+                    best_bid=eff_book.best_bid,
+                    is_impossible=False,
+                )
+                await self.store.mark_position(pos, mark, now)
+
+        if in_cutoff and sim is not None:
+            await sim.capture_pre_settlement_clv(event.event_id, books)
 
         # Phase 2: exits (always permitted, including while paused or in cutoff: they cut risk)
         open_positions_after_fills = await self.store.list_positions(status="OPEN", event_id=event.event_id)

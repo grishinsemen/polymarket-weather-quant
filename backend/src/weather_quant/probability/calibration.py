@@ -415,8 +415,10 @@ async def load_local_calibration_samples(
     from weather_quant.probability.engine import list_station_routine_metars
 
     now_utc = datetime.now(timezone.utc)
-    ensembles = await archive_store.aread_ensemble_snapshots(
+    ensembles = await archive_store.aread_latest_ensemble_snapshots(
         start_utc=now_utc - timedelta(days=lookback_days),
+        dedupe_by="station_day",
+        keep="earliest",
     )
     by_icao: dict[str, list[EnsembleSnapshot]] = {}
     for snap in ensembles:

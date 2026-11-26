@@ -231,12 +231,22 @@ class Database:
     async def initialize(self) -> None:
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = await aiosqlite.connect(self.db_path)
+        self._conn = await aiosqlite.connect(self.db_path, timeout=15.0)
         self._conn.row_factory = aiosqlite.Row
+        await self._conn.execute("PRAGMA busy_timeout = 10000")
+        if self.db_path != ":memory:":
+            await self._conn.execute("PRAGMA journal_mode = WAL")
         await self._conn.executescript(SCHEMA_SQL)
         await self._migrate_columns()
         await self._seed_default_versions()
         await self._conn.commit()
+
+    async def connect_readonly(self) -> None:
+        """Open an existing SQLite database strictly read-only (zero write locks)."""
+        self._conn = await aiosqlite.connect(self.db_path, timeout=15.0)
+        self._conn.row_factory = aiosqlite.Row
+        await self._conn.execute("PRAGMA busy_timeout = 10000")
+        await self._conn.execute("PRAGMA query_only = ON")
 
     async def _migrate_columns(self) -> None:
         """Idempotently add backward-compatible columns to existing SQLite tables."""
@@ -251,6 +261,8 @@ class Database:
             ("positions", "expected_edge", "REAL"),
             ("positions", "realized_edge", "REAL"),
             ("clv_snapshots", "outcome_side", "TEXT NOT NULL DEFAULT 'YES'"),
+            ("experiment_runs", "log_loss", "REAL"),
+            ("experiment_runs", "sharpe_ratio", "REAL"),
         )
         existing_cols_cache: dict[str, set[str]] = {}
         for table, column, ddl in migrations:

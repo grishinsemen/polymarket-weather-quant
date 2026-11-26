@@ -62,6 +62,8 @@ class AutonomousRuntime:
         self._task: asyncio.Task[None] | None = None
         self._ensemble_cache: dict[str, EnsembleSnapshot] = {}
         self._ensemble_warmed_from_archive: bool = False
+        self._hist_ensembles_cache: list[EnsembleSnapshot] = []
+        self._hist_ensembles_loaded_at: datetime | None = None
         self._ensemble_cooldown_until: datetime | None = None
         self._archived_ensemble_keys: set[tuple[str, str]] = set()
         self._last_metar_by_station: dict[str, MetarObservation] = {}
@@ -160,11 +162,16 @@ class AutonomousRuntime:
             return
         self._ensemble_warmed_from_archive = True
         try:
-            recent = await archive.aread_ensemble_snapshots(
+            recent = await archive.aread_latest_ensemble_snapshots(
                 start_utc=now_utc - timedelta(days=2),
+                dedupe_by="station",
+                keep="latest",
             )
             for snap in recent:
                 icao = snap.station_icao.upper()
+                self._archived_ensemble_keys.add(
+                    (icao, ensure_utc(snap.fetched_at_utc).isoformat())
+                )
                 prev = self._ensemble_cache.get(icao)
                 if prev is None or ensure_utc(snap.fetched_at_utc) > ensure_utc(prev.fetched_at_utc):
                     self._ensemble_cache[icao] = snap
@@ -190,7 +197,7 @@ class AutonomousRuntime:
                     if cached.event_id == event.event_id
                     else cached.model_copy(update={"event_id": event.event_id})
                 )
-                arch_key = (event.event_id, ensure_utc(event_snap.fetched_at_utc).isoformat())
+                arch_key = (icao, ensure_utc(event_snap.fetched_at_utc).isoformat())
                 if arch_key not in self._archived_ensemble_keys:
                     self._archived_ensemble_keys.add(arch_key)
                     await archive.awrite_ensemble_snapshots([event_snap])
@@ -211,7 +218,7 @@ class AutonomousRuntime:
             )
             self._ensemble_cache[icao] = snap
             self._archived_ensemble_keys.add(
-                (event.event_id, ensure_utc(snap.fetched_at_utc).isoformat())
+                (icao, ensure_utc(snap.fetched_at_utc).isoformat())
             )
             await archive.awrite_ensemble_snapshots([snap])
             return snap
@@ -338,12 +345,20 @@ class AutonomousRuntime:
             fetcher = self._get_ensemble_fetcher()
             prob_engine = self._get_probability_engine()
             probs_computed = 0
-            try:
-                hist_ensembles = await archive.aread_ensemble_snapshots(
-                    start_utc=now_utc - timedelta(days=prob_engine.bias_window_days),
-                )
-            except Exception:
-                hist_ensembles = []
+            if (
+                self._hist_ensembles_loaded_at is None
+                or (now_utc - self._hist_ensembles_loaded_at) >= timedelta(minutes=15)
+            ):
+                try:
+                    self._hist_ensembles_cache = await archive.aread_latest_ensemble_snapshots(
+                        start_utc=now_utc - timedelta(days=prob_engine.bias_window_days),
+                        dedupe_by="station_day",
+                        keep="earliest",
+                    )
+                    self._hist_ensembles_loaded_at = now_utc
+                except Exception:
+                    self._hist_ensembles_cache = []
+            hist_ensembles = self._hist_ensembles_cache
 
             for event in events:
                 if settlement_close_utc(event) <= now_utc:

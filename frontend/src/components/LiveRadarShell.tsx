@@ -4,6 +4,8 @@ import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { TerminalTab, WsStatus } from "@/components/TopPortfolioBar";
 import { WeatherQuantTerminal } from "@/components/WeatherQuantTerminal";
 import type {
+  CalibrationEvaluationReport,
+  ExitModeComparisonResult,
   ExperimentRunSummary,
   ReplayProgressStatus,
   TerminalSnapshotResponse,
@@ -57,6 +59,12 @@ export function LiveRadarShell() {
   const [isActivatingPair, setIsActivatingPair] = useState(false);
   const [promotingRunId, setPromotingRunId] = useState<string | null>(null);
   const [replayWindowHours, setReplayWindowHours] = useState<number | null>(24);
+  const [exitComparison, setExitComparison] = useState<ExitModeComparisonResult | null>(null);
+  const [isComparingExits, setIsComparingExits] = useState(false);
+  const [calibrationReport, setCalibrationReport] = useState<CalibrationEvaluationReport | null>(
+    null,
+  );
+  const [isRunningCalibration, setIsRunningCalibration] = useState(false);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
   const versionsRef = useRef({
@@ -85,10 +93,17 @@ export function LiveRadarShell() {
         if (resp.ok) {
           const data = (await resp.json()) as TerminalSnapshotResponse;
           setSnapshot(data);
-          if (!initializedRef.current) {
+          if (!initializedRef.current && data.strategy_versions.length > 0) {
             initializedRef.current = true;
-            setSelectedModelVersion(data.portfolio.active_model_version);
-            setSelectedStrategyVersion(data.portfolio.active_strategy_version);
+            const liveMv =
+              data.model_versions.find((m) => m.is_active)?.model_version ??
+              data.portfolio.active_model_version;
+            const liveSv =
+              data.strategy_versions.find((s) => s.is_active)?.strategy_version ??
+              data.portfolio.active_strategy_version;
+            versionsRef.current = { mv: liveMv, sv: liveSv };
+            setSelectedModelVersion(liveMv);
+            setSelectedStrategyVersion(liveSv);
           }
           setErrorBanner(null);
         }
@@ -117,10 +132,18 @@ export function LiveRadarShell() {
       socket = new WebSocket(wsUrl);
       socket.onopen = () => {
         setWsStatus("connected");
-        void fetchSnapshot(versionsRef.current.mv, versionsRef.current.sv, true);
+        if (initializedRef.current) {
+          void fetchSnapshot(versionsRef.current.mv, versionsRef.current.sv, true);
+        } else {
+          void fetchSnapshot(undefined, undefined, true);
+        }
       };
       socket.onmessage = () => {
-        void fetchSnapshot(versionsRef.current.mv, versionsRef.current.sv, true);
+        if (initializedRef.current) {
+          void fetchSnapshot(versionsRef.current.mv, versionsRef.current.sv, true);
+        } else {
+          void fetchSnapshot(undefined, undefined, true);
+        }
       };
       socket.onclose = () => {
         setWsStatus("disconnected");
@@ -136,7 +159,11 @@ export function LiveRadarShell() {
     connect();
 
     const pollTimer = setInterval(() => {
-      void fetchSnapshot(versionsRef.current.mv, versionsRef.current.sv, true);
+      if (initializedRef.current) {
+        void fetchSnapshot(versionsRef.current.mv, versionsRef.current.sv, true);
+      } else {
+        void fetchSnapshot(undefined, undefined, true);
+      }
     }, 5_000);
 
     return () => {
@@ -261,6 +288,56 @@ export function LiveRadarShell() {
     [fetchSnapshot, replayWindowHours],
   );
 
+  const handleCompareExitModes = useCallback(
+    async (mv: string, sv: string, enableBuyNo: boolean) => {
+      setIsComparingExits(true);
+      try {
+        const resp = await fetch(`${API_BASE}/api/replay/compare-exit-modes`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model_version: mv,
+            strategy_version: sv,
+            enable_buy_no: enableBuyNo,
+            ...(replayWindowHours !== null ? { lookback_hours: replayWindowHours } : {}),
+          }),
+        });
+        if (!resp.ok) {
+          const detail = await resp.text();
+          setErrorBanner(`Exit mode comparison failed: ${detail}`);
+        } else {
+          const data = (await resp.json()) as { comparison: ExitModeComparisonResult };
+          setExitComparison(data.comparison);
+          setErrorBanner(null);
+        }
+      } finally {
+        setIsComparingExits(false);
+      }
+    },
+    [replayWindowHours],
+  );
+
+  const handleRunCalibrationAudit = useCallback(async () => {
+    setIsRunningCalibration(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/replay/calibration-audit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lookback_days: 45, tail_price_threshold: 0.1 }),
+      });
+      if (!resp.ok) {
+        const detail = await resp.text();
+        setErrorBanner(`Calibration audit failed: ${detail}`);
+      } else {
+        const data = (await resp.json()) as { report: CalibrationEvaluationReport };
+        setCalibrationReport(data.report);
+        setErrorBanner(null);
+      }
+    } finally {
+      setIsRunningCalibration(false);
+    }
+  }, []);
+
   const promoteVersions = useCallback(
     async (mv: string, sv: string, runId?: string) => {
       const resp = await fetch(`${API_BASE}/api/replay/promote`, {
@@ -326,6 +403,10 @@ export function LiveRadarShell() {
       isActivatingPair={isActivatingPair}
       promotingRunId={promotingRunId}
       replayWindowHours={replayWindowHours}
+      exitComparison={exitComparison}
+      isComparingExits={isComparingExits}
+      calibrationReport={calibrationReport}
+      isRunningCalibration={isRunningCalibration}
       errorBanner={errorBanner}
       onSelectEvent={setSelectedEventId}
       onSelectTab={setActiveTab}
@@ -336,6 +417,8 @@ export function LiveRadarShell() {
       onSync={handleSync}
       onSeedDemo={handleSeedDemo}
       onRunReplay={handleRunReplay}
+      onCompareExitModes={handleCompareExitModes}
+      onRunCalibrationAudit={handleRunCalibrationAudit}
       onActivatePair={handleActivatePair}
       onPromoteRun={handlePromoteRun}
     />
