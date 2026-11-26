@@ -1,5 +1,7 @@
-# Polymarket Daily Weather Quant Engine & Pro Terminal
 <img width="1687" height="901" alt="image" src="https://github.com/user-attachments/assets/7b0e4de6-c7cd-45c8-ac26-7431b3207b5b" />
+
+# Polymarket Daily Weather Quant Engine & Pro Terminal
+
 
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
