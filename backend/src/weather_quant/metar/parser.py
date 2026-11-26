@@ -6,7 +6,23 @@ import calendar
 import re
 from datetime import datetime, timezone
 
+from pydantic import BaseModel
+
 from weather_quant.domain.models import MetarObservation
+
+_SPECI_HEADER_RE = re.compile(r"^SPECI\s+([A-Z0-9]{4})\s+(\d{2})(\d{2})(\d{2})Z\b")
+
+
+class SpeciCancelAlert(BaseModel):
+    """Cancel-only adverse-selection alert extracted from a SPECI report.
+
+    NEVER persisted as a settlement MetarObservation and NEVER used in realized extremes.
+    """
+
+    station_icao: str
+    raw_report: str
+    observed_at_utc: datetime
+    temp_c: float
 
 _HEADER_RE = re.compile(r"^(?:METAR\s+)?([A-Z0-9]{4})\s+(\d{2})(\d{2})(\d{2})Z\b")
 _TEMP_GROUP_RE = re.compile(r"(?:^|\s)(M?\d{2})/(?:M?\d{2}|//)(?=\s|$)")
@@ -137,6 +153,48 @@ def parse_metar_line(
         wind_speed_kt=wind_speed_kt,
         cloud_cover_oktas=cloud_cover_oktas,
         is_routine=True,
+    )
+
+
+def parse_speci_cancel_trigger(
+    raw_line: str,
+    reference_time_utc: datetime | None = None,
+) -> SpeciCancelAlert | None:
+    """Parse a SPECI report strictly as a cancel-only adverse-selection trigger.
+
+    Returns None for routine METARs or malformed lines. Settlement logic must
+    continue calling ``parse_metar_line`` which rejects all SPECI reports.
+    """
+    cleaned = raw_line.strip().rstrip("=").strip()
+    if not cleaned:
+        return None
+    upper = cleaned.upper()
+    if not upper.startswith("SPECI"):
+        return None
+    m = _SPECI_HEADER_RE.match(upper)
+    if m is None:
+        return None
+    station_icao = m.group(1)
+    ref = reference_time_utc or datetime.now(timezone.utc)
+    observed_at = _resolve_observed_at_utc(int(m.group(2)), int(m.group(3)), int(m.group(4)), ref)
+    if observed_at is None:
+        return None
+    body, _, remarks = upper.partition(" RMK ")
+    temp_match = _TEMP_GROUP_RE.search(body)
+    if temp_match is None:
+        return None
+    whole_temp_c = _decode_whole_temp(temp_match.group(1))
+    temp_c = float(whole_temp_c)
+    if remarks:
+        rmk_match = _REMARK_TENTHS_RE.search(remarks)
+        if rmk_match is not None:
+            sign = -1.0 if rmk_match.group(1) == "1" else 1.0
+            temp_c = round(sign * (int(rmk_match.group(2)) / 10.0), 1)
+    return SpeciCancelAlert(
+        station_icao=station_icao,
+        raw_report=cleaned,
+        observed_at_utc=observed_at,
+        temp_c=temp_c,
     )
 
 

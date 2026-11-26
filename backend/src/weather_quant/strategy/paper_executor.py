@@ -101,17 +101,20 @@ class PaperExecutor:
         store: StrategyStore | None = None,
         clv_horizons_minutes: tuple[int, ...] = DEFAULT_CLV_HORIZONS_MINUTES,
         min_limit_shares: float = 5.0,
+        strict_maker_fills: bool = False,
     ) -> None:
         self.db = db
         self.clock = clock
         self.store = store or StrategyStore(db)
         self.clv_horizons_minutes = tuple(clv_horizons_minutes)
         self.min_limit_shares = float(min_limit_shares)
+        self.strict_maker_fills = bool(strict_maker_fills)
         self._events: dict[str, WeatherEvent] = {}
         self._latest_books: dict[str, OrderBookSnapshot] = {}
         self._books_by_bucket: dict[tuple[str, str], OrderBookSnapshot] = {}
         self._last_consumed_sig: dict[str, tuple[Any, ...]] = {}
         self._captured_clv_keys: set[tuple[str, int]] = set()
+        self._queue_ahead_shares: dict[str, float] = {}
 
     def register_event(self, event: WeatherEvent) -> None:
         """Register WeatherEvent metadata for fee calculation and Bucket labels."""
@@ -171,6 +174,10 @@ class PaperExecutor:
             return rejected
 
         await self.store.insert_order(order)
+        if self.strict_maker_fills and order.post_only and book is not None and not book.is_stale:
+            same_side = book.bids if order.side == "BUY" else book.asks
+            ahead = sum(lvl.size for lvl in same_side if abs(lvl.price - order.limit_price) <= _EPS)
+            self._queue_ahead_shares[order.order_id] = float(ahead)
         if not order.post_only and book is not None and not book.is_stale:
             fills = await self._evaluate_orders_against_book([order], book, now)
             if fills:
@@ -345,6 +352,18 @@ class PaperExecutor:
                 avail = max(0.0, lvl.size - already_used)
                 if avail <= _EPS:
                     continue
+                if self.strict_maker_fills and order.post_only:
+                    is_touch_only = abs(lvl.price - order.limit_price) <= _EPS
+                    if is_touch_only:
+                        queue_ahead = self._queue_ahead_shares.get(order.order_id, 0.0)
+                        if queue_ahead > _EPS:
+                            consumed_q = min(queue_ahead, avail)
+                            self._queue_ahead_shares[order.order_id] = max(0.0, queue_ahead - consumed_q)
+                            avail -= consumed_q
+                            consumed_by_level[key] = already_used + consumed_q
+                            already_used += consumed_q
+                            if avail <= _EPS:
+                                continue
                 take = min(remaining - matched, avail)
                 if take <= _EPS:
                     break

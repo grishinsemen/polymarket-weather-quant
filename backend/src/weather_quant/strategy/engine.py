@@ -24,6 +24,12 @@ from pydantic import BaseModel, Field
 
 from weather_quant.clob.fees import calculate_net_edge
 from weather_quant.domain.clock import Clock
+from weather_quant.metar.parser import SpeciCancelAlert
+from weather_quant.strategy.kelly import (
+    is_metar_or_nwp_blackout,
+    shrink_probabilities_to_market,
+    solve_multi_outcome_kelly,
+)
 from weather_quant.domain.models import (
     BucketFairProbability,
     ClvSnapshot,
@@ -212,6 +218,10 @@ R_CHEAP_TAIL = "TAIL_PRICE_BELOW_MIN"
 R_NO_PRICE_BOUNDS = "NO_PRICE_OUT_OF_RANGE"
 R_TRADE_EDGE_REALIZED = "TRADE_EDGE_REALIZED"
 R_CRASH_CANCEL = "ADVERSE_SELECTION_CRASH_CANCEL"
+R_BLACKOUT_METAR = "BLACKOUT_METAR_RELEASE"
+R_BLACKOUT_NWP = "BLACKOUT_NWP_RELEASE"
+R_SPECI_CANCEL = "SPECI_ADVERSE_SELECTION_CANCEL"
+R_ANOMALY_DIVERGENCE = "ANOMALY_DIVERGENCE_KILL_SWITCH"
 
 
 # --------------------------------------------------------------------------------------------
@@ -257,6 +267,15 @@ class StrategyParams(BaseModel):
     hold_to_expiry: bool = False
     take_profit_min_profit: float = 0.03
     take_profit_premium: float = 0.02
+    # V2 Level 4 feature flags
+    enable_market_shrinkage: bool = False
+    market_shrinkage_us: float = 0.30
+    market_shrinkage_intl: float = 0.15
+    enable_multi_kelly: bool = False
+    model_prob_std: float = 0.03
+    enable_blackout_windows: bool = False
+    max_anomaly_divergence: float | None = None
+    strict_maker_fills: bool = False
 
     @classmethod
     def from_manifest(cls, manifest: StrategyVersionRecord) -> "StrategyParams":
@@ -265,6 +284,35 @@ class StrategyParams(BaseModel):
         if "clv_horizons_minutes" in known:
             known["clv_horizons_minutes"] = tuple(int(x) for x in known["clv_horizons_minutes"])
         return cls(**known)
+
+
+def v2_multi_kelly_strict_manifest(created_at_utc: datetime | None = None) -> StrategyVersionRecord:
+    """Return the V2 ``kelly-multi-strict-v2`` manifest with market shrinkage, Multi-Kelly & maker guards."""
+    return StrategyVersionRecord(
+        strategy_version="kelly-multi-strict-v2",
+        description="V2 Multi-Outcome Fractional Kelly with market shrinkage, blackout/SPECI guards & strict fills",
+        reference_bankroll=100.0,
+        kelly_fraction=0.2,
+        max_bucket_usd=5.0,
+        max_city_exposure_usd=8.0,
+        intraday_cash_reserve_ratio=0.4,
+        min_edge=0.05,
+        min_top_liquidity_usd=5.0,
+        stale_feed_seconds=30,
+        cutoff_minutes_before_settlement=30,
+        config_json={
+            "post_only": True,
+            "phases": [PHASE_PREMARKET, PHASE_INTRADAY],
+            "enable_buy_no": True,
+            "enable_market_shrinkage": True,
+            "enable_multi_kelly": True,
+            "enable_blackout_windows": True,
+            "max_anomaly_divergence": 0.28,
+            "strict_maker_fills": True,
+        },
+        is_active=False,
+        created_at_utc=created_at_utc or datetime.now(timezone.utc),
+    )
 
 
 # --------------------------------------------------------------------------------------------
@@ -1445,6 +1493,7 @@ class StrategyEngine:
         probabilities: EventProbabilitySnapshot,
         books: Mapping[str, OrderBookSnapshot],
         latest_metar: MetarObservation | None = None,
+        speci_alert: SpeciCancelAlert | None = None,
     ) -> TickResult:
         """Evaluate one Weather Event: advance fills, manage exits, then place new entries.
 
@@ -1465,10 +1514,44 @@ class StrategyEngine:
         label_by_bucket = {b.bucket_id: b.label for b in event.buckets}
         bucket_by_id = {b.bucket_id: b for b in event.buckets}
 
+        # Optional V2 Bayesian shrinkage toward de-vigged two-sided CLOB midpoints
+        if self.params.enable_market_shrinkage and event.buckets:
+            raw_probs = [
+                0.0 if (prob_by_bucket.get(b.bucket_id) is None or prob_by_bucket[b.bucket_id].is_impossible)
+                else prob_by_bucket[b.bucket_id].fair_probability
+                for b in event.buckets
+            ]
+            mids = [books[b.bucket_id].midpoint if b.bucket_id in books and not self._is_stale(books[b.bucket_id], now) else None for b in event.buckets]
+            spreads = [books[b.bucket_id].spread if b.bucket_id in books and not self._is_stale(books[b.bucket_id], now) else None for b in event.buckets]
+            lam = (
+                self.params.market_shrinkage_us
+                if event.station.country.strip().upper() == "US"
+                else self.params.market_shrinkage_intl
+            )
+            shrunk = shrink_probabilities_to_market(raw_probs, mids, spreads, lambda_mkt=lam)
+            for idx, b in enumerate(event.buckets):
+                if b.bucket_id in prob_by_bucket and not prob_by_bucket[b.bucket_id].is_impossible:
+                    prob_by_bucket[b.bucket_id] = prob_by_bucket[b.bucket_id].model_copy(
+                        update={"fair_probability": shrunk[idx]}
+                    )
+
         close_at = settlement_close_utc(event)
         in_cutoff = now >= close_at - timedelta(minutes=self.manifest.cutoff_minutes_before_settlement)
         paused = await self.store.is_paused()
         intraday = self._is_intraday(event, latest_metar, now)
+        speci_triggered = (
+            speci_alert is not None
+            and speci_alert.station_icao.strip().upper() == event.station.icao.strip().upper()
+            and (
+                latest_metar is None
+                or abs(speci_alert.temp_c - latest_metar.temp_c) >= 1.0 - _EPS
+            )
+        )
+        in_blackout, blackout_reason = (
+            is_metar_or_nwp_blackout(now, event.station.country)
+            if self.params.enable_blackout_windows
+            else (False, None)
+        )
 
         # Cancel invalid, ZEROED, edge-lost, or crash-hit resting orders BEFORE simulating fills
         # so stale passive BUY orders never get adversely filled on a dead/ZEROED bucket crash.
@@ -1512,6 +1595,10 @@ class StrategyEngine:
             reasons: list[str] = []
             if price_invalid:
                 reasons = [R_EDGE_LOST_CANCEL]
+            elif speci_triggered:
+                reasons = [R_SPECI_CANCEL]
+            elif in_blackout and blackout_reason is not None:
+                reasons = [blackout_reason]
             elif in_cutoff:
                 reasons = [R_CUTOFF]
             elif paused:
@@ -1617,6 +1704,12 @@ class StrategyEngine:
         if in_cutoff:
             await self._skip(result, event, "*", [R_CUTOFF], mv)
             return result
+        if speci_triggered:
+            await self._skip(result, event, "*", [R_SPECI_CANCEL], mv)
+            return result
+        if in_blackout and blackout_reason is not None:
+            await self._skip(result, event, "*", [blackout_reason], mv)
+            return result
         phase = PHASE_INTRADAY if intraday else PHASE_PREMARKET
         candidates: list[_Candidate] = []
         for bucket in event.buckets:
@@ -1650,6 +1743,22 @@ class StrategyEngine:
 
             # 1) Evaluate BUY YES
             fair_yes = 0.0 if prob.is_impossible else prob.fair_probability
+            if (
+                self.params.max_anomaly_divergence is not None
+                and not prob.is_impossible
+                and book.midpoint is not None
+                and abs(fair_yes - book.midpoint) > self.params.max_anomaly_divergence + _EPS
+                and not intraday
+            ):
+                await self._skip(
+                    result,
+                    event,
+                    bucket.bucket_id,
+                    [R_ANOMALY_DIVERGENCE],
+                    prob.model_version,
+                    {"fair": fair_yes, "midpoint": book.midpoint},
+                )
+                continue
             limit_yes = self._passive_buy_limit(book, fair_yes)
             if "NO" in held_sides:
                 limit_yes = None
@@ -1729,9 +1838,46 @@ class StrategyEngine:
                     skip_detail,
                 )
 
+        multi_kelly_usd: dict[tuple[str, str], float] = {}
+        if self.params.enable_multi_kelly and candidates:
+            b_idx_map = {b.bucket_id: i for i, b in enumerate(event.buckets)}
+            post_probs = [
+                0.0 if (prob_by_bucket.get(b.bucket_id) is None or prob_by_bucket[b.bucket_id].is_impossible)
+                else prob_by_bucket[b.bucket_id].fair_probability
+                for b in event.buckets
+            ]
+            yes_px: list[float | None] = [None] * len(event.buckets)
+            no_px: list[float | None] = [None] * len(event.buckets)
+            for c in candidates:
+                pos_i = b_idx_map.get(c.bucket_id)
+                if pos_i is not None:
+                    if c.outcome_side == "YES":
+                        yes_px[pos_i] = c.limit
+                    else:
+                        no_px[pos_i] = c.limit
+            yes_fracs, no_fracs = solve_multi_outcome_kelly(
+                post_probs,
+                yes_px,
+                no_px if self.params.enable_buy_no else None,
+                kelly_fraction=self.manifest.kelly_fraction,
+                max_total_fraction=min(
+                    0.25,
+                    self.manifest.max_city_exposure_usd / max(self.manifest.reference_bankroll, _EPS),
+                ),
+                model_prob_std=self.params.model_prob_std,
+            )
+            for idx, b in enumerate(event.buckets):
+                multi_kelly_usd[(b.bucket_id, "YES")] = yes_fracs[idx] * self.manifest.reference_bankroll
+                multi_kelly_usd[(b.bucket_id, "NO")] = no_fracs[idx] * self.manifest.reference_bankroll
+
         candidates.sort(key=lambda c: c.edge, reverse=True)
         for cand in candidates:
-            await self._try_entry(event, cand, phase, now, result)
+            override_usd = (
+                multi_kelly_usd.get((cand.bucket_id, cand.outcome_side))
+                if self.params.enable_multi_kelly
+                else None
+            )
+            await self._try_entry(event, cand, phase, now, result, kelly_usd_override=override_usd)
         return result
 
     async def _try_entry(
@@ -1741,6 +1887,8 @@ class StrategyEngine:
         phase: Literal["PREMARKET_ENTRY", "INTRADAY_REPRICING"],
         now: datetime,
         result: TickResult,
+        *,
+        kelly_usd_override: float | None = None,
     ) -> None:
         m = self.manifest
         resting = [
@@ -1758,8 +1906,13 @@ class StrategyEngine:
         reserve = m.intraday_cash_reserve_ratio * m.reference_bankroll
 
         f_star = max(0.0, (cand.fair - cand.limit) / (1.0 - cand.limit))
+        kelly_target_usd = (
+            kelly_usd_override
+            if kelly_usd_override is not None
+            else m.kelly_fraction * f_star * m.reference_bankroll
+        )
         caps = {
-            R_KELLY_SMALL: m.kelly_fraction * f_star * m.reference_bankroll,
+            R_KELLY_SMALL: kelly_target_usd,
             R_BUCKET_CAP: m.max_bucket_usd - bucket_committed,
             R_CITY_CAP: m.max_city_exposure_usd - city_committed,
         }

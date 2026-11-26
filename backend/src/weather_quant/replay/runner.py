@@ -542,7 +542,8 @@ async def _execute_replay_isolated(
 
         clock = VirtualClock(ticks[0] if ticks else start_utc)
         store = StrategyStore(iso_db)
-        executor = PaperExecutor(db=iso_db, clock=clock, store=store)
+        strict_maker = bool((strategy_rec.config_json or {}).get("strict_maker_fills", False))
+        executor = PaperExecutor(db=iso_db, clock=clock, store=store, strict_maker_fills=strict_maker)
         engine = StrategyEngine(
             db=iso_db,
             executor=executor,
