@@ -723,3 +723,112 @@ async def test_compare_exit_modes_hold_to_expiry_vs_dynamic_early_exit_and_api(t
         assert isinstance(cal_report["stations"], list)
 
 
+@pytest.mark.asyncio
+async def test_settle_expired_events_settles_positions_and_expires_resting_orders(tmp_path: Path) -> None:
+    from weather_quant.domain.models import MakerOrder, PositionRecord
+    from weather_quant.replay.runner import settle_expired_events
+    from weather_quant.strategy.engine import StrategyStore
+
+    db = Database(str(tmp_path / "settle_live.db"))
+    await db.initialize()
+    try:
+        event = _make_11_bucket_event(
+            event_id="evt-settle-lfpb",
+            icao="LFPB",
+            local_date=date(2026, 11, 25),
+            center_c=12,
+        )
+        await db.upsert_weather_event(event)
+        store = StrategyStore(db)
+        await store.ensure_schema()
+
+        win_bucket = event.buckets[5]   # 12°C
+        lose_bucket = event.buckets[3]  # 10°C
+        t_open = datetime(2026, 11, 25, 10, 0, tzinfo=timezone.utc)
+        await store.upsert_position(
+            PositionRecord(
+                position_id="pos-win",
+                event_id=event.event_id,
+                station_icao="LFPB",
+                bucket_id=win_bucket.bucket_id,
+                bucket_label=win_bucket.label,
+                shares=10.0,
+                avg_entry_price=0.25,
+                cost_basis_usd=2.5,
+                mark_price=0.25,
+                unrealized_pnl_usd=0.0,
+                realized_pnl_usd=0.0,
+                status="OPEN",
+                model_version="ensemble-3layer-v1",
+                strategy_version="conservative-kelly-100-v1",
+                updated_at_utc=t_open,
+            )
+        )
+        await store.upsert_position(
+            PositionRecord(
+                position_id="pos-lose",
+                event_id=event.event_id,
+                station_icao="LFPB",
+                bucket_id=lose_bucket.bucket_id,
+                bucket_label=lose_bucket.label,
+                shares=10.0,
+                avg_entry_price=0.20,
+                cost_basis_usd=2.0,
+                mark_price=0.20,
+                unrealized_pnl_usd=0.0,
+                realized_pnl_usd=0.0,
+                status="OPEN",
+                model_version="ensemble-3layer-v1",
+                strategy_version="conservative-kelly-100-v1",
+                updated_at_utc=t_open,
+            )
+        )
+        await store.insert_order(
+            MakerOrder(
+                order_id="ord-stale",
+                event_id=event.event_id,
+                station_icao="LFPB",
+                bucket_id=win_bucket.bucket_id,
+                token_id=win_bucket.token_id,
+                side="SELL",
+                limit_price=0.60,
+                size_shares=10.0,
+                size_usd=6.0,
+                post_only=True,
+                phase="INTRADAY_REPRICING",
+                status="OPEN",
+                model_version="ensemble-3layer-v1",
+                strategy_version="conservative-kelly-100-v1",
+                created_at_utc=t_open,
+                updated_at_utc=t_open,
+            )
+        )
+        await db.conn.commit()
+
+        metars = [
+            _make_metar(
+                "LFPB",
+                observed_at=datetime(2026, 11, 25, 14, 0, tzinfo=timezone.utc),
+                ingested_at=datetime(2026, 11, 25, 14, 5, tzinfo=timezone.utc),
+                temp_c=12.1,
+            )
+        ]
+        now_after = datetime(2026, 11, 26, 2, 0, tzinfo=timezone.utc)
+        count = await settle_expired_events(store, [event], metars, now_after)
+        assert count == 2
+
+        by_id = {p.position_id: p for p in await store.list_positions()}
+        assert by_id["pos-win"].status == "SETTLED"
+        assert by_id["pos-win"].mark_price == pytest.approx(1.0)
+        assert by_id["pos-win"].realized_pnl_usd == pytest.approx(7.5)
+        assert by_id["pos-lose"].status == "SETTLED"
+        assert by_id["pos-lose"].mark_price == pytest.approx(0.0)
+        assert by_id["pos-lose"].realized_pnl_usd == pytest.approx(-2.0)
+
+        resting_after = await store.list_resting_orders(event.event_id)
+        assert resting_after == []
+    finally:
+        await db.close()
+
+
+

@@ -25,6 +25,7 @@ from weather_quant.probability.engine import (
     save_event_probability_snapshot,
 )
 from weather_quant.probability.ensemble_fetcher import EnsembleFetcherPort, OpenMeteoEnsembleFetcher
+from weather_quant.replay.runner import settle_expired_events
 from weather_quant.storage.database import Database
 from weather_quant.strategy.engine import StrategyEngine, StrategyStore, settlement_close_utc
 from weather_quant.strategy.paper_executor import PaperExecutor
@@ -408,6 +409,35 @@ class AutonomousRuntime:
                     continue
                 await save_event_probability_snapshot(db, prob_snap)
                 probs_computed += 1
+
+            # 3b. Settle expired live positions whose local settlement day has closed
+            settled_count = 0
+            open_pos = await strategy_engine.store.list_positions(status="OPEN")
+            open_rest = await strategy_engine.store.list_resting_orders()
+            open_event_ids = {p.event_id for p in open_pos} | {o.event_id for o in open_rest}
+            if open_event_ids:
+                all_db_events = await db.list_weather_events(active_only=False)
+                expired_events = [
+                    ev
+                    for ev in all_db_events
+                    if ev.event_id in open_event_ids and now_utc >= settlement_close_utc(ev)
+                ]
+                if expired_events:
+                    expired_metars: list[MetarObservation] = []
+                    seen_icaos: set[str] = set()
+                    for ev in expired_events:
+                        icao = ev.station.icao.upper()
+                        if icao not in seen_icaos:
+                            seen_icaos.add(icao)
+                            expired_metars.extend(await list_station_routine_metars(db, icao))
+                    settled_count = await settle_expired_events(
+                        strategy_engine.store,
+                        expired_events,
+                        expired_metars,
+                        now_utc,
+                    )
+                    if settled_count > 0:
+                        logger.info("Auto-settled %d expired live position(s)", settled_count)
 
             # 4. Strategy cycle + PaperExecutor + Telegram signal alerts
             tick_results = await strategy_engine.run_cycle(

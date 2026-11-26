@@ -11,6 +11,7 @@ import type {
 } from "@/types/terminal";
 
 type RunSortKey =
+  | "created_at_utc"
   | "brier_score"
   | "log_loss"
   | "sharpe_ratio"
@@ -112,6 +113,22 @@ function fmtEdgeCents(val: number | null | undefined): string {
   return `${val >= 0 ? "+" : ""}${(val * 100).toFixed(2)}¢`;
 }
 
+function fmtRunDateTimeMsk(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Moscow",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(d);
+  const lookup = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  const hour = lookup.hour === "24" ? "00" : lookup.hour;
+  return `${lookup.day}.${lookup.month} ${hour}:${lookup.minute}`;
+}
+
 export function ExperimentLabPanel({
   runs,
   modelVersions,
@@ -164,6 +181,17 @@ export function ExperimentLabPanel({
       return runs;
     }
     return [...runs].sort((a, b) => {
+      if (sortKey === "created_at_utc") {
+        const aMs = Date.parse(a.created_at_utc);
+        const bMs = Date.parse(b.created_at_utc);
+        const aMissing = Number.isNaN(aMs);
+        const bMissing = Number.isNaN(bMs);
+        if (aMissing && bMissing) return a.run_id.localeCompare(b.run_id);
+        if (aMissing) return 1;
+        if (bMissing) return -1;
+        if (aMs === bMs) return a.run_id.localeCompare(b.run_id);
+        return sortAsc ? aMs - bMs : bMs - aMs;
+      }
       const aRaw = a[sortKey];
       const bRaw = b[sortKey];
       const aMissing = aRaw === null || aRaw === undefined;
@@ -303,6 +331,18 @@ export function ExperimentLabPanel({
           <table className="w-full text-left border-collapse text-xs">
             <thead>
               <tr className="border-b border-[#1c2638] bg-[#0a101b] text-[10px] uppercase tracking-wider text-slate-400">
+                <th className="px-3 py-2 font-medium whitespace-nowrap">
+                  <button
+                    type="button"
+                    data-testid="sort-runs-date"
+                    onClick={() => handleSort("created_at_utc")}
+                    className={`hover:text-sky-300 transition-colors ${
+                      sortKey === "created_at_utc" ? "text-sky-300 font-semibold" : ""
+                    }`}
+                  >
+                    Date{arrow("created_at_utc")}
+                  </button>
+                </th>
                 <th className="px-3 py-2 font-medium">Run ID</th>
                 <th className="px-3 py-2 font-medium">Model Version</th>
                 <th className="px-3 py-2 font-medium">Strategy Version</th>
@@ -391,6 +431,9 @@ export function ExperimentLabPanel({
                   data-testid="experiment-run-row"
                   className="border-b border-[#1c2638] hover:bg-[#111927]"
                 >
+                  <td className="px-3 py-2.5 font-mono-tabular text-slate-400 whitespace-nowrap">
+                    {fmtRunDateTimeMsk(run.created_at_utc)}
+                  </td>
                   <td className="px-3 py-2.5 font-mono-tabular text-slate-300">
                     {run.run_id}
                   </td>

@@ -592,3 +592,177 @@ def test_fastapi_ml_train_from_historical_fetcher_seam() -> None:
         assert body["benchmark"]["train_count"] > 0
         assert body["benchmark"]["val_count"] > 0
         assert body["benchmark"]["test_count"] > 0
+
+
+def test_mos_intraday_layer3_and_premarket_prior_obs_isolation() -> None:
+    """Intraday METARs must not corrupt premarket prior_obs_temp_c, and post-peak cooling
+    must collapse MOS probabilities onto the realized daily extreme via Layer 3 conditioning."""
+    lfpb = get_station("LFPB")
+    assert lfpb is not None
+    samples = _make_synthetic_mos_history(station_icao="LFPB", n_days=40, start_date=date(2026, 9, 15))
+    mos_model = QuantileMosModel.fit(
+        samples,
+        model_version="mos-layer3-test",
+        covered_stations=["LFPB"],
+        lgbm_params={"n_estimators": 15, "max_depth": 3, "num_leaves": 7, "min_child_samples": 3, "verbose": -1},
+    )
+
+    # 18:00 UTC on Nov 20 (19:00 Paris): afternoon peak (15°C) already passed, evening cooled to 11°C
+    decision_time = datetime(2026, 11, 20, 18, 0, tzinfo=timezone.utc)
+    clock = VirtualClock(decision_time)
+    buckets = [
+        Bucket(bucket_id="b14", market_id="m14", token_id="t14", label="14°C or below", lower_bound=None, upper_bound=14.0, unit="C", outcome_index=0),
+        Bucket(bucket_id="b15", market_id="m15", token_id="t15", label="15°C", lower_bound=15.0, upper_bound=15.0, unit="C", outcome_index=1),
+        Bucket(bucket_id="b16", market_id="m16", token_id="t16", label="16°C", lower_bound=16.0, upper_bound=16.0, unit="C", outcome_index=2),
+        Bucket(bucket_id="b17", market_id="m17", token_id="t17", label="17°C", lower_bound=17.0, upper_bound=17.0, unit="C", outcome_index=3),
+        Bucket(bucket_id="b18", market_id="m18", token_id="t18", label="18°C or higher", lower_bound=18.0, upper_bound=None, unit="C", outcome_index=4),
+    ]
+    event = WeatherEvent(
+        event_id="evt-lfpb-evening",
+        slug="highest-temp-paris-2026-11-20",
+        title="Highest temp Paris?",
+        url="https://polymarket.com/event/lfpb-evening",
+        station=lfpb,
+        local_date=date(2026, 11, 20),
+        polarity=Polarity.HIGHEST,
+        remark_tenths_enabled=True,
+        unit="C",
+        buckets=buckets,
+        discovered_at_utc=decision_time - timedelta(hours=20),
+    )
+    # Morning ensemble predicted 17.5°C peak at 14:00 UTC, cooling to 12°C by 18:00..22:00 UTC
+    ts = [datetime(2026, 11, 19, 23, 0, tzinfo=timezone.utc) + timedelta(hours=h) for h in range(24)]
+    trajs = [
+        [round(11.0 + 6.5 * max(0.0, 1.0 - abs(h - 14) / 7.0) + (m - 30) * 0.03, 2) for h in range(24)]
+        for m in range(60)
+    ]
+    ens = EnsembleSnapshot(
+        event_id=event.event_id,
+        station_icao="LFPB",
+        fetched_at_utc=decision_time - timedelta(hours=18),
+        ingested_at_utc=decision_time - timedelta(hours=18),
+        models=["ecmwf_ifs025", "gfs_seamless", "icon_seamless"],
+        member_count=60,
+        hourly_timestamps_utc=ts,
+        member_temps_c=trajs,
+    )
+    yesterday_metar = MetarObservation(
+        station_icao="LFPB",
+        raw_report="METAR LFPB 191800Z 20005KT CAVOK 10/06 Q1016 RMK T01000060",
+        observed_at_utc=datetime(2026, 11, 19, 18, 0, tzinfo=timezone.utc),
+        ingested_at_utc=datetime(2026, 11, 19, 18, 5, tzinfo=timezone.utc),
+        temp_c=10.0,
+        whole_temp_c=10,
+        remark_tenths_c=10.0,
+        has_remark_tenths=True,
+        is_routine=True,
+    )
+    peak_metar = MetarObservation(
+        station_icao="LFPB",
+        raw_report="METAR LFPB 201300Z 20005KT CAVOK 15/06 Q1016 RMK T01510060",
+        observed_at_utc=datetime(2026, 11, 20, 13, 0, tzinfo=timezone.utc),
+        ingested_at_utc=datetime(2026, 11, 20, 13, 5, tzinfo=timezone.utc),
+        temp_c=15.1,
+        whole_temp_c=15,
+        remark_tenths_c=15.1,
+        has_remark_tenths=True,
+        is_routine=True,
+    )
+    evening_metar = MetarObservation(
+        station_icao="LFPB",
+        raw_report="METAR LFPB 201730Z 20005KT CAVOK 11/06 Q1016 RMK T01100060",
+        observed_at_utc=datetime(2026, 11, 20, 17, 30, tzinfo=timezone.utc),
+        ingested_at_utc=datetime(2026, 11, 20, 17, 35, tzinfo=timezone.utc),
+        temp_c=11.0,
+        whole_temp_c=11,
+        remark_tenths_c=11.0,
+        has_remark_tenths=True,
+        is_routine=True,
+    )
+
+    from weather_quant.ml.dataset_builder import extract_features_from_ensemble
+
+    feats = extract_features_from_ensemble(
+        station=lfpb,
+        local_date=date(2026, 11, 20),
+        polarity=Polarity.HIGHEST,
+        ensemble=ens,
+        decision_time_utc=decision_time,
+        prior_observations=[yesterday_metar, peak_metar, evening_metar],
+    )
+    # Must use strictly prior-day 10.0C, NOT today's 15.1C or 11.0C!
+    assert feats["prior_obs_temp_c"] == pytest.approx(10.0)
+
+    snap = mos_model.predict_event_probabilities(
+        station=lfpb,
+        event=event,
+        ensemble=ens,
+        intraday_metars=[yesterday_metar, peak_metar, evening_metar],
+        clock=clock,
+    )
+    by_id = {b.bucket_id: b for b in snap.buckets}
+    assert by_id["b14"].is_impossible is True
+    assert by_id["b14"].fair_probability == 0.0
+    # After peak passed and evening cooled to 11°C, realized 15°C must strongly dominate 17°C+
+    assert by_id["b15"].fair_probability > 0.85
+    assert by_id["b17"].fair_probability < 0.05
+
+
+@pytest.mark.asyncio
+async def test_ensemble_fetcher_preserves_per_model_hourly_means_and_spread() -> None:
+    """Open-Meteo multi-model suffixed ensemble payloads must preserve ECMWF/GFS/ICON hourly means
+    so extract_features_from_ensemble computes real per-day model_spread_c for HIGHEST & LOWEST."""
+    from weather_quant.ml.dataset_builder import extract_features_from_ensemble
+    from weather_quant.probability.ensemble_fetcher import OpenMeteoEnsembleFetcher
+
+    lfpb = get_station("LFPB")
+    assert lfpb is not None
+    ts = [f"2026-11-26T{h:02d}:00" for h in range(24)]
+    payload = {
+        "hourly": {
+            "time": ts,
+            "temperature_2m_member01_ecmwf_ifs025": [10.0 + (2.0 if h == 14 else 0.0) for h in range(24)],
+            "temperature_2m_member01_gfs_seamless": [13.0 + (2.0 if h == 14 else 0.0) for h in range(24)],
+            "temperature_2m_member01_icon_seamless": [11.0 + (2.0 if h == 14 else 0.0) for h in range(24)],
+        }
+    }
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    clock = VirtualClock(datetime(2026, 11, 25, 18, 0, tzinfo=timezone.utc))
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        fetcher = OpenMeteoEnsembleFetcher(client=client, clock=clock)
+        snap = await fetcher.fetch_ensemble(lfpb, event_id="evt-spread-test", local_date=date(2026, 11, 26))
+
+    assert "model_hourly_means_c" in snap.metadata
+    assert set(snap.metadata["model_hourly_means_c"].keys()) == {
+        "ecmwf_ifs025",
+        "gfs_seamless",
+        "icon_seamless",
+    }
+
+    feats_hi = extract_features_from_ensemble(
+        station=lfpb,
+        local_date=date(2026, 11, 26),
+        polarity=Polarity.HIGHEST,
+        ensemble=snap,
+        decision_time_utc=datetime(2026, 11, 25, 22, 0, tzinfo=timezone.utc),
+    )
+    assert feats_hi["ecmwf_extreme_c"] == pytest.approx(12.0)
+    assert feats_hi["gfs_extreme_c"] == pytest.approx(15.0)
+    assert feats_hi["icon_extreme_c"] == pytest.approx(13.0)
+    assert feats_hi["model_spread_c"] == pytest.approx(3.0)
+
+    feats_lo = extract_features_from_ensemble(
+        station=lfpb,
+        local_date=date(2026, 11, 26),
+        polarity=Polarity.LOWEST,
+        ensemble=snap,
+        decision_time_utc=datetime(2026, 11, 25, 22, 0, tzinfo=timezone.utc),
+    )
+    assert feats_lo["ecmwf_extreme_c"] == pytest.approx(10.0)
+    assert feats_lo["gfs_extreme_c"] == pytest.approx(13.0)
+    assert feats_lo["model_spread_c"] == pytest.approx(3.0)
+
+

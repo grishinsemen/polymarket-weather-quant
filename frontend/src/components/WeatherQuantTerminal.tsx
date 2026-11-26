@@ -178,6 +178,8 @@ export function WeatherQuantTerminal({
                 xray={activeXRay}
                 allXrays={snapshot.xrays}
                 closedPositions={snapshot.closed_positions ?? []}
+                selectedModelVersion={selectedModelVersion}
+                selectedStrategyVersion={selectedStrategyVersion}
                 screenerOrder={snapshot.screener.map((r) => r.event_id)}
                 serverTimeUtc={snapshot.server_time_utc}
                 nowMs={nowMs}

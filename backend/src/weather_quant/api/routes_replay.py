@@ -2047,25 +2047,23 @@ async def get_terminal_snapshot(
     all_events_by_id = {
         e.event_id: e for e in await db.list_weather_events(active_only=False)
     }
-    buy_stats_by_bucket: dict[tuple[str, str], tuple[float, float]] = {}
+    buy_stats_by_bucket: dict[tuple[str, str, str, str], tuple[float, float]] = {}
     for f in fills:
-        if f.side == "BUY" and f.model_version == selected_mv and f.strategy_version == selected_sv:
-            key = (f.event_id, f.bucket_id)
+        if f.side == "BUY":
+            key = (f.event_id, f.bucket_id, f.model_version, f.strategy_version)
             prev_sh, prev_usd = buy_stats_by_bucket.get(key, (0.0, 0.0))
             buy_stats_by_bucket[key] = (prev_sh + f.fill_shares, prev_usd + f.fill_usd)
 
     closed_positions: list[ClosedPositionItem] = []
     for p in positions:
-        if (
-            p.status not in ("CLOSED", "SETTLED")
-            or p.model_version != selected_mv
-            or p.strategy_version != selected_sv
-        ):
+        if p.status not in ("CLOSED", "SETTLED"):
             continue
         ev = all_events_by_id.get(p.event_id)
         station_meta = ev.station if ev is not None else get_station(p.station_icao)
         city_name = station_meta.city if station_meta is not None else p.station_icao
-        traded_sh, stake_usd = buy_stats_by_bucket.get((p.event_id, p.bucket_id), (0.0, 0.0))
+        traded_sh, stake_usd = buy_stats_by_bucket.get(
+            (p.event_id, p.bucket_id, p.model_version, p.strategy_version), (0.0, 0.0)
+        )
         if traded_sh <= 1e-9 and abs(p.mark_price - p.avg_entry_price) > 1e-6:
             est_sh = abs(p.realized_pnl_usd / (p.mark_price - p.avg_entry_price))
             traded_sh = round(est_sh, 2)

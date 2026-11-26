@@ -420,6 +420,7 @@ class QuantileMosModel:
 
         impossible_mask = [False] * len(event.buckets)
         if today_metars:
+            today_metars.sort(key=lambda o: _ensure_utc(o.observed_at_utc))
             obs_temps_c = [
                 EnsembleProbabilityEngine.obs_settlement_temp_c(obs, event.remark_tenths_enabled)
                 for obs in today_metars
@@ -433,11 +434,66 @@ class QuantileMosModel:
                 event.polarity,
                 realized_extreme_unit,
             )
-            # Clamp remaining predicted extremes by realized intraday extreme
-            if event.polarity == Polarity.HIGHEST:
-                mos_extremes_c = [max(x, realized_extreme_c) for x in mos_extremes_c]
+
+            # Layer 3 intraday conditioning: calibrate hourly trajectories to MOS premarket
+            # mean/spread, then apply decaying live METAR residual drift over remaining hours.
+            day_indices = [
+                idx
+                for idx, ts in enumerate(ensemble.hourly_timestamps_utc)
+                if _ensure_utc(ts).astimezone(station_tz).date() == event.local_date
+            ]
+            day_timestamps = [_ensure_utc(ensemble.hourly_timestamps_utc[idx]) for idx in day_indices]
+            day_trajectories = [
+                [float(traj[idx]) for idx in day_indices]
+                for traj in ensemble.member_temps_c
+                if day_indices and len(traj) > max(day_indices)
+            ]
+            if day_trajectories:
+                raw_extremes_c = [
+                    max(traj) if event.polarity == Polarity.HIGHEST else min(traj)
+                    for traj in day_trajectories
+                ]
+                raw_mean = float(np.mean(raw_extremes_c))
+                raw_std = float(np.std(raw_extremes_c))
+                mos_mean = float(np.mean(mos_extremes_c))
+                mos_std = float(np.std(mos_extremes_c))
+                mos_bias_c = mos_mean - raw_mean
+                mos_scale = (
+                    max(0.5, min(3.0, mos_std / raw_std))
+                    if raw_std > 1e-6 and mos_std > 1e-6
+                    else 1.0
+                )
+
+                prob_engine = EnsembleProbabilityEngine()
+                mos_trajectories = prob_engine.calibrate_day_trajectories(
+                    day_trajectories,
+                    bias_c=mos_bias_c,
+                    scale=mos_scale,
+                )
+                latest_obs_utc = _ensure_utc(today_metars[-1].observed_at_utc)
+                latest_temp_c = obs_temps_c[-1]
+                shifted_trajectories, _, _ = prob_engine.compute_intraday_shifted_trajectories(
+                    day_timestamps,
+                    mos_trajectories,
+                    latest_obs_utc,
+                    latest_temp_c,
+                )
+                future_indices = [
+                    idx for idx, ts in enumerate(day_timestamps) if ts > latest_obs_utc
+                ]
+                intraday_extremes_c: list[float] = []
+                for shifted_traj in shifted_trajectories:
+                    future_vals = [shifted_traj[idx] for idx in future_indices]
+                    if event.polarity == Polarity.HIGHEST:
+                        intraday_extremes_c.append(max([realized_extreme_c, *future_vals]))
+                    else:
+                        intraday_extremes_c.append(min([realized_extreme_c, *future_vals]))
+                mos_extremes_c = intraday_extremes_c
             else:
-                mos_extremes_c = [min(x, realized_extreme_c) for x in mos_extremes_c]
+                if event.polarity == Polarity.HIGHEST:
+                    mos_extremes_c = [max(x, realized_extreme_c) for x in mos_extremes_c]
+                else:
+                    mos_extremes_c = [min(x, realized_extreme_c) for x in mos_extremes_c]
 
         mos_extremes_unit = [to_event_unit(x, event.unit) for x in mos_extremes_c]
         mos_probs = map_extremes_to_probabilities(

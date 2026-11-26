@@ -18,6 +18,8 @@ interface CityXRayPanelProps {
   xray: CityXRay | null;
   allXrays?: Record<string, CityXRay>;
   closedPositions?: ClosedPositionItem[];
+  selectedModelVersion?: string;
+  selectedStrategyVersion?: string;
   screenerOrder?: string[];
   serverTimeUtc?: string;
   nowMs?: number;
@@ -225,12 +227,15 @@ export function CityXRayPanel({
   xray,
   allXrays,
   closedPositions = [],
+  selectedModelVersion,
+  selectedStrategyVersion,
   screenerOrder,
   serverTimeUtc,
   nowMs,
   onSelectEvent,
 }: CityXRayPanelProps) {
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [historyScope, setHistoryScope] = useState<"all" | "current">("all");
   const [panelFilter, setPanelFilter] = useState<"all" | "orders" | "positions">("all");
   const [panelSort, setPanelSort] = useState<"date" | "usd" | null>(null);
 
@@ -732,10 +737,19 @@ export function CityXRayPanel({
         </div>
 
         {(() => {
-          const wins = closedPositions.filter((c) => c.realized_pnl_usd > 1e-6).length;
-          const losses = closedPositions.filter((c) => c.realized_pnl_usd < -1e-6).length;
+          const currentPairClosed =
+            selectedModelVersion && selectedStrategyVersion
+              ? closedPositions.filter(
+                  (c) =>
+                    c.model_version === selectedModelVersion &&
+                    c.strategy_version === selectedStrategyVersion,
+                )
+              : closedPositions;
+          const shownClosed = historyScope === "current" ? currentPairClosed : closedPositions;
+          const wins = shownClosed.filter((c) => c.realized_pnl_usd > 1e-6).length;
+          const losses = shownClosed.filter((c) => c.realized_pnl_usd < -1e-6).length;
           const totalRealized = normalizeZero(
-            closedPositions.reduce((acc, item) => acc + item.realized_pnl_usd, 0),
+            shownClosed.reduce((acc, item) => acc + item.realized_pnl_usd, 0),
           );
           return (
             <div className="rounded border border-[#1c2638] bg-[#0a101b] overflow-hidden">
@@ -752,9 +766,9 @@ export function CityXRayPanel({
                   </span>
                   <span>История завершённых ставок</span>
                   <span className="px-1.5 py-0.5 rounded bg-slate-800 text-sky-300 border border-slate-700 text-[10px]">
-                    {closedPositions.length}
+                    {shownClosed.length}
                   </span>
-                  {closedPositions.length > 0 && (
+                  {shownClosed.length > 0 && (
                     <span className="text-[10px] font-normal normal-case text-slate-400">
                       W:{wins} / L:{losses}
                     </span>
@@ -772,14 +786,47 @@ export function CityXRayPanel({
               {isHistoryOpen && (
                 <div
                   data-testid="closed-bets-history-panel"
-                  className="border-t border-[#1c2638] p-3 max-h-72 overflow-y-auto space-y-1.5 text-xs font-mono-tabular"
+                  className="border-t border-[#1c2638] p-3 max-h-[560px] overflow-y-auto space-y-1.5 text-xs font-mono-tabular"
                 >
-                  {closedPositions.length === 0 ? (
+                  {selectedModelVersion && selectedStrategyVersion && (
+                    <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-[#182132] text-[10px]">
+                      <span className="text-slate-500">
+                        Показываются закрытые (CLOSED) и рассчитанные по итогам дня (SETTLED) ставки
+                      </span>
+                      <div className="inline-flex rounded bg-[#0f1726] p-0.5 border border-[#1c2638] shrink-0">
+                        <button
+                          type="button"
+                          data-testid="history-scope-all"
+                          onClick={() => setHistoryScope("all")}
+                          className={`px-2 py-0.5 rounded transition-colors ${
+                            historyScope === "all"
+                              ? "bg-sky-700 text-white font-semibold"
+                              : "text-slate-400 hover:text-slate-200"
+                          }`}
+                        >
+                          Все ({closedPositions.length})
+                        </button>
+                        <button
+                          type="button"
+                          data-testid="history-scope-current"
+                          onClick={() => setHistoryScope("current")}
+                          className={`px-2 py-0.5 rounded transition-colors ${
+                            historyScope === "current"
+                              ? "bg-sky-700 text-white font-semibold"
+                              : "text-slate-400 hover:text-slate-200"
+                          }`}
+                        >
+                          Текущая ({currentPairClosed.length})
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {shownClosed.length === 0 ? (
                     <p className="text-center text-slate-500 py-4">
-                      Нет завершённых ставок для выбранной модели и стратегии.
+                      Нет завершённых ставок для выбранного фильтра.
                     </p>
                   ) : (
-                    closedPositions.map((item) => {
+                    shownClosed.map((item) => {
                       const dateLabel = item.local_date ? formatTargetDate(item.local_date) : "—";
                       const realized = normalizeZero(item.realized_pnl_usd);
                       const canSelect = Boolean(allXrays && allXrays[item.event_id]);
@@ -806,12 +853,23 @@ export function CityXRayPanel({
                               ({fmtPrice(item.entry_price)} → {fmtPrice(item.exit_price)}
                               {item.stake_usd > 0 ? `, $${item.stake_usd.toFixed(2)}` : ""})
                             </span>
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-[#0a101b] text-slate-400 border border-[#1c2638]">
+                              <span className="text-sky-300/90">{item.model_version}</span>
+                              {" · "}
+                              <span className="text-amber-300/90">{item.strategy_version}</span>
+                            </span>
                           </div>
                           <div className="flex items-center gap-2 shrink-0">
                             <span className="text-[10px] text-slate-500">
                               {formatMoscowHhMm(item.closed_at_utc)}
                             </span>
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
+                            <span
+                              className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                                item.status === "SETTLED"
+                                  ? "bg-sky-950/60 text-sky-300 border-sky-800/70"
+                                  : "bg-slate-800 text-slate-300 border-slate-700"
+                              }`}
+                            >
                               {item.status}
                             </span>
                             <span

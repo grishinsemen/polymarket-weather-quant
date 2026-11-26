@@ -656,16 +656,26 @@ def extract_features_from_ensemble(
         local_dt = day_timestamps[best_idx].astimezone(station_tz)
         peak_hours.append(local_dt.hour + local_dt.minute / 60.0)
 
-    # Approximate per-model extremes if model_member_counts metadata exists; otherwise ensemble mean
+    # Extract exact per-model daily extremes (ECMWF / GFS / ICON) when model_hourly_means_c is archived
     ens_mean = _mean(all_extremes)
     model_extremes: dict[str, float] = {}
-    model_means = ensemble.metadata.get("model_extremes_c")
-    if isinstance(model_means, dict):
-        for k, v in model_means.items():
-            model_extremes[str(k)] = float(v)
-    else:
-        for m_name in ensemble.models:
-            model_extremes[m_name] = ens_mean
+    model_hourly_means = ensemble.metadata.get("model_hourly_means_c")
+    if isinstance(model_hourly_means, dict) and model_hourly_means:
+        max_idx = max(day_indices)
+        for m_name, series in model_hourly_means.items():
+            if isinstance(series, list) and len(series) > max_idx:
+                day_vals = [float(series[idx]) for idx in day_indices]
+                model_extremes[str(m_name)] = (
+                    max(day_vals) if polarity == Polarity.HIGHEST else min(day_vals)
+                )
+    if not model_extremes:
+        model_means = ensemble.metadata.get("model_extremes_c")
+        if isinstance(model_means, dict):
+            for k, v in model_means.items():
+                model_extremes[str(k)] = float(v)
+        else:
+            for m_name in ensemble.models:
+                model_extremes[m_name] = ens_mean
 
     bias_errors: list[float] = []
     for bias in recent_bias_obs:
@@ -683,7 +693,9 @@ def extract_features_from_ensemble(
         assert_before_decision(obs.observed_at_utc, decision_utc, label="prior_observation")
         if obs.is_routine and not obs.raw_report.strip().upper().startswith("SPECI"):
             if obs.station_icao.strip().upper() == target_icao:
-                valid_obs.append(obs)
+                # Match training schema: prior_obs_temp_c is strictly a premarket prior-day reading
+                if _ensure_utc(obs.observed_at_utc).astimezone(station_tz).date() < local_date:
+                    valid_obs.append(obs)
     valid_obs.sort(key=lambda o: o.observed_at_utc)
 
     rolling_bias_c = _mean(bias_errors, 0.0)

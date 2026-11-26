@@ -370,14 +370,15 @@ def _compute_log_loss(
     return round(sum(losses) / len(losses), 6)
 
 
-async def _settle_expired_events(
+async def settle_expired_events(
     store: StrategyStore,
     events: Sequence[WeatherEvent],
     metars: Sequence[MetarObservation],
     now: datetime,
-) -> None:
-    """Settle open positions for events whose local day has closed and METARs exist."""
+) -> int:
+    """Settle open positions and cancel leftover resting orders for closed events with METARs."""
     now_utc = _ensure_utc(now)
+    settled_count = 0
     for event in events:
         close_utc = settlement_close_utc(event)
         if now_utc < close_utc:
@@ -386,6 +387,10 @@ async def _settle_expired_events(
         if true_idx is None:
             continue
         winning_bucket_id = event.buckets[true_idx].bucket_id
+        # Cancel any stale resting orders left open on the expired event
+        resting_orders = await store.list_resting_orders(event.event_id)
+        for ro in resting_orders:
+            await store.set_order_status(ro.order_id, "EXPIRED", now_utc)
         open_positions = await store.list_positions(status="OPEN", event_id=event.event_id)
         for pos in open_positions:
             if pos.shares <= _EPS:
@@ -405,6 +410,7 @@ async def _settle_expired_events(
             pos.status = "SETTLED"
             pos.updated_at_utc = now_utc
             await store.upsert_position(pos)
+            settled_count += 1
             await store.add_audit(
                 decision=R_TRADE_EDGE_REALIZED,
                 reason_codes=[R_TRADE_EDGE_REALIZED],
@@ -430,7 +436,12 @@ async def _settle_expired_events(
                     "realized_pnl_usd": round(pos.realized_pnl_usd, 6),
                 },
             )
-        await store.db.conn.commit()
+        if resting_orders or open_positions:
+            await store.db.conn.commit()
+    return settled_count
+
+
+_settle_expired_events = settle_expired_events
 
 
 async def _execute_replay_isolated(

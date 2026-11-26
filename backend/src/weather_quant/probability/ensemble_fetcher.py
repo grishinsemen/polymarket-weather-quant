@@ -46,13 +46,14 @@ def _parse_iso_utc(raw_ts: str) -> datetime:
 
 def _extract_hourly_trajectories(
     payload: dict[str, Any] | list[dict[str, Any]],
+    requested_models: Sequence[str] = DEFAULT_ENSEMBLE_MODELS,
 ) -> tuple[list[datetime], list[list[float]], list[str], dict[str, Any]]:
     """Normalize single-dict or multi-model-list Open-Meteo Ensemble JSON payloads."""
     blocks = payload if isinstance(payload, list) else [payload]
     reference_times: list[datetime] = []
     trajectories: list[list[float]] = []
     discovered_models: list[str] = []
-    model_extremes_c: dict[str, float] = {}
+    trajs_by_model: dict[str, list[list[float]]] = {}
     wind_speed_vals: list[float] = []
     wind_dir_vals: list[float] = []
     cloud_cover_vals: list[float] = []
@@ -62,9 +63,9 @@ def _extract_hourly_trajectories(
         if not isinstance(block, dict):
             continue
         model_name = block.get("model")
-        resolved_model = str(model_name) if isinstance(model_name, str) and model_name else f"model_{block_idx}"
-        if isinstance(model_name, str) and model_name:
-            discovered_models.append(model_name)
+        block_model = str(model_name) if isinstance(model_name, str) and model_name else None
+        if block_model and block_model not in discovered_models:
+            discovered_models.append(block_model)
 
         hourly = block.get("hourly")
         if not isinstance(hourly, dict):
@@ -79,7 +80,6 @@ def _extract_hourly_trajectories(
 
         # Align block timestamps to reference_times when multiple models are returned
         time_index = {ts: idx for idx, ts in enumerate(parsed_times)}
-        model_member_maxes: list[float] = []
         for key, series in hourly.items():
             if not isinstance(series, list):
                 continue
@@ -97,6 +97,17 @@ def _extract_hourly_trajectories(
                 continue
             if not key.startswith("temperature_2m"):
                 continue
+            resolved_model = block_model
+            if resolved_model is None:
+                for m_candidate in requested_models:
+                    if key.endswith(f"_{m_candidate}"):
+                        resolved_model = m_candidate
+                        break
+            if resolved_model is None:
+                resolved_model = f"model_{block_idx}"
+            elif resolved_model not in discovered_models:
+                discovered_models.append(resolved_model)
+
             aligned: list[float] = []
             valid = True
             for ref_ts in reference_times:
@@ -107,9 +118,20 @@ def _extract_hourly_trajectories(
                 aligned.append(float(series[pos]))
             if valid and len(aligned) == len(reference_times):
                 trajectories.append(aligned)
-                model_member_maxes.append(max(aligned))
-        if model_member_maxes:
-            model_extremes_c[resolved_model] = round(mean(model_member_maxes), 4)
+                trajs_by_model.setdefault(resolved_model, []).append(aligned)
+
+    model_extremes_c: dict[str, float] = {}
+    model_hourly_means_c: dict[str, list[float]] = {}
+    n_hours = len(reference_times)
+    for m_name, m_trajs in trajs_by_model.items():
+        if not m_trajs:
+            continue
+        model_extremes_c[m_name] = round(mean(max(t) for t in m_trajs), 4)
+        if n_hours > 0:
+            model_hourly_means_c[m_name] = [
+                round(sum(t[h] for t in m_trajs) / len(m_trajs), 3)
+                for h in range(n_hours)
+            ]
 
     extra_meta: dict[str, Any] = {}
     if model_extremes_c:
@@ -117,6 +139,8 @@ def _extract_hourly_trajectories(
         extra_meta["model_spread_c"] = (
             round(pstdev(list(model_extremes_c.values())), 4) if len(model_extremes_c) > 1 else 0.0
         )
+    if model_hourly_means_c:
+        extra_meta["model_hourly_means_c"] = model_hourly_means_c
     if wind_speed_vals:
         extra_meta["wind_speed_10m"] = wind_speed_vals
     if wind_dir_vals:
@@ -184,7 +208,9 @@ class OpenMeteoEnsembleFetcher:
             if owns_client:
                 await client.aclose()
 
-        timestamps_utc, member_temps_c, discovered_models, extra_meta = _extract_hourly_trajectories(payload)
+        timestamps_utc, member_temps_c, discovered_models, extra_meta = _extract_hourly_trajectories(
+            payload, requested_models=self._models
+        )
         ingested_at = self._clock.now()
 
         meta_payload: dict[str, Any] = {
