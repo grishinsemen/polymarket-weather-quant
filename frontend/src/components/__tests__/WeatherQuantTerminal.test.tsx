@@ -587,7 +587,9 @@ describe("WeatherQuantTerminal", () => {
   it("supports version filtering and Experiment Lab replay triggering and promotion", () => {
     const onFilterModel = vi.fn();
     const onFilterStrategy = vi.fn();
+    const onSelectReplayWindow = vi.fn();
     const onRunReplay = vi.fn(async () => {});
+    const onActivatePair = vi.fn(async () => {});
     const onPromoteRun = vi.fn(async () => {});
 
     render(
@@ -598,14 +600,17 @@ describe("WeatherQuantTerminal", () => {
         activeTab="experiments"
         selectedModelVersion="mos-lgbm-v1"
         selectedStrategyVersion="aggressive-kelly-100-v2"
+        replayWindowHours={24}
         onSelectEvent={vi.fn()}
         onSelectTab={vi.fn()}
         onFilterModelVersion={onFilterModel}
         onFilterStrategyVersion={onFilterStrategy}
+        onSelectReplayWindow={onSelectReplayWindow}
         onTogglePause={vi.fn(async () => {})}
         onSync={vi.fn(async () => {})}
         onSeedDemo={vi.fn(async () => {})}
         onRunReplay={onRunReplay}
+        onActivatePair={onActivatePair}
         onPromoteRun={onPromoteRun}
       />,
     );
@@ -620,6 +625,11 @@ describe("WeatherQuantTerminal", () => {
     });
     expect(onFilterStrategy).toHaveBeenCalledWith("conservative-kelly-100-v1");
 
+    fireEvent.change(screen.getByLabelText("Replay Window"), {
+      target: { value: "6" },
+    });
+    expect(onSelectReplayWindow).toHaveBeenCalledWith(6);
+
     // Experiment Lab renders comparison rows & Promote button for unpromoted candidate
     expect(screen.getByText("exp-base-1")).toBeInTheDocument();
     expect(screen.getByText("exp-mos-2")).toBeInTheDocument();
@@ -627,6 +637,9 @@ describe("WeatherQuantTerminal", () => {
 
     fireEvent.click(screen.getByTestId("run-replay-btn"));
     expect(onRunReplay).toHaveBeenCalledWith("mos-lgbm-v1", "aggressive-kelly-100-v2");
+
+    fireEvent.click(screen.getByTestId("activate-pair-btn"));
+    expect(onActivatePair).toHaveBeenCalledWith("mos-lgbm-v1", "aggressive-kelly-100-v2");
 
     fireEvent.click(screen.getByTestId("promote-run-exp-mos-2"));
     expect(onPromoteRun).toHaveBeenCalledWith(FIXTURE_SNAPSHOT.experiment_runs[1]);

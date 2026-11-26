@@ -13,11 +13,17 @@ interface ExperimentLabPanelProps {
   strategyVersions: StrategyVersionRecord[];
   selectedModelVersion: string;
   selectedStrategyVersion: string;
+  activeModelVersion?: string;
+  activeStrategyVersion?: string;
   isRunningReplay: boolean;
+  isActivatingPair?: boolean;
   promotingRunId: string | null;
+  replayWindowHours?: number | null;
   onSelectModelVersion: (mv: string) => void;
   onSelectStrategyVersion: (sv: string) => void;
+  onSelectReplayWindow?: (hours: number | null) => void;
   onRunReplay: (modelVersion: string, strategyVersion: string) => Promise<void>;
+  onActivatePair?: (modelVersion: string, strategyVersion: string) => Promise<void>;
   onPromoteRun: (run: ExperimentRunSummary) => Promise<void>;
 }
 
@@ -27,13 +33,25 @@ export function ExperimentLabPanel({
   strategyVersions,
   selectedModelVersion,
   selectedStrategyVersion,
+  activeModelVersion,
+  activeStrategyVersion,
   isRunningReplay,
+  isActivatingPair = false,
   promotingRunId,
+  replayWindowHours = 24,
   onSelectModelVersion,
   onSelectStrategyVersion,
+  onSelectReplayWindow,
   onRunReplay,
+  onActivatePair,
   onPromoteRun,
 }: ExperimentLabPanelProps) {
+  const isSelectedPairActive =
+    activeModelVersion !== undefined &&
+    activeStrategyVersion !== undefined &&
+    selectedModelVersion === activeModelVersion &&
+    selectedStrategyVersion === activeStrategyVersion;
+
   return (
     <section
       data-testid="experiment-lab-panel"
@@ -74,6 +92,21 @@ export function ExperimentLabPanel({
               </option>
             ))}
           </select>
+          <select
+            aria-label="Replay Window"
+            value={replayWindowHours === null ? "all" : String(replayWindowHours)}
+            onChange={(e) => {
+              if (!onSelectReplayWindow) return;
+              onSelectReplayWindow(e.target.value === "all" ? null : Number(e.target.value));
+            }}
+            className="bg-[#0a101b] text-slate-300 border border-[#25324a] rounded px-2 py-1 font-mono-tabular text-xs"
+          >
+            <option value="6">Last 6h</option>
+            <option value="24">Last 24h</option>
+            <option value="48">Last 48h</option>
+            <option value="168">Last 7d</option>
+            <option value="all">All Archive</option>
+          </select>
           <button
             type="button"
             data-testid="run-replay-btn"
@@ -83,6 +116,21 @@ export function ExperimentLabPanel({
           >
             {isRunningReplay ? "Running Replay..." : "Run Experiment Replay"}
           </button>
+          {onActivatePair && (
+            <button
+              type="button"
+              data-testid="activate-pair-btn"
+              disabled={isActivatingPair || isSelectedPairActive}
+              onClick={() => void onActivatePair(selectedModelVersion, selectedStrategyVersion)}
+              className="px-3 py-1 rounded bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-white font-semibold text-xs transition-colors"
+            >
+              {isSelectedPairActive
+                ? "Active Live"
+                : isActivatingPair
+                  ? "Activating..."
+                  : "Activate Live"}
+            </button>
+          )}
         </div>
       </div>
 

@@ -17,16 +17,20 @@ interface WeatherQuantTerminalProps {
   isSyncing?: boolean;
   isTogglingPause?: boolean;
   isRunningReplay?: boolean;
+  isActivatingPair?: boolean;
   promotingRunId?: string | null;
+  replayWindowHours?: number | null;
   errorBanner?: string | null;
   onSelectEvent: (eventId: string) => void;
   onSelectTab: (tab: TerminalTab) => void;
   onFilterModelVersion: (mv: string) => void;
   onFilterStrategyVersion: (sv: string) => void;
+  onSelectReplayWindow?: (hours: number | null) => void;
   onTogglePause: () => Promise<void>;
   onSync: () => Promise<void>;
   onSeedDemo: () => Promise<void>;
   onRunReplay: (modelVersion: string, strategyVersion: string) => Promise<void>;
+  onActivatePair?: (modelVersion: string, strategyVersion: string) => Promise<void>;
   onPromoteRun: (run: ExperimentRunSummary) => Promise<void>;
 }
 
@@ -40,16 +44,20 @@ export function WeatherQuantTerminal({
   isSyncing = false,
   isTogglingPause = false,
   isRunningReplay = false,
+  isActivatingPair = false,
   promotingRunId = null,
+  replayWindowHours = 24,
   errorBanner = null,
   onSelectEvent,
   onSelectTab,
   onFilterModelVersion,
   onFilterStrategyVersion,
+  onSelectReplayWindow,
   onTogglePause,
   onSync,
   onSeedDemo,
   onRunReplay,
+  onActivatePair,
   onPromoteRun,
 }: WeatherQuantTerminalProps) {
   const [nowMs, setNowMs] = useState<number>(() =>
@@ -152,11 +160,17 @@ export function WeatherQuantTerminal({
             strategyVersions={snapshot.strategy_versions}
             selectedModelVersion={selectedModelVersion}
             selectedStrategyVersion={selectedStrategyVersion}
+            activeModelVersion={snapshot.portfolio.active_model_version}
+            activeStrategyVersion={snapshot.portfolio.active_strategy_version}
             isRunningReplay={isRunningReplay}
+            isActivatingPair={isActivatingPair}
             promotingRunId={promotingRunId}
+            replayWindowHours={replayWindowHours}
             onSelectModelVersion={onFilterModelVersion}
             onSelectStrategyVersion={onFilterStrategyVersion}
+            onSelectReplayWindow={onSelectReplayWindow}
             onRunReplay={onRunReplay}
+            onActivatePair={onActivatePair}
             onPromoteRun={onPromoteRun}
           />
         )}

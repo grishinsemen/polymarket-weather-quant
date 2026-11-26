@@ -107,6 +107,7 @@ class ReplayRunRequest(BaseModel):
     dataset_start_utc: datetime | None = None
     dataset_end_utc: datetime | None = None
     event_ids: list[str] | None = None
+    lookback_hours: float | None = Field(default=None, gt=0)
 
 
 class ReplayRunResponse(BaseModel):
@@ -1223,14 +1224,26 @@ async def trigger_replay_run(
         else None
     )
 
+    dataset_start_utc = req.dataset_start_utc
+    dataset_end_utc = req.dataset_end_utc
+    if dataset_start_utc is None and req.lookback_hours is not None:
+        app_clock: Clock = getattr(request.app.state, "clock", None) or SystemClock()
+        resolved_end = (
+            ensure_utc(dataset_end_utc)
+            if dataset_end_utc is not None
+            else ensure_utc(app_clock.now())
+        )
+        dataset_end_utc = resolved_end
+        dataset_start_utc = resolved_end - timedelta(hours=req.lookback_hours)
+
     try:
         res = await run_experiment_replay(
             db=db,
             archive_store=archive_store,
             model_version=target_mv,
             strategy_version=target_sv,
-            dataset_start_utc=req.dataset_start_utc,
-            dataset_end_utc=req.dataset_end_utc,
+            dataset_start_utc=dataset_start_utc,
+            dataset_end_utc=dataset_end_utc,
             events=events,
             mos_model=mos_model,
             persist=True,

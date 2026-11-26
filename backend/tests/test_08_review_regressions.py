@@ -563,3 +563,168 @@ async def test_fetch_clob_books_rest_chunks_tokens_and_runtime_handles_429_coold
         clock.advance(timedelta(seconds=30))
         await app.state.autonomous_runtime.run_cycle()
         assert limited.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_autonomous_runtime_skips_event_missing_hourly_horizon_without_aborting_cycle(
+    tmp_path: Path,
+) -> None:
+    class _TwoEventWorldFeed(_FakeWorldFeed):
+        async def fetch_weather_events(self) -> list[dict[str, Any]]:
+            base = await super().fetch_weather_events()
+            future_event = {
+                "id": "evt-no-horizon",
+                "slug": "highest-temperature-in-paris-on-2026-11-28",
+                "title": "Highest temperature in Paris on 2026-11-28?",
+                "description": (
+                    "This market will resolve to the temperature range that contains the highest "
+                    "temperature reported at Paris-Le Bourget Airport (LFPB) on 28 Nov '26. "
+                    "Only routine METAR reports qualify; SPECI is excluded."
+                ),
+                "negRisk": True,
+                "active": True,
+                "markets": [
+                    {
+                        "id": "m-fut-0",
+                        "groupItemTitle": "10°C",
+                        "clobTokenIds": '["tok-fut-0", "tok-fut-no-0"]',
+                        "feesEnabled": True,
+                        "feeType": "weather_fees",
+                        "takerBaseFee": 1000,
+                        "makerBaseFee": 0,
+                    }
+                ],
+            }
+            return [future_event, *base]
+
+    now = datetime(2026, 11, 26, 9, 15, tzinfo=timezone.utc)
+    clock = VirtualClock(now)
+    app = create_app(
+        db_path=":memory:",
+        world_feed=_TwoEventWorldFeed("LFPB", date(2026, 11, 26)),
+        clock=clock,
+        enable_background_poll=False,
+        archive_dir=str(tmp_path / "archive_horizon"),
+    )
+    app.state.parquet_archive = ParquetArchiveStore(base_dir=tmp_path / "archive_horizon")
+    app.state.ensemble_fetcher = _FakeEnsembleFetcher(clock)
+
+    with TestClient(app) as client:
+        await app.state.clob_stream.process_raw_message(
+            [
+                {
+                    "event_type": "book",
+                    "asset_id": "tok-auto-0",
+                    "bids": [{"price": "0.40", "size": "50"}],
+                    "asks": [{"price": "0.55", "size": "50"}],
+                },
+                {
+                    "event_type": "book",
+                    "asset_id": "tok-auto-1",
+                    "bids": [{"price": "0.02", "size": "50"}],
+                    "asks": [{"price": "0.05", "size": "50"}],
+                },
+            ]
+        )
+        summary = await app.state.autonomous_runtime.run_cycle()
+        assert summary["events_count"] == 2
+        assert summary["probabilities_computed"] == 1
+        assert summary["signals_count"] >= 1
+
+        orders_resp = client.get("/api/strategy/orders?status=OPEN").json()
+        assert any(o["event_id"] == "evt-auto-lfpb" for o in orders_resp["orders"])
+
+
+@pytest.mark.asyncio
+async def test_replay_run_respects_lookback_hours_and_skips_missing_horizon(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 11, 26, 18, 0, tzinfo=timezone.utc)
+    clock = VirtualClock(now)
+    app = create_app(
+        db_path=":memory:",
+        world_feed=_FakeWorldFeed("LFPB", date(2026, 11, 26)),
+        clock=clock,
+        enable_background_poll=False,
+        archive_dir=str(tmp_path / "archive_replay_window"),
+    )
+    archive = ParquetArchiveStore(base_dir=tmp_path / "archive_replay_window")
+    app.state.parquet_archive = archive
+    app.state.ensemble_fetcher = _FakeEnsembleFetcher(clock)
+
+    with TestClient(app) as client:
+        await app.state.radar_service.sync_once()
+        event = (await app.state.db.list_weather_events(active_only=False))[0]
+
+        old_ts = now - timedelta(hours=48)
+        recent_ts = now - timedelta(hours=2)
+        hours = [datetime(2026, 11, 26, h, 0, tzinfo=timezone.utc) for h in range(24)]
+        members = [[10.0 if h == 14 else 7.0 for h in range(24)] for _ in range(30)]
+
+        archive.write_ensemble_snapshots(
+            [
+                EnsembleSnapshot(
+                    event_id=event.event_id,
+                    station_icao=event.station.icao,
+                    fetched_at_utc=old_ts,
+                    ingested_at_utc=old_ts,
+                    models=["ecmwf_ifs025"],
+                    member_count=len(members),
+                    hourly_timestamps_utc=hours,
+                    member_temps_c=members,
+                ),
+                EnsembleSnapshot(
+                    event_id=event.event_id,
+                    station_icao=event.station.icao,
+                    fetched_at_utc=recent_ts,
+                    ingested_at_utc=recent_ts,
+                    models=["ecmwf_ifs025"],
+                    member_count=len(members),
+                    hourly_timestamps_utc=hours,
+                    member_temps_c=members,
+                ),
+            ]
+        )
+        archive.write_orderbook_snapshots(
+            [
+                OrderBookSnapshot(
+                    event_id=event.event_id,
+                    bucket_id=event.buckets[0].bucket_id,
+                    token_id=event.buckets[0].token_id,
+                    bids=[OrderLevel(price=0.40, size=50.0)],
+                    asks=[OrderLevel(price=0.55, size=50.0)],
+                    best_bid=0.40,
+                    best_ask=0.55,
+                    midpoint=0.475,
+                    spread=0.15,
+                    tick_size=0.01,
+                    ingested_at_utc=old_ts + timedelta(minutes=1),
+                ),
+                OrderBookSnapshot(
+                    event_id=event.event_id,
+                    bucket_id=event.buckets[0].bucket_id,
+                    token_id=event.buckets[0].token_id,
+                    bids=[OrderLevel(price=0.40, size=50.0)],
+                    asks=[OrderLevel(price=0.55, size=50.0)],
+                    best_bid=0.40,
+                    best_ask=0.55,
+                    midpoint=0.475,
+                    spread=0.15,
+                    tick_size=0.01,
+                    ingested_at_utc=recent_ts + timedelta(minutes=1),
+                ),
+            ]
+        )
+
+        resp = client.post(
+            "/api/replay/run",
+            json={
+                "model_version": "ensemble-3layer-v1",
+                "strategy_version": "conservative-kelly-100-v1",
+                "lookback_hours": 24,
+            },
+        )
+        assert resp.status_code == 200
+        run = resp.json()["run"]
+        assert run["strategy_version"] == "conservative-kelly-100-v1"
+        assert datetime.fromisoformat(run["dataset_start_utc"]) >= now - timedelta(hours=24)

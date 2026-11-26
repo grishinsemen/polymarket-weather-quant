@@ -8,6 +8,7 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import FastAPI
@@ -28,6 +29,18 @@ from weather_quant.strategy.engine import StrategyEngine, StrategyStore, settlem
 from weather_quant.strategy.paper_executor import PaperExecutor
 
 logger = logging.getLogger(__name__)
+
+
+def _ensemble_covers_event_date(snap: EnsembleSnapshot, event: WeatherEvent) -> bool:
+    """Return True if *snap* contains at least one hourly timestamp on *event.local_date*."""
+    try:
+        station_tz = ZoneInfo(event.station.timezone)
+    except ZoneInfoNotFoundError:
+        return True
+    return any(
+        ensure_utc(ts).astimezone(station_tz).date() == event.local_date
+        for ts in snap.hourly_timestamps_utc
+    )
 
 
 class AutonomousRuntime:
@@ -165,7 +178,9 @@ class AutonomousRuntime:
         cached = self._ensemble_cache.get(icao)
         if cached is not None:
             age = ensure_utc(now_utc) - ensure_utc(cached.fetched_at_utc)
-            if age < timedelta(minutes=self.ensemble_refresh_minutes):
+            if age < timedelta(minutes=self.ensemble_refresh_minutes) and _ensemble_covers_event_date(
+                cached, event
+            ):
                 event_snap = (
                     cached
                     if cached.event_id == event.event_id
@@ -286,23 +301,33 @@ class AutonomousRuntime:
                 if ensemble is None:
                     continue
                 intraday_metars = await list_station_routine_metars(db, event.station.icao)
-                if mos_provider is not None and mos_provider.is_station_covered(event.station.icao):
-                    prob_snap = mos_provider.compute_probabilities(
-                        station=event.station,
-                        event=event,
-                        ensemble=ensemble,
-                        intraday_metars=intraday_metars,
-                        clock=clock,
+                try:
+                    if mos_provider is not None and mos_provider.is_station_covered(event.station.icao):
+                        prob_snap = mos_provider.compute_probabilities(
+                            station=event.station,
+                            event=event,
+                            ensemble=ensemble,
+                            intraday_metars=intraday_metars,
+                            clock=clock,
+                        )
+                    else:
+                        prob_snap = prob_engine.compute_probabilities(
+                            station=event.station,
+                            event=event,
+                            ensemble=ensemble,
+                            intraday_metars=intraday_metars,
+                            clock=clock,
+                            model_version=active_mv,
+                        )
+                except (ValueError, ZoneInfoNotFoundError) as exc:
+                    logger.warning(
+                        "Skipping probability computation for event %s (%s %s): %s",
+                        event.event_id,
+                        event.station.icao,
+                        event.local_date.isoformat(),
+                        exc,
                     )
-                else:
-                    prob_snap = prob_engine.compute_probabilities(
-                        station=event.station,
-                        event=event,
-                        ensemble=ensemble,
-                        intraday_metars=intraday_metars,
-                        clock=clock,
-                        model_version=active_mv,
-                    )
+                    continue
                 await save_event_probability_snapshot(db, prob_snap)
                 probs_computed += 1
 

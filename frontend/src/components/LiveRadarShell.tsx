@@ -49,7 +49,9 @@ export function LiveRadarShell() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [isTogglingPause, setIsTogglingPause] = useState(false);
   const [isRunningReplay, setIsRunningReplay] = useState(false);
+  const [isActivatingPair, setIsActivatingPair] = useState(false);
   const [promotingRunId, setPromotingRunId] = useState<string | null>(null);
+  const [replayWindowHours, setReplayWindowHours] = useState<number | null>(24);
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
 
   const versionsRef = useRef({
@@ -197,7 +199,11 @@ export function LiveRadarShell() {
         const resp = await fetch(`${API_BASE}/api/replay/run`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ model_version: mv, strategy_version: sv }),
+          body: JSON.stringify({
+            model_version: mv,
+            strategy_version: sv,
+            ...(replayWindowHours !== null ? { lookback_hours: replayWindowHours } : {}),
+          }),
         });
         if (!resp.ok) {
           const detail = await resp.text();
@@ -210,34 +216,57 @@ export function LiveRadarShell() {
         setIsRunningReplay(false);
       }
     },
+    [fetchSnapshot, replayWindowHours],
+  );
+
+  const promoteVersions = useCallback(
+    async (mv: string, sv: string, runId?: string) => {
+      const resp = await fetch(`${API_BASE}/api/replay/promote`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model_version: mv,
+          strategy_version: sv,
+          ...(runId ? { run_id: runId } : {}),
+        }),
+      });
+      if (resp.ok) {
+        initializedRef.current = true;
+        versionsRef.current = { mv, sv };
+        setSelectedModelVersion(mv);
+        setSelectedStrategyVersion(sv);
+        setErrorBanner(null);
+        await fetchSnapshot(mv, sv);
+      } else {
+        const detail = await resp.text();
+        setErrorBanner(`Promote failed: ${detail}`);
+      }
+    },
     [fetchSnapshot],
+  );
+
+  const handleActivatePair = useCallback(
+    async (mv: string, sv: string) => {
+      setIsActivatingPair(true);
+      try {
+        await promoteVersions(mv, sv);
+      } finally {
+        setIsActivatingPair(false);
+      }
+    },
+    [promoteVersions],
   );
 
   const handlePromoteRun = useCallback(
     async (run: ExperimentRunSummary) => {
       setPromotingRunId(run.run_id);
       try {
-        const resp = await fetch(`${API_BASE}/api/replay/promote`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model_version: run.model_version,
-            strategy_version: run.strategy_version,
-            run_id: run.run_id,
-          }),
-        });
-        if (resp.ok) {
-          initializedRef.current = true;
-          versionsRef.current = { mv: run.model_version, sv: run.strategy_version };
-          setSelectedModelVersion(run.model_version);
-          setSelectedStrategyVersion(run.strategy_version);
-          await fetchSnapshot(run.model_version, run.strategy_version);
-        }
+        await promoteVersions(run.model_version, run.strategy_version, run.run_id);
       } finally {
         setPromotingRunId(null);
       }
     },
-    [fetchSnapshot],
+    [promoteVersions],
   );
 
   return (
@@ -251,16 +280,20 @@ export function LiveRadarShell() {
       isSyncing={isSyncing}
       isTogglingPause={isTogglingPause}
       isRunningReplay={isRunningReplay}
+      isActivatingPair={isActivatingPair}
       promotingRunId={promotingRunId}
+      replayWindowHours={replayWindowHours}
       errorBanner={errorBanner}
       onSelectEvent={setSelectedEventId}
       onSelectTab={setActiveTab}
       onFilterModelVersion={handleFilterModel}
       onFilterStrategyVersion={handleFilterStrategy}
+      onSelectReplayWindow={setReplayWindowHours}
       onTogglePause={handleTogglePause}
       onSync={handleSync}
       onSeedDemo={handleSeedDemo}
       onRunReplay={handleRunReplay}
+      onActivatePair={handleActivatePair}
       onPromoteRun={handlePromoteRun}
     />
   );

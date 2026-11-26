@@ -7,7 +7,7 @@ import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Mapping, Sequence
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field
 
@@ -380,20 +380,29 @@ async def _execute_replay_isolated(
         ]
         peak_equity = strategy_rec.reference_bankroll
         max_drawdown = 0.0
+        close_by_event = {e.event_id: settlement_close_utc(e) for e in events_sorted}
+        events_by_icao: dict[str, list[str]] = {}
+        for ev in events_sorted:
+            events_by_icao.setdefault(ev.station.icao.upper(), []).append(ev.event_id)
+        checked_close_events: set[str] = set()
 
         for tick_time in ticks:
             clock.set(tick_time)
+            dirty_events: set[str] = set()
+            metar_arrived = False
 
             while book_idx < len(books_sorted) and _ensure_utc(books_sorted[book_idx].ingested_at_utc) < tick_time:
                 b = books_sorted[book_idx]
                 assert_before_decision(b.ingested_at_utc, tick_time, label="orderbook")
                 latest_books.setdefault(b.event_id, {})[b.bucket_id] = b
+                dirty_events.add(b.event_id)
                 book_idx += 1
 
             while ens_idx < len(ensembles_sorted) and _ensure_utc(ensembles_sorted[ens_idx].ingested_at_utc) < tick_time:
                 e = ensembles_sorted[ens_idx]
                 assert_before_decision(e.ingested_at_utc, tick_time, label="ensemble")
                 latest_ensembles[e.event_id] = e
+                dirty_events.add(e.event_id)
                 ens_idx += 1
 
             while metar_idx < len(metars_sorted) and _ensure_utc(metars_sorted[metar_idx].ingested_at_utc) < tick_time:
@@ -402,9 +411,23 @@ async def _execute_replay_isolated(
                 if strict_temporal:
                     assert_before_decision(m.observed_at_utc, tick_time, label="metar_observed")
                 metars_by_station.setdefault(m.station_icao.upper(), []).append(m)
+                for ev_id in events_by_icao.get(m.station_icao.upper(), ()):
+                    dirty_events.add(ev_id)
+                metar_arrived = True
                 metar_idx += 1
 
+            newly_expired = [
+                ev
+                for ev in events_sorted
+                if ev.event_id not in checked_close_events and tick_time >= close_by_event[ev.event_id]
+            ]
+            for ev in newly_expired:
+                checked_close_events.add(ev.event_id)
+                dirty_events.add(ev.event_id)
+
             for event in events_sorted:
+                if event.event_id not in dirty_events:
+                    continue
                 ens = latest_ensembles.get(event.event_id)
                 if ens is None:
                     continue
@@ -417,37 +440,42 @@ async def _execute_replay_isolated(
                 prob_key = (_ensure_utc(ens.ingested_at_utc), len(station_metars))
                 if last_prob_input_stamp.get(event.event_id) != prob_key:
                     bias_obs = recent_bias_by_station.get(event.station.icao.upper(), ())
-                    if mos_provider is not None and mos_provider.is_station_covered(event.station.icao):
-                        snap = mos_provider.compute_probabilities(
-                            station=event.station,
-                            event=event,
-                            ensemble=ens,
-                            recent_bias_obs=bias_obs,
-                            intraday_metars=station_metars,
-                            clock=clock,
-                            strict_temporal=strict_temporal,
-                        )
-                        if snap.model_version != model_rec.model_version:
-                            snap = snap.model_copy(
-                                update={
-                                    "model_version": model_rec.model_version,
-                                    "buckets": [
-                                        b.model_copy(update={"model_version": model_rec.model_version})
-                                        for b in snap.buckets
-                                    ],
-                                }
+                    try:
+                        if mos_provider is not None and mos_provider.is_station_covered(event.station.icao):
+                            snap = mos_provider.compute_probabilities(
+                                station=event.station,
+                                event=event,
+                                ensemble=ens,
+                                recent_bias_obs=bias_obs,
+                                intraday_metars=station_metars,
+                                clock=clock,
+                                strict_temporal=strict_temporal,
                             )
-                    else:
-                        snap = base_prob_engine.compute_probabilities(
-                            station=event.station,
-                            event=event,
-                            ensemble=ens,
-                            recent_bias_obs=bias_obs,
-                            intraday_metars=station_metars,
-                            clock=clock,
-                            model_version=model_rec.model_version,
-                            strict_temporal=strict_temporal,
-                        )
+                            if snap.model_version != model_rec.model_version:
+                                snap = snap.model_copy(
+                                    update={
+                                        "model_version": model_rec.model_version,
+                                        "buckets": [
+                                            b.model_copy(update={"model_version": model_rec.model_version})
+                                            for b in snap.buckets
+                                        ],
+                                    }
+                                )
+                        else:
+                            snap = base_prob_engine.compute_probabilities(
+                                station=event.station,
+                                event=event,
+                                ensemble=ens,
+                                recent_bias_obs=bias_obs,
+                                intraday_metars=station_metars,
+                                clock=clock,
+                                model_version=model_rec.model_version,
+                                strict_temporal=strict_temporal,
+                            )
+                    except TemporalIntegrityError:
+                        raise
+                    except (ValueError, ZoneInfoNotFoundError):
+                        continue
                     latest_probs[event.event_id] = snap
                     last_prob_input_stamp[event.event_id] = prob_key
 
@@ -457,7 +485,8 @@ async def _execute_replay_isolated(
                     latest_routine = station_metars[-1] if station_metars else None
                     await engine.tick_event(event, event_prob, event_books, latest_routine)
 
-            await _settle_expired_events(store, events_sorted, metars_sorted, tick_time)
+            if metar_arrived or newly_expired:
+                await _settle_expired_events(store, events_sorted, metars_sorted, tick_time)
 
             portfolio = await engine.portfolio(model_version=model_rec.model_version)
             peak_equity = max(peak_equity, portfolio.equity_usd)
