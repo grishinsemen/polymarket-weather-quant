@@ -1,15 +1,15 @@
 <img width="1687" height="901" alt="image" src="https://github.com/user-attachments/assets/7b0e4de6-c7cd-45c8-ac26-7431b3207b5b" />
 
-# Polymarket Daily Weather Quant Engine & Pro Terminal
+<h1 align="center">Polymarket Daily Weather Quant Engine & Pro Terminal</h1>
 
-
-![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
-![LightGBM](https://img.shields.io/badge/LightGBM-ML%20MOS-2E7D32)
-![Next.js](https://img.shields.io/badge/Next.js-React-000000?logo=nextdotjs&logoColor=white)
-![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white)
-![Parquet](https://img.shields.io/badge/Apache%20Parquet-Replay%20Archive-50ABF1)
-
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white" alt="Python" />
+  <img src="https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white" alt="FastAPI" />
+  <img src="https://img.shields.io/badge/LightGBM-ML%20MOS-2E7D32" alt="LightGBM" />
+  <img src="https://img.shields.io/badge/Next.js-React-000000?logo=nextdotjs&logoColor=white" alt="Next.js" />
+  <img src="https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white" alt="TypeScript" />
+  <img src="https://img.shields.io/badge/Apache%20Parquet-Replay%20Archive-50ABF1" alt="Parquet" />
+</p>
 Автономный квантовый движок, лаборатория воспроизводимых экспериментов (`Experiment Replay`), низкошумный Telegram-радар и тёмный веб-терминал (`Next.js`) для дневных температурных рынков Polymarket, расчёт которых идёт строго по официальным авиационным сводкам `Routine METAR` конкретных аэропортов (`Station` ICAO).
 
 > **Статус безопасности:** публичный репозиторий работает в режиме симуляции (`PaperExecutor`) на открытых публичных API без реальных ключей и транзакций. Секреты, локальные базы и архивы исключены из Git и защищены автоматическим тестом-предохранителем.
