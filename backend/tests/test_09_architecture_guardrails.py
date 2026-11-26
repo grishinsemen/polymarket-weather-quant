@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -110,5 +111,102 @@ def test_env_example_and_gitignore_parity() -> None:
         assert var_name in frontend_corpus, f"{var_name} in .env.example is unused in frontend/src"
 
     gitignore_text = GITIGNORE.read_text(encoding="utf-8")
-    for required in (".env", "data/**/*.parquet", "data/models/", "logs/", ".venv/", "node_modules/"):
+    for required in (
+        ".env",
+        "*.tsbuildinfo",
+        "data/**/*.parquet",
+        "data/models/",
+        "logs/",
+        ".venv/",
+        "node_modules/",
+    ):
         assert required in gitignore_text, f"Missing required .gitignore pattern: {required}"
+
+
+_FORBIDDEN_TRACKED_SUFFIXES = {
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".tsbuildinfo",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".parquet",
+}
+_BINARY_SKIP_SUFFIXES = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".pdf",
+    ".zip",
+}
+_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("PEM private key", re.compile("-" * 5 + r"BEGIN [A-Z0-9 ]*PRIVATE KEY" + "-" * 5)),
+    ("Telegram bot token", re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b")),
+    (
+        "64-hex private key assignment",
+        re.compile(
+            r"(?i)(?:private_key|wallet_key|signer_key|polymarket_private_key|eth_private_key)"
+            r"\s*[:=]\s*['\"]?(?:0x)?[0-9a-f]{64}\b"
+        ),
+    ),
+)
+_SENSITIVE_ENV_ASSIGNMENT = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?(TELEGRAM_BOT_TOKEN|POLYMARKET_API_KEY|POLYMARKET_API_SECRET"
+    r"|POLYMARKET_PASSPHRASE|POLYMARKET_PRIVATE_KEY|WALLET_PRIVATE_KEY)[ \t]*=[ \t]*([^\s#]+)",
+    re.MULTILINE,
+)
+_PLACEHOLDER_PREFIXES = ("<", "${", "your_", "example", "changeme", "dummy", "test_", "fake_")
+
+
+def _is_placeholder_value(raw: str) -> bool:
+    cleaned = raw.strip().strip("'\"").lower()
+    if not cleaned:
+        return True
+    return cleaned.startswith(_PLACEHOLDER_PREFIXES) or cleaned in {"test", "dummy", "changeme", "none", "null"}
+
+
+def test_no_tracked_secrets_or_private_keys() -> None:
+    """Prevent accidental commits of .env files, runtime artifacts, private keys, or API tokens."""
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=True,
+    )
+    tracked_rel_paths = [p for p in result.stdout.decode("utf-8", errors="replace").split("\0") if p]
+
+    violations: list[str] = []
+    for rel in tracked_rel_paths:
+        rel_path = Path(rel)
+        name = rel_path.name
+        if (name == ".env" or name.startswith(".env.")) and name != ".env.example":
+            violations.append(f"Forbidden env file tracked in git: {rel}")
+            continue
+        if rel_path.suffix.lower() in _FORBIDDEN_TRACKED_SUFFIXES:
+            violations.append(f"Forbidden artifact/key file tracked in git: {rel}")
+            continue
+        if rel_path.suffix.lower() in _BINARY_SKIP_SUFFIXES:
+            continue
+
+        abs_path = REPO_ROOT / rel_path
+        if not abs_path.is_file():
+            continue
+        text = abs_path.read_text(encoding="utf-8", errors="ignore")
+
+        for label, pattern in _SECRET_PATTERNS:
+            if pattern.search(text):
+                violations.append(f"{label} detected in {rel}")
+
+        for match in _SENSITIVE_ENV_ASSIGNMENT.finditer(text):
+            var_name, raw_val = match.group(1), match.group(2)
+            if not _is_placeholder_value(raw_val):
+                violations.append(f"Non-empty secret assignment {var_name}=... in {rel}")
+
+    assert not violations, "Potential secret/artifact leak in tracked files:\n" + "\n".join(violations)

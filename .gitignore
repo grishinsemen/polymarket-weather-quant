@@ -12,6 +12,7 @@ node_modules/
 .next/
 out/
 dist/
+*.tsbuildinfo
 
 # Secrets & local env
 .env
