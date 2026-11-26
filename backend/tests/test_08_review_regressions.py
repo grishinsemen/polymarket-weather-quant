@@ -744,3 +744,129 @@ def test_coalesce_replay_ticks_reduces_dense_ws_stamps_while_preserving_small_ru
     assert len(coalesced) <= 12
     for prev, nxt in zip(coalesced, coalesced[1:-1]):
         assert (nxt - prev) >= timedelta(seconds=60)
+
+
+@pytest.mark.asyncio
+async def test_paper_executor_on_books_batches_fills_and_clv(tmp_path: Path) -> None:
+    from weather_quant.strategy.paper_executor import PaperExecutor
+
+    db = Database(str(tmp_path / "batch_books.db"))
+    await db.initialize()
+    try:
+        now = datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc)
+        clock = VirtualClock(now)
+        store = StrategyStore(db)
+        await store.ensure_schema()
+        await store.ensure_model_version("ensemble-3layer-v1", now)
+
+        klga = get_station("KLGA")
+        assert klga is not None
+        event = WeatherEvent(
+            event_id="evt-batch-1",
+            slug="highest-temp-nyc-batch",
+            title="Batch test",
+            url="https://polymarket.com/event/batch",
+            station=klga,
+            local_date=date(2026, 11, 26),
+            polarity=Polarity.HIGHEST,
+            remark_tenths_enabled=True,
+            unit="C",
+            buckets=[
+                Bucket(
+                    bucket_id="b0",
+                    market_id="m0",
+                    token_id="tok-0",
+                    label="10°C",
+                    lower_bound=10.0,
+                    upper_bound=10.0,
+                    outcome_index=0,
+                ),
+                Bucket(
+                    bucket_id="b1",
+                    market_id="m1",
+                    token_id="tok-1",
+                    label="11°C",
+                    lower_bound=11.0,
+                    upper_bound=11.0,
+                    outcome_index=1,
+                ),
+            ],
+            discovered_at_utc=now - timedelta(hours=2),
+        )
+        await db.upsert_weather_event(event)
+
+        executor = PaperExecutor(db=db, clock=clock, store=store)
+        executor.register_event(event)
+        order = MakerOrder(
+            order_id="ord-batch-0",
+            event_id=event.event_id,
+            station_icao=klga.icao,
+            bucket_id="b0",
+            token_id="tok-0",
+            side="BUY",
+            limit_price=0.40,
+            size_shares=10.0,
+            size_usd=4.0,
+            post_only=True,
+            phase="PREMARKET_ENTRY",
+            status="OPEN",
+            model_version="ensemble-3layer-v1",
+            strategy_version="conservative-kelly-100-v1",
+            created_at_utc=now,
+            updated_at_utc=now,
+        )
+        await executor.place_order(order)
+
+        books = [
+            OrderBookSnapshot(
+                event_id=event.event_id,
+                bucket_id="b0",
+                token_id="tok-0",
+                bids=[OrderLevel(price=0.35, size=20.0)],
+                asks=[OrderLevel(price=0.40, size=20.0)],
+                best_bid=0.35,
+                best_ask=0.40,
+                midpoint=0.375,
+                spread=0.05,
+                tick_size=0.01,
+                ingested_at_utc=now,
+            ),
+            OrderBookSnapshot(
+                event_id=event.event_id,
+                bucket_id="b1",
+                token_id="tok-1",
+                bids=[OrderLevel(price=0.10, size=20.0)],
+                asks=[OrderLevel(price=0.20, size=20.0)],
+                best_bid=0.10,
+                best_ask=0.20,
+                midpoint=0.15,
+                spread=0.10,
+                tick_size=0.01,
+                ingested_at_utc=now,
+            ),
+        ]
+        fills = await executor.on_books(event.event_id, books)
+        assert len(fills) == 1
+        assert fills[0].bucket_id == "b0"
+
+        # Advance 10m -> captures 5m CLV horizon once without duplicate DB writes
+        clock.advance(timedelta(minutes=10))
+        books_later = [
+            b.model_copy(
+                update={
+                    "bids": [OrderLevel(price=0.48, size=20.0)],
+                    "asks": [OrderLevel(price=0.52, size=20.0)],
+                    "best_bid": 0.48,
+                    "best_ask": 0.52,
+                    "midpoint": 0.50,
+                    "ingested_at_utc": clock.now(),
+                }
+            )
+            for b in books
+        ]
+        assert await executor.on_books(event.event_id, books_later) == []
+        clvs = await store.list_clv(fill_id=fills[0].fill_id)
+        assert [c.horizon_minutes for c in clvs] == [5]
+        assert clvs[0].clv == pytest.approx(0.10)
+    finally:
+        await db.close()

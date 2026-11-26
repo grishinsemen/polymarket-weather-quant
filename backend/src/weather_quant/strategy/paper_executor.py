@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from weather_quant.clob.fees import calculate_order_fee_usd
 from weather_quant.domain.clock import Clock
@@ -108,6 +108,7 @@ class PaperExecutor:
         self._latest_books: dict[str, OrderBookSnapshot] = {}
         self._books_by_bucket: dict[tuple[str, str], OrderBookSnapshot] = {}
         self._last_consumed_sig: dict[str, tuple[Any, ...]] = {}
+        self._captured_clv_keys: set[tuple[str, int]] = set()
 
     def register_event(self, event: WeatherEvent) -> None:
         """Register WeatherEvent metadata for fee calculation and Bucket labels."""
@@ -217,6 +218,50 @@ class PaperExecutor:
         await self._capture_horizon_clv(book, now)
         return fills
 
+    async def on_books(
+        self, event_id: str, books: Iterable[OrderBookSnapshot]
+    ) -> list[FillRecord]:
+        """Batch-evaluate all Bucket books for one event with O(1) SQL roundtrips."""
+        book_list = list(books)
+        fresh: list[OrderBookSnapshot] = []
+        for book in book_list:
+            self._latest_books[book.token_id] = book
+            self._books_by_bucket[(book.event_id, book.bucket_id)] = book
+            if not book.is_stale:
+                fresh.append(book)
+        if not fresh:
+            return []
+
+        now = self.clock.now()
+        resting_all = await self.store.list_resting_orders(event_id)
+        created_fills: list[FillRecord] = []
+        if resting_all:
+            for book in fresh:
+                matching = [
+                    o
+                    for o in resting_all
+                    if o.token_id == book.token_id or o.bucket_id == book.bucket_id
+                ]
+                if matching:
+                    created_fills.extend(
+                        await self._evaluate_orders_against_book(matching, book, now)
+                    )
+
+        buy_fills_all = await self.store.list_fills(
+            limit=500, event_id=event_id, side="BUY"
+        )
+        if buy_fills_all:
+            fills_by_bucket: dict[str, list[FillRecord]] = {}
+            for fill in buy_fills_all:
+                fills_by_bucket.setdefault(fill.bucket_id, []).append(fill)
+            now_utc = _ensure_utc(now)
+            for book in fresh:
+                bucket_fills = fills_by_bucket.get(book.bucket_id)
+                if bucket_fills:
+                    await self._capture_fills_clv_for_book(bucket_fills, book, now_utc)
+
+        return created_fills
+
     async def _evaluate_orders_against_book(
         self,
         orders: list[MakerOrder],
@@ -309,16 +354,29 @@ class PaperExecutor:
         midpoint = _book_midpoint(book)
         if midpoint is None:
             return []
-        fills = [
-            f
-            for f in await self.store.list_fills(limit=500)
-            if f.event_id == book.event_id and f.bucket_id == book.bucket_id and f.side == "BUY"
-        ]
+        fills = await self.store.list_fills(
+            limit=500,
+            event_id=book.event_id,
+            bucket_id=book.bucket_id,
+            side="BUY",
+        )
+        if not fills:
+            return []
+        return await self._capture_fills_clv_for_book(fills, book, _ensure_utc(now))
+
+    async def _capture_fills_clv_for_book(
+        self, fills: list[FillRecord], book: OrderBookSnapshot, now_utc: datetime
+    ) -> list[ClvSnapshot]:
+        midpoint = _book_midpoint(book)
+        if midpoint is None:
+            return []
         captured: list[ClvSnapshot] = []
-        now_utc = _ensure_utc(now)
         for fill in fills:
             filled_utc = _ensure_utc(fill.filled_at_utc)
             for horizon in self.clv_horizons_minutes:
+                cache_key = (fill.fill_id, horizon)
+                if cache_key in self._captured_clv_keys:
+                    continue
                 if now_utc < filled_utc + timedelta(minutes=horizon):
                     continue
                 snap = ClvSnapshot(
@@ -334,7 +392,9 @@ class PaperExecutor:
                     strategy_version=fill.strategy_version,
                     captured_at_utc=now_utc,
                 )
-                if await self.store.insert_clv(snap):
+                inserted = await self.store.insert_clv(snap)
+                self._captured_clv_keys.add(cache_key)
+                if inserted:
                     captured.append(snap)
         return captured
 

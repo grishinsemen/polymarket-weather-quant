@@ -176,6 +176,7 @@ class StrategyStore:
 
     def __init__(self, db: Database) -> None:
         self.db = db
+        self._ensured_models: set[str] = set()
 
     async def ensure_schema(self) -> None:
         await self.db.conn.executescript(STRATEGY_SCHEMA_SQL)
@@ -183,6 +184,8 @@ class StrategyStore:
 
     # ---- versions -------------------------------------------------------------------------
     async def ensure_model_version(self, model_version: str, now: datetime) -> None:
+        if model_version in self._ensured_models:
+            return
         await self.db.conn.execute(
             """
             INSERT OR IGNORE INTO model_versions (
@@ -200,6 +203,7 @@ class StrategyStore:
             ),
         )
         await self.db.conn.commit()
+        self._ensured_models.add(model_version)
 
     async def register_strategy_version(self, record: StrategyVersionRecord) -> StrategyVersionRecord:
         """Register an immutable Strategy Version; re-registering identical content is a no-op."""
@@ -713,12 +717,32 @@ class StrategyStore:
         await self._upsert_position(pos)
         await self.db.conn.commit()
 
-    async def list_fills(self, *, limit: int = 500, order_id: str | None = None) -> list[FillRecord]:
-        sql = "SELECT * FROM fills"
+    async def list_fills(
+        self,
+        *,
+        limit: int = 500,
+        order_id: str | None = None,
+        event_id: str | None = None,
+        bucket_id: str | None = None,
+        side: str | None = None,
+    ) -> list[FillRecord]:
+        clauses: list[str] = []
         params: list[Any] = []
         if order_id is not None:
-            sql += " WHERE order_id = ?"
+            clauses.append("order_id = ?")
             params.append(order_id)
+        if event_id is not None:
+            clauses.append("event_id = ?")
+            params.append(event_id)
+        if bucket_id is not None:
+            clauses.append("bucket_id = ?")
+            params.append(bucket_id)
+        if side is not None:
+            clauses.append("side = ?")
+            params.append(side)
+        sql = "SELECT * FROM fills"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY filled_at_utc DESC, rowid DESC LIMIT ?"
         params.append(limit)
         async with self.db.conn.execute(sql, params) as cur:
@@ -1159,8 +1183,12 @@ class StrategyEngine:
         sim = executor if isinstance(executor, SimulatedExecutor) else None
         if sim is not None:
             sim.register_event(event)
-            for book in books.values():
-                result.fills.extend(await sim.on_book(book))
+            on_books_fn = getattr(sim, "on_books", None)
+            if callable(on_books_fn):
+                result.fills.extend(await on_books_fn(event.event_id, books.values()))
+            else:
+                for book in books.values():
+                    result.fills.extend(await sim.on_book(book))
 
         prob_by_bucket: dict[str, BucketFairProbability] = {b.bucket_id: b for b in probabilities.buckets}
         label_by_bucket = {b.bucket_id: b.label for b in event.buckets}
