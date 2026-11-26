@@ -943,3 +943,33 @@ async def test_replay_progress_callback_and_status_endpoint(tmp_path: Path) -> N
         assert "simulating" in stages
         assert "finalizing" in stages
         assert updates[-1]["pct"] == 97
+
+
+@pytest.mark.asyncio
+async def test_http_world_feed_backfills_36h_metar_on_initial_station_fetch() -> None:
+    import httpx
+    from weather_quant.metar.fetcher import HttpWorldFeed
+
+    requested_hours: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_hours.append(request.url.params.get("hours"))
+        return httpx.Response(
+            200,
+            text=(
+                "METAR MMMX 251345Z 03005KT 1 1/2SM BR HZ BKN010 10/09 A3036\n"
+                "METAR MMMX 260046Z 13009KT 10SM BKN020CB OVC080 19/07 A3027\n"
+            ),
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        feed = HttpWorldFeed(client=client)
+        lines1 = await feed.fetch_metar_reports(["MMMX"])
+        lines2 = await feed.fetch_metar_reports(["MMMX"])
+        # New station triggers backfill again
+        lines3 = await feed.fetch_metar_reports(["MMMX", "KLGA"])
+
+    assert len(lines1) == 2
+    assert len(lines2) == 2
+    assert len(lines3) == 2
+    assert requested_hours == ["36", "4", "36"]

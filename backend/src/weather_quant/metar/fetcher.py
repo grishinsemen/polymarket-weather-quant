@@ -17,9 +17,14 @@ class HttpWorldFeed:
         self,
         client: httpx.AsyncClient | None = None,
         timeout_seconds: float = 15.0,
+        metar_hours: int = 4,
+        backfill_metar_hours: int = 36,
     ) -> None:
         self._external_client = client
         self._timeout_seconds = timeout_seconds
+        self._metar_hours = metar_hours
+        self._backfill_metar_hours = backfill_metar_hours
+        self._backfilled_icaos: set[str] = set()
 
     async def _get_client(self) -> tuple[httpx.AsyncClient, bool]:
         if self._external_client is not None:
@@ -76,15 +81,19 @@ class HttpWorldFeed:
         if not unique_icaos:
             return []
 
+        needs_backfill = any(icao not in self._backfilled_icaos for icao in unique_icaos)
+        hours = self._backfill_metar_hours if needs_backfill else self._metar_hours
+
         client, owns_client = await self._get_client()
         try:
             params = {
                 "ids": ",".join(unique_icaos),
                 "format": "raw",
-                "hours": 3,
+                "hours": hours,
             }
             resp = await client.get(AVIATION_WEATHER_METAR_URL, params=params)
             resp.raise_for_status()
+            self._backfilled_icaos.update(unique_icaos)
             return [line.strip() for line in resp.text.splitlines() if line.strip()]
         finally:
             if owns_client:
