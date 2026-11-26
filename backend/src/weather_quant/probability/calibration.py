@@ -76,6 +76,39 @@ class StationCalibrationReport(BaseModel):
     learned_spread_scale: float = 1.0
 
 
+class RegimeErrorSummary(BaseModel):
+    """Error stratification for a temperature regime (COLD / MILD / HOT)."""
+
+    regime: str
+    sample_count: int
+    mean_bias_c: float
+    mae_c: float
+    rmse_c: float
+    brier_score: float
+
+
+class MonthlyErrorSummary(BaseModel):
+    """Calendar-month error breakdown for seasonal calibration diagnostics."""
+
+    month: int
+    sample_count: int
+    mean_bias_c: float
+    mae_c: float
+    brier_score: float
+
+
+class WorstDayDiagnostic(BaseModel):
+    """Single worst-error day record for offline tail-failure inspection."""
+
+    station_icao: str
+    local_date: date
+    actual_c: float
+    predicted_p50_c: float
+    residual_c: float
+    abs_error_c: float
+    brier_score: float
+
+
 class CalibrationEvaluationReport(BaseModel):
     """Full per-station and aggregate calibration report."""
 
@@ -84,6 +117,10 @@ class CalibrationEvaluationReport(BaseModel):
     overall_raw: CalibrationMetricsSummary
     overall_calibrated: CalibrationMetricsSummary
     stations: list[StationCalibrationReport] = Field(default_factory=list)
+    regime_breakdown: list[RegimeErrorSummary] = Field(default_factory=list)
+    monthly_breakdown: list[MonthlyErrorSummary] = Field(default_factory=list)
+    worst_days: list[WorstDayDiagnostic] = Field(default_factory=list)
+    pit_histogram: list[int] = Field(default_factory=list)
 
 
 def build_synthetic_degree_buckets(
@@ -355,14 +392,23 @@ def evaluate_calibration_walk_forward(
                 clock=clock,
             )
             cal_arr = raw_mean + bias_c + scale * (raw_arr - raw_mean)
+            pit_val = float(np.mean(cal_arr <= item.actual_extreme_c))
+            cal_probs = [b.fair_probability for b in cal_snap.buckets]
+            day_brier = sum(
+                (p - (1.0 if k == true_idx else 0.0)) ** 2 for k, p in enumerate(cal_probs)
+            )
             cal_records.append(
                 {
-                    "probs": [b.fair_probability for b in cal_snap.buckets],
+                    "probs": cal_probs,
                     "true_idx": true_idx,
                     "actual_c": item.actual_extreme_c,
                     "p10_c": float(np.percentile(cal_arr, 10)),
                     "p50_c": float(np.percentile(cal_arr, 50)),
                     "p90_c": float(np.percentile(cal_arr, 90)),
+                    "station_icao": icao,
+                    "local_date": item.local_date,
+                    "pit": pit_val,
+                    "brier": day_brier,
                 }
             )
 
@@ -393,13 +439,105 @@ def evaluate_calibration_walk_forward(
             all_raw_records.extend(raw_records)
             all_cal_records.extend(cal_records)
 
+    regime_breakdown, monthly_breakdown, worst_days, pit_hist = _build_extended_diagnostics(all_cal_records)
+
     return CalibrationEvaluationReport(
         generated_at_utc=datetime.now(timezone.utc),
         tail_price_threshold=tail_price_threshold,
         overall_raw=_summarize_records(all_raw_records, tail_price_threshold),
         overall_calibrated=_summarize_records(all_cal_records, tail_price_threshold),
         stations=station_reports,
+        regime_breakdown=regime_breakdown,
+        monthly_breakdown=monthly_breakdown,
+        worst_days=worst_days,
+        pit_histogram=pit_hist,
     )
+
+
+def _build_extended_diagnostics(
+    records: list[dict[str, object]],
+    *,
+    cold_threshold_c: float = 10.0,
+    hot_threshold_c: float = 25.0,
+    top_n: int = 5,
+    pit_bins: int = 10,
+) -> tuple[list[RegimeErrorSummary], list[MonthlyErrorSummary], list[WorstDayDiagnostic], list[int]]:
+    if not records:
+        return [], [], [], []
+
+    by_regime: dict[str, list[dict[str, object]]] = {"COLD": [], "MILD": [], "HOT": []}
+    by_month: dict[int, list[dict[str, object]]] = {}
+    pit_counts = [0] * pit_bins
+
+    for rec in records:
+        actual = float(rec["actual_c"])  # type: ignore[arg-type]
+        if actual < cold_threshold_c:
+            by_regime["COLD"].append(rec)
+        elif actual > hot_threshold_c:
+            by_regime["HOT"].append(rec)
+        else:
+            by_regime["MILD"].append(rec)
+
+        d = rec.get("local_date")
+        if isinstance(d, date):
+            by_month.setdefault(d.month, []).append(rec)
+
+        pit = float(rec.get("pit", 0.5))  # type: ignore[arg-type]
+        b_idx = min(pit_bins - 1, max(0, int(pit * pit_bins)))
+        pit_counts[b_idx] += 1
+
+    regimes: list[RegimeErrorSummary] = []
+    for name in ("COLD", "MILD", "HOT"):
+        grp = by_regime[name]
+        if not grp:
+            continue
+        errs = [float(r["actual_c"]) - float(r["p50_c"]) for r in grp]  # type: ignore[arg-type]
+        briers = [float(r.get("brier", 0.0)) for r in grp]  # type: ignore[arg-type]
+        regimes.append(
+            RegimeErrorSummary(
+                regime=name,
+                sample_count=len(grp),
+                mean_bias_c=round(sum(errs) / len(errs), 4),
+                mae_c=round(sum(abs(e) for e in errs) / len(errs), 4),
+                rmse_c=round(math.sqrt(sum(e * e for e in errs) / len(errs)), 4),
+                brier_score=round(sum(briers) / len(briers), 6),
+            )
+        )
+
+    months: list[MonthlyErrorSummary] = []
+    for m in sorted(by_month):
+        grp = by_month[m]
+        errs = [float(r["actual_c"]) - float(r["p50_c"]) for r in grp]  # type: ignore[arg-type]
+        briers = [float(r.get("brier", 0.0)) for r in grp]  # type: ignore[arg-type]
+        months.append(
+            MonthlyErrorSummary(
+                month=m,
+                sample_count=len(grp),
+                mean_bias_c=round(sum(errs) / len(errs), 4),
+                mae_c=round(sum(abs(e) for e in errs) / len(errs), 4),
+                brier_score=round(sum(briers) / len(briers), 6),
+            )
+        )
+
+    worst_sorted = sorted(
+        records,
+        key=lambda r: abs(float(r["actual_c"]) - float(r["p50_c"])),  # type: ignore[arg-type]
+        reverse=True,
+    )[:top_n]
+    worst_days = [
+        WorstDayDiagnostic(
+            station_icao=str(r.get("station_icao", "")),
+            local_date=r["local_date"],  # type: ignore[arg-type]
+            actual_c=round(float(r["actual_c"]), 3),  # type: ignore[arg-type]
+            predicted_p50_c=round(float(r["p50_c"]), 3),  # type: ignore[arg-type]
+            residual_c=round(float(r["actual_c"]) - float(r["p50_c"]), 3),  # type: ignore[arg-type]
+            abs_error_c=round(abs(float(r["actual_c"]) - float(r["p50_c"])), 3),  # type: ignore[arg-type]
+            brier_score=round(float(r.get("brier", 0.0)), 6),  # type: ignore[arg-type]
+        )
+        for r in worst_sorted
+        if isinstance(r.get("local_date"), date)
+    ]
+    return regimes, months, worst_days, pit_counts
 
 
 async def load_local_calibration_samples(

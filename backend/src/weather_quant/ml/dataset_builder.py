@@ -76,6 +76,12 @@ FEATURE_COLUMNS: tuple[str, ...] = (
     "station_elevation_m",
     "rolling_bias_c",
     "prior_obs_temp_c",
+    "delta_obs_temp_24h",
+    "prior_diurnal_range_c",
+    "pressure_msl_tendency_24h",
+    "mosmix_extreme_c",
+    "nbm_extreme_c",
+    "nws_point_extreme_c",
 )
 
 FEATURE_SCHEMA_HASH: str = hashlib.sha256(",".join(FEATURE_COLUMNS).encode("utf-8")).hexdigest()[:16]
@@ -122,6 +128,7 @@ class HistoricalForecastPoint(BaseModel):
     wind_direction_10m: float | None = None
     cloud_cover: float | None = None
     relative_humidity_2m: float | None = None
+    pressure_msl: float | None = None
 
 
 class MosDatasetSample(BaseModel):
@@ -358,6 +365,33 @@ def _circular_wind_stats(directions_deg: Sequence[float]) -> tuple[float, float]
     return sum(sins) / len(sins), sum(coss) / len(coss)
 
 
+def _compute_prior_obs_dynamics(
+    valid_obs: Sequence[MetarObservation],
+    local_date: date,
+    station_tz: ZoneInfo,
+) -> tuple[float, float]:
+    """Compute (delta_obs_temp_24h, prior_diurnal_range_c) strictly from prior Routine METARs."""
+    by_day: dict[date, list[float]] = {}
+    for obs in valid_obs:
+        d = _ensure_utc(obs.observed_at_utc).astimezone(station_tz).date()
+        if d < local_date:
+            by_day.setdefault(d, []).append(float(obs.temp_c))
+    d1 = local_date - timedelta(days=1)
+    d2 = local_date - timedelta(days=2)
+    temps_d1 = by_day.get(d1) or []
+    temps_d2 = by_day.get(d2) or []
+    diurnal_range = (max(temps_d1) - min(temps_d1)) if len(temps_d1) >= 2 else 0.0
+    delta_24h = (max(temps_d1) - max(temps_d2)) if (temps_d1 and temps_d2) else 0.0
+    return float(delta_24h), float(diurnal_range)
+
+
+def _compute_pressure_tendency(pressures: Sequence[float]) -> float:
+    """Compute 24h barometric tendency (last - first hPa) from hourly pressure series."""
+    if len(pressures) < 2:
+        return 0.0
+    return float(pressures[-1] - pressures[0])
+
+
 def _compute_feature_dict(
     *,
     station: Station,
@@ -372,6 +406,12 @@ def _compute_feature_dict(
     rhs: Sequence[float],
     rolling_bias_c: float,
     prior_obs_temp_c: float,
+    delta_obs_temp_24h: float = 0.0,
+    prior_diurnal_range_c: float = 0.0,
+    pressure_msl_tendency_24h: float = 0.0,
+    mosmix_extreme_c: float | None = None,
+    nbm_extreme_c: float | None = None,
+    nws_point_extreme_c: float | None = None,
 ) -> tuple[dict[str, float], float, float]:
     ens_mean = _mean(all_extremes_c)
     ens_std = _std(all_extremes_c, ens_mean)
@@ -412,6 +452,12 @@ def _compute_feature_dict(
         "station_elevation_m": float(station.elevation_m),
         "rolling_bias_c": float(rolling_bias_c),
         "prior_obs_temp_c": float(prior_obs_temp_c),
+        "delta_obs_temp_24h": float(delta_obs_temp_24h),
+        "prior_diurnal_range_c": float(prior_diurnal_range_c),
+        "pressure_msl_tendency_24h": float(pressure_msl_tendency_24h),
+        "mosmix_extreme_c": float(mosmix_extreme_c if mosmix_extreme_c is not None else ens_mean),
+        "nbm_extreme_c": float(nbm_extreme_c if nbm_extreme_c is not None else ens_mean),
+        "nws_point_extreme_c": float(nws_point_extreme_c if nws_point_extreme_c is not None else ens_mean),
     }
     return features, ens_mean, ens_std
 
@@ -488,9 +534,16 @@ def build_mos_sample(
     wind_dirs = [p.wind_direction_10m for p in day_forecasts if p.wind_direction_10m is not None]
     clouds = [p.cloud_cover for p in day_forecasts if p.cloud_cover is not None]
     rhs = [p.relative_humidity_2m for p in day_forecasts if p.relative_humidity_2m is not None]
+    pressures = [
+        p.pressure_msl
+        for p in sorted(day_forecasts, key=lambda pt: _ensure_utc(pt.valid_at_utc))
+        if p.pressure_msl is not None
+    ]
 
     rolling_bias_c = _mean(bias_errors, 0.0)
     prior_obs_temp_c = valid_obs[-1].temp_c if valid_obs else _mean(all_extremes)
+    delta_obs_24h, prior_diurnal_range = _compute_prior_obs_dynamics(valid_obs, local_date, station_tz)
+    pressure_tendency = _compute_pressure_tendency(pressures)
     latest_avail = max(_ensure_utc(p.available_at_utc) for p in day_forecasts)
 
     features, ens_mean, ens_std = _compute_feature_dict(
@@ -506,6 +559,9 @@ def build_mos_sample(
         rhs=rhs,
         rolling_bias_c=rolling_bias_c,
         prior_obs_temp_c=prior_obs_temp_c,
+        delta_obs_temp_24h=delta_obs_24h,
+        prior_diurnal_range_c=prior_diurnal_range,
+        pressure_msl_tendency_24h=pressure_tendency,
     )
 
     return MosDatasetSample(
@@ -700,12 +756,15 @@ def extract_features_from_ensemble(
 
     rolling_bias_c = _mean(bias_errors, 0.0)
     prior_obs_temp_c = valid_obs[-1].temp_c if valid_obs else ens_mean
+    delta_obs_24h, prior_diurnal_range = _compute_prior_obs_dynamics(valid_obs, local_date, station_tz)
 
     meta = ensemble.metadata
     wind_speeds = [float(x) for x in meta.get("wind_speed_10m", [])] if isinstance(meta.get("wind_speed_10m"), list) else []
     wind_dirs = [float(x) for x in meta.get("wind_direction_10m", [])] if isinstance(meta.get("wind_direction_10m"), list) else []
     clouds = [float(x) for x in meta.get("cloud_cover", [])] if isinstance(meta.get("cloud_cover"), list) else []
     rhs = [float(x) for x in meta.get("relative_humidity_2m", [])] if isinstance(meta.get("relative_humidity_2m"), list) else []
+    pressures = [float(x) for x in meta.get("pressure_msl", [])] if isinstance(meta.get("pressure_msl"), list) else []
+    pressure_tendency = _compute_pressure_tendency(pressures)
 
     features, _, _ = _compute_feature_dict(
         station=station,
@@ -720,10 +779,121 @@ def extract_features_from_ensemble(
         rhs=rhs,
         rolling_bias_c=rolling_bias_c,
         prior_obs_temp_c=prior_obs_temp_c,
+        delta_obs_temp_24h=delta_obs_24h,
+        prior_diurnal_range_c=prior_diurnal_range,
+        pressure_msl_tendency_24h=pressure_tendency,
+        mosmix_extreme_c=float(meta["mosmix_extreme_c"]) if meta.get("mosmix_extreme_c") is not None else None,
+        nbm_extreme_c=float(meta["nbm_extreme_c"]) if meta.get("nbm_extreme_c") is not None else None,
+        nws_point_extreme_c=float(meta["nws_point_extreme_c"]) if meta.get("nws_point_extreme_c") is not None else None,
     )
     return features
 
 
+def build_mos_samples_from_parquet_ensembles(
+    *,
+    station: Station,
+    ensembles: Sequence[EnsembleSnapshot],
+    routine_metars: Sequence[MetarObservation],
+    polarity: Polarity = Polarity.HIGHEST,
+    remark_tenths_enabled: bool = True,
+    decision_hour_utc_offset_hours: int = -6,
+) -> list[MosDatasetSample]:
+    """Assemble strictly leak-free MosDatasetSamples directly from recorded Parquet EnsembleSnapshots."""
+    station_tz = ZoneInfo(station.timezone)
+    target_icao = station.icao.strip().upper()
+
+    obs_by_date: dict[date, list[MetarObservation]] = {}
+    for obs in routine_metars:
+        if not obs.is_routine or obs.raw_report.strip().upper().startswith("SPECI"):
+            continue
+        if obs.station_icao.strip().upper() != target_icao:
+            continue
+        local_d = _ensure_utc(obs.observed_at_utc).astimezone(station_tz).date()
+        obs_by_date.setdefault(local_d, []).append(obs)
+
+    station_ensembles = sorted(
+        (e for e in ensembles if e.station_icao.strip().upper() == target_icao),
+        key=lambda e: _ensure_utc(e.fetched_at_utc),
+    )
+
+    samples: list[MosDatasetSample] = []
+    history_bias: list[DailyBiasObservation] = []
+    for local_d in sorted(obs_by_date.keys()):
+        local_midnight = datetime(local_d.year, local_d.month, local_d.day, 0, 0, tzinfo=station_tz)
+        decision_utc = local_midnight.astimezone(timezone.utc) + timedelta(hours=decision_hour_utc_offset_hours)
+
+        eligible_ens = [e for e in station_ensembles if _ensure_utc(e.fetched_at_utc) < decision_utc]
+        if not eligible_ens:
+            continue
+        chosen_ens = eligible_ens[-1]
+
+        day_obs = obs_by_date[local_d]
+        if remark_tenths_enabled:
+            target_obs = max(day_obs, key=lambda o: o.temp_c) if polarity == Polarity.HIGHEST else min(day_obs, key=lambda o: o.temp_c)
+            target_val = float(target_obs.temp_c)
+        else:
+            target_obs = max(day_obs, key=lambda o: float(o.whole_temp_c)) if polarity == Polarity.HIGHEST else min(day_obs, key=lambda o: float(o.whole_temp_c))
+            target_val = float(target_obs.whole_temp_c)
+
+        prior_obs = [o for o in routine_metars if _ensure_utc(o.observed_at_utc) < decision_utc]
+        try:
+            feats = extract_features_from_ensemble(
+                station=station,
+                local_date=local_d,
+                polarity=polarity,
+                ensemble=chosen_ens,
+                decision_time_utc=decision_utc,
+                recent_bias_obs=history_bias,
+                prior_observations=prior_obs,
+            )
+        except ValueError:
+            continue
+
+        sample = MosDatasetSample(
+            station_icao=target_icao,
+            local_date=local_d,
+            polarity=polarity,
+            decision_time_utc=decision_utc,
+            forecast_available_at_utc=_ensure_utc(chosen_ens.fetched_at_utc),
+            features=feats,
+            baseline_mean_c=feats["ensemble_mean_c"] + feats["rolling_bias_c"],
+            baseline_std_c=max(feats["ensemble_std_c"], 0.5),
+            baseline_extremes_c=[feats["ensemble_mean_c"]],
+            target_temp_c=target_val,
+            target_observed_at_utc=_ensure_utc(target_obs.observed_at_utc),
+            remark_tenths_enabled=remark_tenths_enabled,
+        )
+        samples.append(sample)
+        history_bias.append(
+            DailyBiasObservation(
+                local_date=local_d,
+                forecast_extreme_c=feats["ensemble_mean_c"],
+                observed_extreme_c=target_val,
+                forecast_std_c=feats["ensemble_std_c"],
+                observed_at_utc=_ensure_utc(target_obs.observed_at_utc),
+                is_routine=True,
+            )
+        )
+
+    samples.sort(key=lambda s: s.decision_time_utc)
+    return samples
+
+
+_MOS_ANCHOR_FEATURES = frozenset({"mosmix_extreme_c", "nbm_extreme_c", "nws_point_extreme_c"})
+_OPTIONAL_ZERO_FEATURES = frozenset({"delta_obs_temp_24h", "prior_diurnal_range_c", "pressure_msl_tendency_24h"})
+
+
 def features_to_vector(features: dict[str, float]) -> list[float]:
-    """Order a feature dictionary into the canonical FEATURE_COLUMNS vector."""
-    return [float(features[col]) for col in FEATURE_COLUMNS]
+    """Order a feature dictionary into the canonical FEATURE_COLUMNS vector with safe v1 fallbacks."""
+    ens_mean = float(features.get("ensemble_mean_c", 0.0))
+    vec: list[float] = []
+    for col in FEATURE_COLUMNS:
+        if col in features:
+            vec.append(float(features[col]))
+        elif col in _MOS_ANCHOR_FEATURES:
+            vec.append(ens_mean)
+        elif col in _OPTIONAL_ZERO_FEATURES:
+            vec.append(0.0)
+        else:
+            vec.append(float(features[col]))
+    return vec
