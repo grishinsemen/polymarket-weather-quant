@@ -682,4 +682,63 @@ describe("WeatherQuantTerminal", () => {
     expect(bar).toHaveTextContent("12.4s");
     expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "63");
   });
+
+  it("shows thin time and temperature crosshair lines with axis readouts on hover and hides on leave", () => {
+    render(
+      <WeatherQuantTerminal
+        snapshot={FIXTURE_SNAPSHOT}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    const fanSvg = screen.getByTestId("ensemble-fan-svg");
+    vi.spyOn(fanSvg, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 560,
+      height: 180,
+      right: 560,
+      bottom: 180,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+
+    expect(screen.queryByTestId("ensemble-hover-crosshair")).not.toBeInTheDocument();
+
+    // Hover center of plot area: x = padL(44) + plotW(500)/2 = 294, y = padT(16) + plotH(138)/2 = 85
+    fireEvent.mouseMove(fanSvg, { clientX: 294, clientY: 85 });
+
+    expect(screen.getByTestId("ensemble-hover-crosshair")).toBeInTheDocument();
+    expect(fanSvg).toHaveStyle({ cursor: "none" });
+    expect(screen.getByTestId("ensemble-hover-time-line")).toHaveAttribute("x1", "294");
+    expect(screen.getByTestId("ensemble-hover-temp-line")).toHaveAttribute("y1", "85");
+    expect(screen.getByTestId("ensemble-hover-dot")).toHaveAttribute("cx", "294");
+    expect(screen.getByTestId("ensemble-hover-dot")).toHaveAttribute("cy", "85");
+    expect(screen.getByTestId("ensemble-hover-time-label")).toHaveTextContent("15:00");
+    expect(screen.getByTestId("ensemble-hover-temp-label")).toHaveTextContent("10.0°C");
+
+    // Moving outside plot area hides crosshair
+    fireEvent.mouseMove(fanSvg, { clientX: 10, clientY: 85 });
+    expect(screen.queryByTestId("ensemble-hover-crosshair")).not.toBeInTheDocument();
+
+    // Hover again then mouse leave hides crosshair
+    fireEvent.mouseMove(fanSvg, { clientX: 294, clientY: 85 });
+    expect(screen.getByTestId("ensemble-hover-crosshair")).toBeInTheDocument();
+    fireEvent.mouseLeave(fanSvg);
+    expect(screen.queryByTestId("ensemble-hover-crosshair")).not.toBeInTheDocument();
+  });
 });

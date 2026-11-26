@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { formatHhMmInZone } from "@/lib/time";
 import type { EnsembleFanSeries } from "@/types/terminal";
 
@@ -10,6 +10,36 @@ interface EnsembleFanChartProps {
   serverTimeUtc?: string;
   nowMs?: number;
   latestMetarTempInUnit?: number | null;
+}
+
+function clientToSvgCoords(
+  svg: SVGSVGElement,
+  clientX: number,
+  clientY: number,
+  vbWidth: number,
+  vbHeight: number,
+): { x: number; y: number } | null {
+  if (typeof svg.createSVGPoint === "function" && typeof svg.getScreenCTM === "function") {
+    const ctm = svg.getScreenCTM();
+    if (ctm) {
+      const pt = svg.createSVGPoint();
+      pt.x = clientX;
+      pt.y = clientY;
+      const transformed = pt.matrixTransform(ctm.inverse());
+      return { x: transformed.x, y: transformed.y };
+    }
+  }
+  const rect = svg.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const scale = Math.min(rect.width / vbWidth, rect.height / vbHeight);
+  const renderedW = vbWidth * scale;
+  const renderedH = vbHeight * scale;
+  const offsetX = (rect.width - renderedW) / 2;
+  const offsetY = (rect.height - renderedH) / 2;
+  return {
+    x: (clientX - rect.left - offsetX) / scale,
+    y: (clientY - rect.top - offsetY) / scale,
+  };
 }
 
 function interpolateSeriesAt(timesMs: number[], values: number[], targetMs: number): number {
@@ -37,6 +67,8 @@ export function EnsembleFanChart({
   nowMs: controlledNowMs,
   latestMetarTempInUnit = null,
 }: EnsembleFanChartProps) {
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [hoverPoint, setHoverPoint] = useState<{ x: number; y: number } | null>(null);
   const [internalNowMs, setInternalNowMs] = useState<number>(() =>
     serverTimeUtc ? new Date(serverTimeUtc).getTime() : Date.now(),
   );
@@ -135,6 +167,43 @@ export function EnsembleFanChart({
   const dayMinTemp = metarTemps.length > 0 ? Math.min(...metarTemps) : null;
   const dayMaxTemp = metarTemps.length > 0 ? Math.max(...metarTemps) : null;
 
+  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const coords = clientToSvgCoords(svg, e.clientX, e.clientY, width, height);
+    if (
+      !coords ||
+      coords.x < padL ||
+      coords.x > width - padR ||
+      coords.y < padT ||
+      coords.y > height - padB
+    ) {
+      setHoverPoint(null);
+      return;
+    }
+    setHoverPoint(coords);
+  };
+
+  const handleMouseLeave = () => {
+    setHoverPoint(null);
+  };
+
+  const hoverCrosshair = hoverPoint
+    ? (() => {
+        const ratioX = Math.max(0, Math.min(1, (hoverPoint.x - padL) / plotW));
+        const ratioY = Math.max(0, Math.min(1, (hoverPoint.y - padT) / plotH));
+        const hoverMs = minTime + ratioX * spanTime;
+        const hoverTemp = maxT - ratioY * spanT;
+        return {
+          x: hoverPoint.x,
+          y: hoverPoint.y,
+          timeLabel: formatHhMmInZone(new Date(hoverMs), tz),
+          tempLabel: `${hoverTemp.toFixed(1)}°${fan.unit}`,
+          timeLabelX: Math.max(padL + 16, Math.min(width - padR - 16, hoverPoint.x)),
+        };
+      })()
+    : null;
+
   return (
     <div className="rounded border border-[#1c2638] bg-[#0a101b] p-3">
       <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
@@ -179,9 +248,13 @@ export function EnsembleFanChart({
       </div>
 
       <svg
+        ref={svgRef}
         data-testid="ensemble-fan-svg"
         viewBox={`0 0 ${width} ${height}`}
-        className="w-full h-44 overflow-visible"
+        className="w-full h-44 overflow-visible select-none"
+        style={hoverCrosshair ? { cursor: "none" } : undefined}
+        onMouseMove={handleMouseMove}
+        onMouseLeave={handleMouseLeave}
         role="img"
         aria-label="Ensemble distribution P10 P50 P90 fan chart with METAR points"
       >
@@ -337,6 +410,80 @@ export function EnsembleFanChart({
             {currentTimeLabel}
           </text>
         </g>
+
+        {hoverCrosshair && (
+          <g data-testid="ensemble-hover-crosshair" className="pointer-events-none">
+            <line
+              data-testid="ensemble-hover-temp-line"
+              x1={padL}
+              x2={width - padR}
+              y1={hoverCrosshair.y}
+              y2={hoverCrosshair.y}
+              stroke="#cbd5e1"
+              strokeWidth={0.75}
+              strokeOpacity={0.65}
+              strokeDasharray="2 3"
+            />
+            <line
+              data-testid="ensemble-hover-time-line"
+              x1={hoverCrosshair.x}
+              x2={hoverCrosshair.x}
+              y1={padT}
+              y2={height - padB}
+              stroke="#cbd5e1"
+              strokeWidth={0.75}
+              strokeOpacity={0.65}
+              strokeDasharray="2 3"
+            />
+            <circle
+              data-testid="ensemble-hover-dot"
+              cx={hoverCrosshair.x}
+              cy={hoverCrosshair.y}
+              r={2.8}
+              fill="#e2e8f0"
+              stroke="#070b12"
+              strokeWidth={1}
+            />
+            <rect
+              x={2}
+              y={hoverCrosshair.y - 6.5}
+              width={padL - 5}
+              height={13}
+              rx={2}
+              fill="#0f172a"
+              stroke="#475569"
+              strokeWidth={0.6}
+            />
+            <text
+              data-testid="ensemble-hover-temp-label"
+              x={padL - 6}
+              y={hoverCrosshair.y + 3}
+              textAnchor="end"
+              className="fill-slate-200 text-[10px] font-semibold font-mono-tabular"
+            >
+              {hoverCrosshair.tempLabel}
+            </text>
+            <rect
+              x={hoverCrosshair.timeLabelX - 17}
+              y={height - 16}
+              width={34}
+              height={13}
+              rx={2}
+              fill="#0f172a"
+              stroke="#475569"
+              strokeWidth={0.6}
+            />
+            <text
+              data-testid="ensemble-hover-time-label"
+              x={hoverCrosshair.timeLabelX}
+              y={height - 6}
+              textAnchor="middle"
+              className="fill-slate-200 text-[10px] font-semibold font-mono-tabular"
+            >
+              {hoverCrosshair.timeLabel}
+            </text>
+          </g>
+        )}
       </svg>
     </div>
   );
