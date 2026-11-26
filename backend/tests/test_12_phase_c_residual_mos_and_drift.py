@@ -152,3 +152,27 @@ def test_calibration_report_includes_regime_monthly_worst_days_and_pit() -> None
     assert len(report.worst_days) == 5
     assert report.worst_days[0].local_date == date(2026, 5, 15)
     assert sum(report.pit_histogram) == 6
+
+
+def test_legacy_23_feature_mos_model_predicts_against_29_feature_dict() -> None:
+    """Saved v1 23-feature LightGBM models must score 29-feature live dicts without shape errors."""
+    import lightgbm as lgb
+    import numpy as np
+    from weather_quant.ml.quantile_mos import QuantileMosModel
+
+    legacy_cols = FEATURE_COLUMNS[:23]
+    x_legacy = np.zeros((10, 23), dtype=np.float64)
+    y_legacy = np.linspace(10.0, 20.0, 10)
+    ds = lgb.Dataset(x_legacy, label=y_legacy, feature_name=list(legacy_cols), free_raw_data=False)
+    booster = lgb.train({"objective": "quantile", "alpha": 0.5, "verbose": -1, "min_data_in_leaf": 2}, ds, num_boost_round=5)
+
+    model = QuantileMosModel(
+        model_version="mos-legacy-23f",
+        quantiles=(0.5,),
+        boosters={0.5: booster},
+        feature_columns=legacy_cols,
+    )
+    full_29_feat = {col: 1.0 for col in FEATURE_COLUMNS}
+    preds = model.predict_quantiles([full_29_feat])
+    assert len(preds) == 1
+    assert 0.5 in preds[0]

@@ -214,7 +214,10 @@ class ResidualMosModel(QuantileMosModel):
         """Predict non-crossing quantiles: ``emos_base + clip(delta_q, -max_delta, +max_delta)``."""
         if not feature_dicts:
             return []
-        x_mat = np.asarray([features_to_vector(f) for f in feature_dicts], dtype=np.float64)
+        x_mat = np.asarray(
+            [features_to_vector(f, columns=self.feature_columns) for f in feature_dicts],
+            dtype=np.float64,
+        )
         raw_by_q = {q: self.boosters[q].predict(x_mat) for q in self.quantiles}
 
         results: list[dict[float, float]] = []

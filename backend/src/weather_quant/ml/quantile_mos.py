@@ -330,7 +330,10 @@ class QuantileMosModel:
         """Predict non-crossing temperature quantiles for a batch of feature dicts."""
         if not feature_dicts:
             return []
-        x_mat = np.asarray([features_to_vector(f) for f in feature_dicts], dtype=np.float64)
+        x_mat = np.asarray(
+            [features_to_vector(f, columns=self.feature_columns) for f in feature_dicts],
+            dtype=np.float64,
+        )
         raw_by_q = {q: self.boosters[q].predict(x_mat) for q in self.quantiles}
 
         is_residual = self.lgbm_params.get("target_mode") == "residual"

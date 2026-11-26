@@ -883,11 +883,14 @@ _MOS_ANCHOR_FEATURES = frozenset({"mosmix_extreme_c", "nbm_extreme_c", "nws_poin
 _OPTIONAL_ZERO_FEATURES = frozenset({"delta_obs_temp_24h", "prior_diurnal_range_c", "pressure_msl_tendency_24h"})
 
 
-def features_to_vector(features: dict[str, float]) -> list[float]:
-    """Order a feature dictionary into the canonical FEATURE_COLUMNS vector with safe v1 fallbacks."""
+def features_to_vector(
+    features: dict[str, float],
+    columns: Sequence[str] = FEATURE_COLUMNS,
+) -> list[float]:
+    """Order a feature dictionary into the requested column vector with safe v1/v2 fallbacks."""
     ens_mean = float(features.get("ensemble_mean_c", 0.0))
     vec: list[float] = []
-    for col in FEATURE_COLUMNS:
+    for col in columns:
         if col in features:
             vec.append(float(features[col]))
         elif col in _MOS_ANCHOR_FEATURES:
