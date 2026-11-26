@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -19,11 +20,13 @@ class HttpWorldFeed:
         timeout_seconds: float = 15.0,
         metar_hours: int = 4,
         backfill_metar_hours: int = 36,
+        backfill_batch_size: int = 4,
     ) -> None:
         self._external_client = client
         self._timeout_seconds = timeout_seconds
         self._metar_hours = metar_hours
         self._backfill_metar_hours = backfill_metar_hours
+        self._backfill_batch_size = max(1, backfill_batch_size)
         self._backfilled_icaos: set[str] = set()
 
     async def _get_client(self) -> tuple[httpx.AsyncClient, bool]:
@@ -81,20 +84,39 @@ class HttpWorldFeed:
         if not unique_icaos:
             return []
 
-        needs_backfill = any(icao not in self._backfilled_icaos for icao in unique_icaos)
-        hours = self._backfill_metar_hours if needs_backfill else self._metar_hours
+        missing = [icao for icao in unique_icaos if icao not in self._backfilled_icaos]
+        known = [icao for icao in unique_icaos if icao in self._backfilled_icaos]
+
+        # aviationweather.gov truncates global responses (~400 lines) when too many stations
+        # are requested with hours=36 in one call, so chunk backfill queries by station batch.
+        queries: list[tuple[list[str], int]] = [
+            (missing[i : i + self._backfill_batch_size], self._backfill_metar_hours)
+            for i in range(0, len(missing), self._backfill_batch_size)
+        ]
+        if known:
+            queries.append((known, self._metar_hours))
 
         client, owns_client = await self._get_client()
         try:
-            params = {
-                "ids": ",".join(unique_icaos),
-                "format": "raw",
-                "hours": hours,
-            }
-            resp = await client.get(AVIATION_WEATHER_METAR_URL, params=params)
-            resp.raise_for_status()
+            resps = await asyncio.gather(
+                *[
+                    client.get(
+                        AVIATION_WEATHER_METAR_URL,
+                        params={
+                            "ids": ",".join(batch),
+                            "format": "raw",
+                            "hours": hours,
+                        },
+                    )
+                    for batch, hours in queries
+                ]
+            )
+            lines: list[str] = []
+            for resp in resps:
+                resp.raise_for_status()
+                lines.extend(line.strip() for line in resp.text.splitlines() if line.strip())
             self._backfilled_icaos.update(unique_icaos)
-            return [line.strip() for line in resp.text.splitlines() if line.strip()]
+            return lines
         finally:
             if owns_client:
                 await client.aclose()

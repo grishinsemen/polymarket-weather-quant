@@ -950,10 +950,10 @@ async def test_http_world_feed_backfills_36h_metar_on_initial_station_fetch() ->
     import httpx
     from weather_quant.metar.fetcher import HttpWorldFeed
 
-    requested_hours: list[str | None] = []
+    requests_seen: list[tuple[str | None, str | None]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requested_hours.append(request.url.params.get("hours"))
+        requests_seen.append((request.url.params.get("ids"), request.url.params.get("hours")))
         return httpx.Response(
             200,
             text=(
@@ -964,12 +964,18 @@ async def test_http_world_feed_backfills_36h_metar_on_initial_station_fetch() ->
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         feed = HttpWorldFeed(client=client)
-        lines1 = await feed.fetch_metar_reports(["MMMX"])
+        lines1 = await feed.fetch_metar_reports(["A1", "A2", "A3", "A4", "A5", "MMMX"])
         lines2 = await feed.fetch_metar_reports(["MMMX"])
-        # New station triggers backfill again
+        # New station KLGA gets 36h backfill while known MMMX uses 4h poll
         lines3 = await feed.fetch_metar_reports(["MMMX", "KLGA"])
 
-    assert len(lines1) == 2
+    assert len(lines1) == 4
     assert len(lines2) == 2
-    assert len(lines3) == 2
-    assert requested_hours == ["36", "4", "36"]
+    assert len(lines3) == 4
+    assert requests_seen == [
+        ("A1,A2,A3,A4", "36"),
+        ("A5,MMMX", "36"),
+        ("MMMX", "4"),
+        ("KLGA", "36"),
+        ("MMMX", "4"),
+    ]
