@@ -369,7 +369,7 @@ export function CityXRayPanel({
               <th className="px-2.5 py-2 font-medium">Bucket</th>
               <th className="px-2.5 py-2 font-medium w-40">Fair Probability</th>
               <th className="px-2.5 py-2 font-medium text-right">Bid / Ask</th>
-              <th className="px-2.5 py-2 font-medium w-44">CLOB Bid / Ask Depth</th>
+              <th className="px-2.5 py-2 font-medium w-44 text-center">Depth (Top-5)</th>
               <th className="px-2.5 py-2 font-medium text-right">Net Edge</th>
               <th className="px-2.5 py-2 font-medium text-right">State</th>
             </tr>

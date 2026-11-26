@@ -280,7 +280,7 @@ export function TopPortfolioBar({
           </div>
 
           <div
-            className={`rounded bg-[#0f1726] border px-2.5 py-1.5 flex flex-col justify-between gap-1 ${
+            className={`min-w-0 overflow-hidden rounded bg-[#0f1726] border px-2.5 py-1.5 flex flex-col justify-between gap-1 ${
               isViewingLive ? "border-[#1c2638]" : "border-amber-600/70"
             }`}
           >
@@ -306,13 +306,13 @@ export function TopPortfolioBar({
                 </>
               )}
             </div>
-            <label className="flex items-center justify-between gap-1 text-[10px] text-slate-500 uppercase">
-              <span>Model</span>
+            <label className="flex items-center gap-1.5 min-w-0 text-[10px] text-slate-500 uppercase">
+              <span className="shrink-0 w-[52px]">Model</span>
               <select
                 aria-label="Model Version"
                 value={selectedModelVersion}
                 onChange={(e) => onFilterModelVersion(e.target.value)}
-                className="bg-[#0a101b] text-sky-300 border border-[#25324a] rounded px-1.5 py-0.5 text-[11px] font-mono-tabular max-w-[140px]"
+                className="min-w-0 flex-1 w-full truncate bg-[#0a101b] text-sky-300 border border-[#25324a] rounded px-1.5 py-0.5 text-[11px] font-mono-tabular"
               >
                 {modelVersions.map((m) => (
                   <option key={m.model_version} value={m.model_version}>
@@ -321,13 +321,13 @@ export function TopPortfolioBar({
                 ))}
               </select>
             </label>
-            <label className="flex items-center justify-between gap-1 text-[10px] text-slate-500 uppercase">
-              <span>Strategy</span>
+            <label className="flex items-center gap-1.5 min-w-0 text-[10px] text-slate-500 uppercase">
+              <span className="shrink-0 w-[52px]">Strategy</span>
               <select
                 aria-label="Strategy Version"
                 value={selectedStrategyVersion}
                 onChange={(e) => onFilterStrategyVersion(e.target.value)}
-                className="bg-[#0a101b] text-amber-300 border border-[#25324a] rounded px-1.5 py-0.5 text-[11px] font-mono-tabular max-w-[140px]"
+                className="min-w-0 flex-1 w-full truncate bg-[#0a101b] text-amber-300 border border-[#25324a] rounded px-1.5 py-0.5 text-[11px] font-mono-tabular"
               >
                 {strategyVersions.map((s) => (
                   <option key={s.strategy_version} value={s.strategy_version}>
