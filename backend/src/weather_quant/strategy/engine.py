@@ -17,7 +17,7 @@ import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, Mapping, Protocol, runtime_checkable
+from typing import Any, Literal, Mapping, Protocol, Sequence, runtime_checkable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field
@@ -32,6 +32,7 @@ from weather_quant.domain.models import (
     MakerOrder,
     MetarObservation,
     OrderBookSnapshot,
+    OrderLevel,
     PortfolioSummary,
     PositionRecord,
     SignalCard,
@@ -51,12 +52,142 @@ DEFAULT_CLV_HORIZONS_MINUTES: tuple[int, ...] = (5, 30, 60)
 DEFAULT_STRATEGY_VERSION = "conservative-kelly-100-v1"
 _EPS = 1e-9
 
+
+def calculate_liquidation_mark_and_upnl(
+    *,
+    shares: float,
+    cost_basis_usd: float,
+    best_bid: float | None,
+    is_impossible: bool = False,
+) -> tuple[float, float]:
+    """Compute liquidation ``(mark_price, unrealized_pnl_usd)`` for an open Bucket position.
+
+    - ``mark_price = 0.0`` when the Bucket is ``ZEROED`` (``is_impossible=True``)
+      or has no positive bid (``best_bid is None`` or ``best_bid <= 0``).
+    - Otherwise ``mark_price = best_bid``.
+    - ``uPnL = shares * mark_price - cost_basis_usd`` with ``-0.0`` normalized to ``0.0``.
+    """
+    if is_impossible or best_bid is None or best_bid <= 0.0:
+        mark_price = 0.0
+    else:
+        mark_price = float(best_bid)
+    upnl = round(shares * mark_price - cost_basis_usd, 6)
+    if abs(upnl) <= _EPS:
+        upnl = 0.0
+    return mark_price, upnl
+
+
+def resolve_tick_size(book: OrderBookSnapshot | None, default_tick: float = 0.01) -> float:
+    """Return the positive CLOB V2 market ``tick_size`` from *book*, falling back to *default_tick*."""
+    if book is not None and book.tick_size is not None and math.isfinite(book.tick_size):
+        if 0.0 < book.tick_size < 0.5:
+            return float(book.tick_size)
+    if math.isfinite(default_tick) and 0.0 < default_tick < 0.5:
+        return float(default_tick)
+    return 0.01
+
+
+def clamp_order_price(price: float, tick_size: float) -> float | None:
+    """Validate an order limit price strictly within ``[tick_size, 1.0 - tick_size]``.
+
+    Returns ``None`` if *price* is non-finite or falls outside ``[tick_size, 1.0 - tick_size]``
+    so no order can ever be generated at ``<= 0`` or ``>= 1``.
+    """
+    if (
+        not math.isfinite(price)
+        or not math.isfinite(tick_size)
+        or tick_size <= 0.0
+        or tick_size >= 0.5
+    ):
+        return None
+    min_p = _round_price(tick_size)
+    max_p = _round_price(1.0 - tick_size)
+    rounded = _round_price(price)
+    if rounded < min_p - _EPS or rounded > max_p + _EPS:
+        return None
+    clamped = min(max_p, max(min_p, rounded))
+    if clamped <= 0.0 or clamped >= 1.0:
+        return None
+    return clamped
+
+
+def derive_no_book(
+    yes_book: OrderBookSnapshot,
+    no_token_id: str | None = None,
+) -> OrderBookSnapshot:
+    """Derive the exact complementary CLOB NO orderbook from a binary YES OrderBookSnapshot.
+
+    On Polymarket's binary CTF CLOB:
+    - A resting YES ask at price ``a`` is equivalent to a resting NO bid at ``1 - a``.
+    - A resting YES bid at price ``b`` is equivalent to a resting NO ask at ``1 - b``.
+    """
+    no_bids = sorted(
+        (
+            OrderLevel(price=_round_price(1.0 - lvl.price), size=lvl.size)
+            for lvl in yes_book.asks
+            if 0.0 < lvl.price < 1.0 and lvl.size > _EPS
+        ),
+        key=lambda lvl: lvl.price,
+        reverse=True,
+    )
+    no_asks = sorted(
+        (
+            OrderLevel(price=_round_price(1.0 - lvl.price), size=lvl.size)
+            for lvl in yes_book.bids
+            if 0.0 < lvl.price < 1.0 and lvl.size > _EPS
+        ),
+        key=lambda lvl: lvl.price,
+    )
+    best_bid: float | None
+    if no_bids:
+        best_bid = no_bids[0].price
+    elif yes_book.best_ask is not None and 0.0 < yes_book.best_ask < 1.0:
+        best_bid = _round_price(1.0 - yes_book.best_ask)
+    else:
+        best_bid = None
+
+    best_ask: float | None
+    if no_asks:
+        best_ask = no_asks[0].price
+    elif yes_book.best_bid is not None and 0.0 < yes_book.best_bid < 1.0:
+        best_ask = _round_price(1.0 - yes_book.best_bid)
+    else:
+        best_ask = None
+
+    midpoint = (
+        round((best_bid + best_ask) / 2.0, 6)
+        if best_bid is not None and best_ask is not None
+        else None
+    )
+    spread = (
+        round(best_ask - best_bid, 6)
+        if best_bid is not None and best_ask is not None
+        else None
+    )
+    return OrderBookSnapshot(
+        event_id=yes_book.event_id,
+        bucket_id=yes_book.bucket_id,
+        token_id=no_token_id or f"{yes_book.token_id}:NO",
+        bids=no_bids,
+        asks=no_asks,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        midpoint=midpoint,
+        spread=spread,
+        tick_size=yes_book.tick_size,
+        ingested_at_utc=yes_book.ingested_at_utc,
+        is_stale=yes_book.is_stale,
+    )
+
+
 # --------------------------------------------------------------------------------------------
 # Reason codes
 # --------------------------------------------------------------------------------------------
 R_ENTRY_EDGE = "PREMARKET_NET_EDGE_OK"
 R_INTRADAY_ENTRY_EDGE = "INTRADAY_NET_EDGE_OK"
+R_BUY_NO_EDGE = "BUY_NO_NET_EDGE_OK"
 R_PROFIT_TAKE = "PROFIT_TAKE_CONVERGENCE"
+R_DYNAMIC_TAKE_PROFIT = "DYNAMIC_TAKE_PROFIT_POST_ONLY"
 R_EARLY_EXIT = "EARLY_EXIT_METAR_EROSION"
 R_STALE_FEED = "STALE_FEED"
 R_NO_BOOK = "NO_BOOK"
@@ -74,6 +205,12 @@ R_CUTOFF = "PRE_SETTLEMENT_CUTOFF"
 R_EDGE_LOST_CANCEL = "EDGE_LOST_CANCEL_RESTING_ENTRY"
 R_POST_ONLY_REJECT = "POST_ONLY_WOULD_CROSS"
 R_FUTURE_PROB = "PROBABILITY_FROM_FUTURE"
+R_SKIP_EXIT_NO_BID = "SKIP_EXIT_NO_BID"
+R_MIN_SHARES = "ORDER_SHARES_BELOW_MIN"
+R_EXIT_DUST_HOLD = "EXIT_DUST_BELOW_MIN_SHARES"
+R_CHEAP_TAIL = "TAIL_PRICE_BELOW_MIN"
+R_NO_PRICE_BOUNDS = "NO_PRICE_OUT_OF_RANGE"
+R_TRADE_EDGE_REALIZED = "TRADE_EDGE_REALIZED"
 
 
 # --------------------------------------------------------------------------------------------
@@ -100,14 +237,25 @@ def default_strategy_manifest(created_at_utc: datetime | None = None) -> Strateg
 
 
 class StrategyParams(BaseModel):
-    """Execution tunables read from ``StrategyVersionRecord.config_json`` (with safe defaults)."""
+    """Execution tunables and feature flags read from ``StrategyVersionRecord.config_json``."""
 
     tick_size: float = 0.01
     min_order_usd: float = 1.0
+    min_order_shares: float = 5.0
+    min_entry_shares: float = 6.0
+    min_buy_price: float = 0.10
+    min_buy_no_price: float = 0.10
+    max_buy_no_price: float = 0.90
     convergence_edge: float = 0.02
     erosion_threshold: float = 0.05
     metar_fresh_minutes: int = 90
     clv_horizons_minutes: tuple[int, ...] = DEFAULT_CLV_HORIZONS_MINUTES
+    # TICKET-6 feature flags
+    enable_buy_no: bool = False
+    enable_dynamic_take_profit: bool = False
+    hold_to_expiry: bool = False
+    take_profit_min_profit: float = 0.03
+    take_profit_premium: float = 0.02
 
     @classmethod
     def from_manifest(cls, manifest: StrategyVersionRecord) -> "StrategyParams":
@@ -169,6 +317,14 @@ def _dt(raw: str) -> datetime:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def _col(row: Any, name: str, default: Any = None) -> Any:
+    try:
+        val = row[name]
+        return default if val is None else val
+    except (KeyError, IndexError):
+        return default
 
 
 class StrategyStore:
@@ -329,9 +485,9 @@ class StrategyStore:
             """
             INSERT INTO signals (
                 signal_id, event_id, station_icao, bucket_id, bucket_label, phase, side,
-                fair_probability, limit_price, target_exit_price, edge, suggested_size_usd,
-                reason_codes_json, model_version, strategy_version, created_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                outcome_side, fair_probability, limit_price, target_exit_price, edge,
+                suggested_size_usd, reason_codes_json, model_version, strategy_version, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 s.signal_id,
@@ -341,6 +497,7 @@ class StrategyStore:
                 s.bucket_label,
                 s.phase,
                 s.side,
+                s.outcome_side,
                 s.fair_probability,
                 s.limit_price,
                 s.target_exit_price,
@@ -368,6 +525,7 @@ class StrategyStore:
                 bucket_label=r["bucket_label"],
                 phase=r["phase"],
                 side=r["side"],
+                outcome_side=_col(r, "outcome_side", "YES"),
                 fair_probability=r["fair_probability"],
                 limit_price=r["limit_price"],
                 target_exit_price=r["target_exit_price"],
@@ -381,14 +539,19 @@ class StrategyStore:
             for r in rows
         ]
 
-    async def latest_entry_fair(self, event_id: str, bucket_id: str) -> float | None:
+    async def latest_entry_fair(
+        self,
+        event_id: str,
+        bucket_id: str,
+        outcome_side: Literal["YES", "NO"] = "YES",
+    ) -> float | None:
         async with self.db.conn.execute(
             """
             SELECT fair_probability FROM signals
-            WHERE event_id = ? AND bucket_id = ? AND side = 'BUY'
+            WHERE event_id = ? AND bucket_id = ? AND side = 'BUY' AND outcome_side = ?
             ORDER BY created_at_utc DESC, rowid DESC LIMIT 1
             """,
-            (event_id, bucket_id),
+            (event_id, bucket_id, outcome_side),
         ) as cur:
             row = await cur.fetchone()
         return None if row is None else float(row["fair_probability"])
@@ -398,10 +561,10 @@ class StrategyStore:
         await self.db.conn.execute(
             """
             INSERT OR REPLACE INTO orders (
-                order_id, event_id, station_icao, bucket_id, token_id, side, limit_price,
-                size_shares, size_usd, post_only, phase, status, model_version,
-                strategy_version, created_at_utc, updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                order_id, event_id, station_icao, bucket_id, token_id, side, outcome_side,
+                limit_price, size_shares, size_usd, post_only, phase, status, expected_edge,
+                model_version, strategy_version, created_at_utc, updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 o.order_id,
@@ -410,12 +573,14 @@ class StrategyStore:
                 o.bucket_id,
                 o.token_id,
                 o.side,
+                o.outcome_side,
                 o.limit_price,
                 o.size_shares,
                 o.size_usd,
                 int(o.post_only),
                 o.phase,
                 o.status,
+                o.expected_edge,
                 o.model_version,
                 o.strategy_version,
                 _iso(o.created_at_utc),
@@ -440,12 +605,14 @@ class StrategyStore:
             bucket_id=r["bucket_id"],
             token_id=r["token_id"],
             side=r["side"],
+            outcome_side=_col(r, "outcome_side", "YES"),
             limit_price=r["limit_price"],
             size_shares=r["size_shares"],
             size_usd=r["size_usd"],
             post_only=bool(r["post_only"]),
             phase=r["phase"],
             status=r["status"],
+            expected_edge=_col(r, "expected_edge", None),
             model_version=r["model_version"],
             strategy_version=r["strategy_version"],
             created_at_utc=_dt(r["created_at_utc"]),
@@ -496,33 +663,11 @@ class StrategyStore:
 
     # ---- fills / positions ----------------------------------------------------------------
     async def record_fill(self, fill: FillRecord, bucket_label: str) -> PositionRecord | None:
-        """Persist a fill and roll it into the Bucket position (avg price, shares, realized PnL)."""
-        await self.db.conn.execute(
-            """
-            INSERT INTO fills (
-                fill_id, order_id, event_id, station_icao, bucket_id, side, fill_price,
-                fill_shares, fill_usd, fee_usd, is_maker, model_version, strategy_version,
-                filled_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                fill.fill_id,
-                fill.order_id,
-                fill.event_id,
-                fill.station_icao,
-                fill.bucket_id,
-                fill.side,
-                fill.fill_price,
-                fill.fill_shares,
-                fill.fill_usd,
-                fill.fee_usd,
-                int(fill.is_maker),
-                fill.model_version,
-                fill.strategy_version,
-                _iso(fill.filled_at_utc),
-            ),
-        )
-        pos = await self.get_open_position(fill.event_id, fill.bucket_id)
+        """Persist a fill, roll into the Bucket position, and log expected vs realized edge."""
+        pos = await self.get_open_position(fill.event_id, fill.bucket_id, outcome_side=fill.outcome_side)
+        actual_edge_for_audit: float | None = None
+        expected_edge_for_audit: float | None = fill.expected_edge
+
         if fill.side == "BUY":
             if pos is None:
                 pos = PositionRecord(
@@ -531,16 +676,25 @@ class StrategyStore:
                     station_icao=fill.station_icao,
                     bucket_id=fill.bucket_id,
                     bucket_label=bucket_label,
+                    outcome_side=fill.outcome_side,
                     shares=0.0,
                     avg_entry_price=fill.fill_price,
                     cost_basis_usd=0.0,
                     mark_price=fill.fill_price,
+                    expected_edge=fill.expected_edge,
                     model_version=fill.model_version,
                     strategy_version=fill.strategy_version,
                     updated_at_utc=fill.filled_at_utc,
                 )
+            prev_shares = pos.shares
             cost = pos.cost_basis_usd + fill.fill_usd
             shares = pos.shares + fill.fill_shares
+            if fill.expected_edge is not None and shares > _EPS:
+                prev_exp = pos.expected_edge if pos.expected_edge is not None else fill.expected_edge
+                pos.expected_edge = round(
+                    (prev_exp * prev_shares + fill.expected_edge * fill.fill_shares) / shares,
+                    6,
+                )
             pos.shares = shares
             pos.cost_basis_usd = cost
             pos.avg_entry_price = cost / shares if shares > 0 else fill.fill_price
@@ -548,10 +702,18 @@ class StrategyStore:
             pos.mark_price = fill.fill_price
         else:
             if pos is None:
-                await self.db.conn.commit()
+                await self.insert_fill(fill, commit=True)
                 return None
             sold = min(fill.fill_shares, pos.shares)
-            pos.realized_pnl_usd += (fill.fill_price - pos.avg_entry_price) * sold - fill.fee_usd
+            realized_delta = (fill.fill_price - pos.avg_entry_price) * sold - fill.fee_usd
+            pos.realized_pnl_usd += realized_delta
+            if sold > _EPS:
+                actual_edge_for_audit = round(realized_delta / sold, 6)
+                fill.realized_edge = actual_edge_for_audit
+                pos.realized_edge = actual_edge_for_audit
+            if pos.expected_edge is not None:
+                expected_edge_for_audit = pos.expected_edge
+                fill.expected_edge = pos.expected_edge
             pos.shares = max(0.0, pos.shares - sold)
             pos.cost_basis_usd = pos.avg_entry_price * pos.shares
             pos.mark_price = fill.fill_price
@@ -559,11 +721,52 @@ class StrategyStore:
                 pos.shares = 0.0
                 pos.cost_basis_usd = 0.0
                 pos.status = "CLOSED"
-        pos.unrealized_pnl_usd = (
-            (pos.mark_price - pos.avg_entry_price) * pos.shares if pos.status == "OPEN" else 0.0
-        )
+
+        await self.insert_fill(fill, commit=False)
+        if pos.status == "OPEN":
+            upnl = round(pos.shares * pos.mark_price - pos.cost_basis_usd, 6)
+            pos.unrealized_pnl_usd = 0.0 if abs(upnl) <= _EPS else upnl
+        else:
+            pos.unrealized_pnl_usd = 0.0
         pos.updated_at_utc = fill.filled_at_utc
         await self._upsert_position(pos)
+        if fill.side == "SELL" and actual_edge_for_audit is not None:
+            await self.db.conn.execute(
+                """
+                INSERT INTO strategy_audit_log (
+                    event_id, bucket_id, decision, reason_codes_json, detail_json,
+                    model_version, strategy_version, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fill.event_id,
+                    fill.bucket_id,
+                    R_TRADE_EDGE_REALIZED,
+                    json.dumps([R_TRADE_EDGE_REALIZED]),
+                    json.dumps(
+                        {
+                            "fill_id": fill.fill_id,
+                            "order_id": fill.order_id,
+                            "outcome_side": fill.outcome_side,
+                            "entry_price": round(pos.avg_entry_price, 6),
+                            "exit_price": round(fill.fill_price, 6),
+                            "shares": round(fill.fill_shares, 6),
+                            "expected_edge": expected_edge_for_audit,
+                            "actual_edge": actual_edge_for_audit,
+                            "edge_diff": (
+                                round(actual_edge_for_audit - expected_edge_for_audit, 6)
+                                if expected_edge_for_audit is not None
+                                else None
+                            ),
+                            "is_maker": fill.is_maker,
+                            "realized_pnl_usd": round(pos.realized_pnl_usd, 6),
+                        }
+                    ),
+                    fill.model_version,
+                    fill.strategy_version,
+                    _iso(fill.filled_at_utc),
+                ),
+            )
         await self.db.conn.commit()
         return pos
 
@@ -571,17 +774,21 @@ class StrategyStore:
         await self.db.conn.execute(
             """
             INSERT INTO positions (
-                position_id, event_id, station_icao, bucket_id, bucket_label, shares,
-                avg_entry_price, cost_basis_usd, mark_price, unrealized_pnl_usd,
-                realized_pnl_usd, status, model_version, strategy_version, updated_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                position_id, event_id, station_icao, bucket_id, bucket_label, outcome_side,
+                shares, avg_entry_price, cost_basis_usd, mark_price, unrealized_pnl_usd,
+                realized_pnl_usd, expected_edge, realized_edge, status, model_version,
+                strategy_version, updated_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(position_id) DO UPDATE SET
+                outcome_side = excluded.outcome_side,
                 shares = excluded.shares,
                 avg_entry_price = excluded.avg_entry_price,
                 cost_basis_usd = excluded.cost_basis_usd,
                 mark_price = excluded.mark_price,
                 unrealized_pnl_usd = excluded.unrealized_pnl_usd,
                 realized_pnl_usd = excluded.realized_pnl_usd,
+                expected_edge = excluded.expected_edge,
+                realized_edge = excluded.realized_edge,
                 status = excluded.status,
                 updated_at_utc = excluded.updated_at_utc
             """,
@@ -591,12 +798,15 @@ class StrategyStore:
                 p.station_icao,
                 p.bucket_id,
                 p.bucket_label,
+                p.outcome_side,
                 p.shares,
                 p.avg_entry_price,
                 p.cost_basis_usd,
                 p.mark_price,
                 p.unrealized_pnl_usd,
                 p.realized_pnl_usd,
+                p.expected_edge,
+                p.realized_edge,
                 p.status,
                 p.model_version,
                 p.strategy_version,
@@ -611,10 +821,10 @@ class StrategyStore:
         await self.db.conn.execute(
             """
             INSERT OR REPLACE INTO fills (
-                fill_id, order_id, event_id, station_icao, bucket_id, side, fill_price,
-                fill_shares, fill_usd, fee_usd, is_maker, model_version, strategy_version,
-                filled_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fill_id, order_id, event_id, station_icao, bucket_id, side, outcome_side,
+                fill_price, fill_shares, fill_usd, fee_usd, is_maker, expected_edge,
+                realized_edge, model_version, strategy_version, filled_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fill.fill_id,
@@ -623,11 +833,14 @@ class StrategyStore:
                 fill.station_icao,
                 fill.bucket_id,
                 fill.side,
+                fill.outcome_side,
                 fill.fill_price,
                 fill.fill_shares,
                 fill.fill_usd,
                 fill.fee_usd,
                 int(fill.is_maker),
+                fill.expected_edge,
+                fill.realized_edge,
                 fill.model_version,
                 fill.strategy_version,
                 _iso(fill.filled_at_utc),
@@ -671,22 +884,34 @@ class StrategyStore:
             station_icao=r["station_icao"],
             bucket_id=r["bucket_id"],
             bucket_label=r["bucket_label"],
+            outcome_side=_col(r, "outcome_side", "YES"),
             shares=r["shares"],
             avg_entry_price=r["avg_entry_price"],
             cost_basis_usd=r["cost_basis_usd"],
             mark_price=r["mark_price"],
             unrealized_pnl_usd=r["unrealized_pnl_usd"],
             realized_pnl_usd=r["realized_pnl_usd"],
+            expected_edge=_col(r, "expected_edge", None),
+            realized_edge=_col(r, "realized_edge", None),
             status=r["status"],
             model_version=r["model_version"],
             strategy_version=r["strategy_version"],
             updated_at_utc=_dt(r["updated_at_utc"]),
         )
 
-    async def get_open_position(self, event_id: str, bucket_id: str) -> PositionRecord | None:
+    async def get_open_position(
+        self,
+        event_id: str,
+        bucket_id: str,
+        outcome_side: Literal["YES", "NO"] = "YES",
+    ) -> PositionRecord | None:
         async with self.db.conn.execute(
-            "SELECT * FROM positions WHERE event_id = ? AND bucket_id = ? AND status = 'OPEN' LIMIT 1",
-            (event_id, bucket_id),
+            """
+            SELECT * FROM positions
+            WHERE event_id = ? AND bucket_id = ? AND outcome_side = ? AND status = 'OPEN'
+            LIMIT 1
+            """,
+            (event_id, bucket_id, outcome_side),
         ) as cur:
             row = await cur.fetchone()
         return None if row is None else self._row_to_position(row)
@@ -712,7 +937,8 @@ class StrategyStore:
 
     async def mark_position(self, pos: PositionRecord, mark_price: float, now: datetime) -> None:
         pos.mark_price = mark_price
-        pos.unrealized_pnl_usd = (mark_price - pos.avg_entry_price) * pos.shares
+        upnl = round(pos.shares * mark_price - pos.cost_basis_usd, 6)
+        pos.unrealized_pnl_usd = 0.0 if abs(upnl) <= _EPS else upnl
         pos.updated_at_utc = now
         await self._upsert_position(pos)
         await self.db.conn.commit()
@@ -755,11 +981,14 @@ class StrategyStore:
                 station_icao=r["station_icao"],
                 bucket_id=r["bucket_id"],
                 side=r["side"],
+                outcome_side=_col(r, "outcome_side", "YES"),
                 fill_price=r["fill_price"],
                 fill_shares=r["fill_shares"],
                 fill_usd=r["fill_usd"],
                 fee_usd=r["fee_usd"],
                 is_maker=bool(r["is_maker"]),
+                expected_edge=_col(r, "expected_edge", None),
+                realized_edge=_col(r, "realized_edge", None),
                 model_version=r["model_version"],
                 strategy_version=r["strategy_version"],
                 filled_at_utc=_dt(r["filled_at_utc"]),
@@ -767,13 +996,18 @@ class StrategyStore:
             for r in rows
         ]
 
-    async def last_buy_fill_time(self, event_id: str, bucket_id: str) -> datetime | None:
+    async def last_buy_fill_time(
+        self,
+        event_id: str,
+        bucket_id: str,
+        outcome_side: Literal["YES", "NO"] = "YES",
+    ) -> datetime | None:
         async with self.db.conn.execute(
             """
             SELECT MAX(filled_at_utc) AS ts FROM fills
-            WHERE event_id = ? AND bucket_id = ? AND side = 'BUY'
+            WHERE event_id = ? AND bucket_id = ? AND side = 'BUY' AND outcome_side = ?
             """,
-            (event_id, bucket_id),
+            (event_id, bucket_id, outcome_side),
         ) as cur:
             row = await cur.fetchone()
         return None if row is None or row["ts"] is None else _dt(row["ts"])
@@ -783,15 +1017,17 @@ class StrategyStore:
         cur = await self.db.conn.execute(
             """
             INSERT OR IGNORE INTO clv_snapshots (
-                clv_id, fill_id, event_id, bucket_id, entry_price, benchmark_midpoint, clv,
-                horizon_minutes, model_version, strategy_version, captured_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                clv_id, fill_id, event_id, bucket_id, outcome_side, entry_price,
+                benchmark_midpoint, clv, horizon_minutes, model_version, strategy_version,
+                captured_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 c.clv_id,
                 c.fill_id,
                 c.event_id,
                 c.bucket_id,
+                c.outcome_side,
                 c.entry_price,
                 c.benchmark_midpoint,
                 c.clv,
@@ -820,6 +1056,7 @@ class StrategyStore:
                 fill_id=r["fill_id"],
                 event_id=r["event_id"],
                 bucket_id=r["bucket_id"],
+                outcome_side=_col(r, "outcome_side", "YES"),
                 entry_price=r["entry_price"],
                 benchmark_midpoint=r["benchmark_midpoint"],
                 clv=r["clv"],
@@ -915,6 +1152,8 @@ class StrategyStore:
         manifest: StrategyVersionRecord,
         model_version: str,
         now: datetime,
+        *,
+        positions_override: Sequence[PositionRecord] | None = None,
     ) -> PortfolioSummary:
         sv = manifest.strategy_version
         per_bucket, total_committed = await self.commitments(
@@ -922,12 +1161,19 @@ class StrategyStore:
             strategy_version=sv,
         )
         realized = await self.realized_pnl(model_version=model_version, strategy_version=sv)
+        source_positions = (
+            positions_override
+            if positions_override is not None
+            else await self.list_positions(status="OPEN")
+        )
         open_positions = [
             p
-            for p in await self.list_positions(status="OPEN")
-            if p.model_version == model_version and p.strategy_version == sv
+            for p in source_positions
+            if p.status == "OPEN" and p.model_version == model_version and p.strategy_version == sv
         ]
-        unrealized = sum(p.unrealized_pnl_usd for p in open_positions)
+        unrealized = round(sum(p.unrealized_pnl_usd for p in open_positions), 6)
+        if abs(unrealized) <= _EPS:
+            unrealized = 0.0
         cash = manifest.reference_bankroll + realized - total_committed
         reserve = manifest.intraday_cash_reserve_ratio * manifest.reference_bankroll
         async with self.db.conn.execute(
@@ -941,7 +1187,7 @@ class StrategyStore:
             cash_balance_usd=round(cash, 6),
             equity_usd=round(manifest.reference_bankroll + realized + unrealized, 6),
             realized_pnl_usd=round(realized, 6),
-            unrealized_pnl_usd=round(unrealized, 6),
+            unrealized_pnl_usd=unrealized,
             total_city_exposure_usd=round(total_committed, 6),
             intraday_cash_reserve_usd=reserve,
             available_premarket_usd=round(max(0.0, cash - reserve), 6),
@@ -985,6 +1231,7 @@ class _Candidate:
     bucket_id: str
     label: str
     token_id: str
+    outcome_side: Literal["YES", "NO"]
     fair: float
     limit: float
     edge: float
@@ -1118,7 +1365,7 @@ class StrategyEngine:
         return age > self.manifest.stale_feed_seconds
 
     def _passive_buy_limit(self, book: OrderBookSnapshot, fair: float) -> float | None:
-        tick = self.params.tick_size
+        tick = resolve_tick_size(book, self.params.tick_size)
         ceiling = math.floor((fair - self.manifest.min_edge) / tick + _EPS) * tick
         upper = ceiling
         if book.best_ask is not None:
@@ -1129,20 +1376,52 @@ class StrategyEngine:
                 return None
         else:
             target = upper
-        target = _round_price(target)
-        if target < tick - _EPS or target > 0.99:
-            return None
-        return target
+        return clamp_order_price(target, tick)
 
     def _passive_sell_limit(self, book: OrderBookSnapshot) -> float | None:
-        tick = self.params.tick_size
-        if book.best_bid is None and book.best_ask is None:
+        tick = resolve_tick_size(book, self.params.tick_size)
+        if book.best_bid is None or book.best_bid < tick - _EPS:
             return None
         if book.best_ask is None:
-            return _round_price(min(0.99, (book.best_bid or 0.0) + tick))
-        if book.best_bid is None or book.best_ask - tick > book.best_bid + _EPS:
-            return _round_price(book.best_ask - tick)
-        return _round_price(book.best_ask)
+            return clamp_order_price(book.best_bid + tick, tick)
+        if book.best_ask - tick > book.best_bid + _EPS:
+            candidate = book.best_ask - tick
+        else:
+            candidate = book.best_ask
+        return clamp_order_price(candidate, tick)
+
+    def _dynamic_take_profit_limit(
+        self,
+        book: OrderBookSnapshot,
+        avg_entry_price: float,
+        current_fair: float,
+    ) -> float | None:
+        """Compute Pre-Resolution Take-Profit Post-Only SELL price.
+
+        Formula: ``max(entry + min_profit, current_fair + premium)`` snapped upward to tick grid
+        and guaranteed strictly passive (``>= best_bid + tick``) within ``[tick, 1 - tick]``.
+        """
+        tick = resolve_tick_size(book, self.params.tick_size)
+        raw_target = max(
+            avg_entry_price + self.params.take_profit_min_profit,
+            current_fair + self.params.take_profit_premium,
+        )
+        snapped = math.ceil(raw_target / tick - _EPS) * tick
+        if book.best_bid is not None:
+            snapped = max(snapped, book.best_bid + tick)
+        return clamp_order_price(snapped, tick)
+
+    @staticmethod
+    def _effective_book_for_side(
+        yes_book: OrderBookSnapshot | None,
+        outcome_side: Literal["YES", "NO"],
+        no_token_id: str | None = None,
+    ) -> OrderBookSnapshot | None:
+        if yes_book is None:
+            return None
+        if outcome_side == "NO":
+            return derive_no_book(yes_book, no_token_id=no_token_id)
+        return yes_book
 
     @staticmethod
     def _depth_usd(book: OrderBookSnapshot) -> float:
@@ -1192,17 +1471,43 @@ class StrategyEngine:
 
         prob_by_bucket: dict[str, BucketFairProbability] = {b.bucket_id: b for b in probabilities.buckets}
         label_by_bucket = {b.bucket_id: b.label for b in event.buckets}
+        bucket_by_id = {b.bucket_id: b for b in event.buckets}
 
-        # mark open positions to the live midpoint
+        # mark open positions to liquidation value (YES ZEROED -> 0.0; NO on ZEROED -> guaranteed 1.0/best_bid)
         open_positions = await self.store.list_positions(status="OPEN", event_id=event.event_id)
         for pos in open_positions:
-            book = books.get(pos.bucket_id)
-            if book is not None and not self._is_stale(book, now):
-                mark = book.midpoint
-                if mark is None and book.best_bid is not None and book.best_ask is not None:
-                    mark = round((book.best_bid + book.best_ask) / 2.0, 6)
-                if mark is not None:
-                    await self.store.mark_position(pos, mark, now)
+            prob = prob_by_bucket.get(pos.bucket_id)
+            is_impossible = bool(prob is not None and prob.is_impossible)
+            yes_book = books.get(pos.bucket_id)
+            b_meta = bucket_by_id.get(pos.bucket_id)
+            eff_book = self._effective_book_for_side(
+                yes_book, pos.outcome_side, b_meta.no_token_id if b_meta else None
+            )
+            if pos.outcome_side == "YES" and is_impossible:
+                mark, _ = calculate_liquidation_mark_and_upnl(
+                    shares=pos.shares,
+                    cost_basis_usd=pos.cost_basis_usd,
+                    best_bid=None,
+                    is_impossible=True,
+                )
+                await self.store.mark_position(pos, mark, now)
+            elif pos.outcome_side == "NO" and is_impossible:
+                no_bid = eff_book.best_bid if (eff_book is not None and eff_book.best_bid and eff_book.best_bid > 0) else 1.0
+                mark, _ = calculate_liquidation_mark_and_upnl(
+                    shares=pos.shares,
+                    cost_basis_usd=pos.cost_basis_usd,
+                    best_bid=no_bid,
+                    is_impossible=False,
+                )
+                await self.store.mark_position(pos, mark, now)
+            elif eff_book is not None and (now - eff_book.ingested_at_utc).total_seconds() >= -_EPS:
+                mark, _ = calculate_liquidation_mark_and_upnl(
+                    shares=pos.shares,
+                    cost_basis_usd=pos.cost_basis_usd,
+                    best_bid=eff_book.best_bid,
+                    is_impossible=False,
+                )
+                await self.store.mark_position(pos, mark, now)
 
         close_at = settlement_close_utc(event)
         in_cutoff = now >= close_at - timedelta(minutes=self.manifest.cutoff_minutes_before_settlement)
@@ -1212,24 +1517,62 @@ class StrategyEngine:
         if in_cutoff and sim is not None:
             await sim.capture_pre_settlement_clv(event.event_id, books)
 
-        # resting orders: cancel entries when entries are disallowed or the edge vanished
+        # resting orders: cancel invalid-price orders, entries when disallowed/zeroed/edge-lost,
+        # and resting SELLs when the Bucket is ZEROED (for YES) or has no valid Bid >= tick_size
         resting = await self.store.list_resting_orders(event.event_id)
         for order in resting:
+            yes_book = books.get(order.bucket_id)
+            b_meta = bucket_by_id.get(order.bucket_id)
+            book = self._effective_book_for_side(
+                yes_book, order.outcome_side, b_meta.no_token_id if b_meta else None
+            )
+            prob = prob_by_bucket.get(order.bucket_id)
+            tick = resolve_tick_size(book, self.params.tick_size)
+            is_zeroed = bool(prob is not None and prob.is_impossible)
+            price_invalid = clamp_order_price(order.limit_price, tick) is None
+
             if order.side != "BUY":
+                side_zeroed = is_zeroed and order.outcome_side == "YES"
+                no_valid_bid = book is not None and (
+                    book.best_bid is None or book.best_bid < tick - _EPS
+                )
+                if price_invalid or side_zeroed or no_valid_bid:
+                    await executor.cancel_order(order.order_id)
+                    result.cancelled.append(order.order_id)
+                    await self._audit(
+                        "CANCEL_EXIT",
+                        [R_SKIP_EXIT_NO_BID],
+                        order.model_version,
+                        event_id=event.event_id,
+                        bucket_id=order.bucket_id,
+                        detail={
+                            "order_id": order.order_id,
+                            "outcome_side": order.outcome_side,
+                            "limit_price": order.limit_price,
+                            "is_impossible": side_zeroed,
+                            "best_bid": book.best_bid if book is not None else None,
+                            "tick_size": tick,
+                        },
+                    )
                 continue
+
             reasons: list[str] = []
-            if in_cutoff:
+            if price_invalid:
+                reasons = [R_EDGE_LOST_CANCEL]
+            elif in_cutoff:
                 reasons = [R_CUTOFF]
             elif paused:
                 reasons = [R_PAUSED]
-            else:
-                book = books.get(order.bucket_id)
-                prob = prob_by_bucket.get(order.bucket_id)
-                if book is not None and prob is not None and not self._is_stale(book, now):
-                    fair = 0.0 if prob.is_impossible else prob.fair_probability
-                    edge = calculate_net_edge(fair, order.limit_price, side="BUY", is_maker=True, event=event)
-                    if edge < self.manifest.min_edge - _EPS:
-                        reasons = [R_EDGE_LOST_CANCEL]
+            elif is_zeroed and order.outcome_side == "YES":
+                reasons = [R_EDGE_LOST_CANCEL]
+            elif book is not None and prob is not None and not self._is_stale(book, now):
+                if order.outcome_side == "NO":
+                    eff_fair = 1.0 if prob.is_impossible else (1.0 - prob.fair_probability)
+                else:
+                    eff_fair = 0.0 if prob.is_impossible else prob.fair_probability
+                edge = calculate_net_edge(eff_fair, order.limit_price, side="BUY", is_maker=True, event=event)
+                if edge < self.manifest.min_edge - _EPS:
+                    reasons = [R_EDGE_LOST_CANCEL]
             if reasons:
                 await executor.cancel_order(order.order_id)
                 result.cancelled.append(order.order_id)
@@ -1239,11 +1582,14 @@ class StrategyEngine:
                     order.model_version,
                     event_id=event.event_id,
                     bucket_id=order.bucket_id,
-                    detail={"order_id": order.order_id},
+                    detail={"order_id": order.order_id, "outcome_side": order.outcome_side},
                 )
 
         # Phase 2: exits (always permitted, including while paused or in cutoff: they cut risk)
-        for pos in await self.store.list_positions(status="OPEN", event_id=event.event_id):
+        open_positions_after_fills = await self.store.list_positions(status="OPEN", event_id=event.event_id)
+        open_sides_by_bucket: dict[str, set[str]] = {}
+        for pos in open_positions_after_fills:
+            open_sides_by_bucket.setdefault(pos.bucket_id, set()).add(pos.outcome_side)
             await self._manage_exit(
                 event, pos, prob_by_bucket.get(pos.bucket_id), books.get(pos.bucket_id),
                 latest_metar, now, result, mv,
@@ -1259,6 +1605,8 @@ class StrategyEngine:
         phase = PHASE_INTRADAY if intraday else PHASE_PREMARKET
         candidates: list[_Candidate] = []
         for bucket in event.buckets:
+            if R_SKIP_EXIT_NO_BID in result.skipped.get(bucket.bucket_id, ()):
+                continue
             book = books.get(bucket.bucket_id)
             prob = prob_by_bucket.get(bucket.bucket_id)
             if prob is None:
@@ -1279,32 +1627,92 @@ class StrategyEngine:
                     {"depth_usd": self._depth_usd(book)},
                 )
                 continue
-            fair = 0.0 if prob.is_impossible else prob.fair_probability
-            limit = self._passive_buy_limit(book, fair)
-            if limit is None:
+
+            held_sides = open_sides_by_bucket.get(bucket.bucket_id, set())
+            bucket_cands: list[_Candidate] = []
+            skip_reason: str | None = None
+            skip_detail: dict[str, Any] = {}
+
+            # 1) Evaluate BUY YES
+            fair_yes = 0.0 if prob.is_impossible else prob.fair_probability
+            limit_yes = self._passive_buy_limit(book, fair_yes)
+            if "NO" in held_sides:
+                limit_yes = None
+            if limit_yes is None:
+                skip_reason = R_BELOW_EDGE
+                skip_detail = {"fair": fair_yes, "best_bid": book.best_bid, "best_ask": book.best_ask}
+            elif limit_yes < self.params.min_buy_price - _EPS:
+                skip_reason = R_CHEAP_TAIL
+                skip_detail = {
+                    "limit_price": limit_yes,
+                    "min_buy_price": self.params.min_buy_price,
+                    "fair": fair_yes,
+                }
+            else:
+                edge_yes = calculate_net_edge(fair_yes, limit_yes, side="BUY", is_maker=True, event=event)
+                if edge_yes >= self.manifest.min_edge - _EPS:
+                    bucket_cands.append(
+                        _Candidate(
+                            bucket_id=bucket.bucket_id,
+                            label=label_by_bucket.get(bucket.bucket_id, bucket.bucket_id),
+                            token_id=bucket.token_id,
+                            outcome_side="YES",
+                            fair=fair_yes,
+                            limit=limit_yes,
+                            edge=edge_yes,
+                            model_version=prob.model_version,
+                        )
+                    )
+                else:
+                    skip_reason = R_BELOW_EDGE
+                    skip_detail = {"edge": edge_yes}
+
+            # 2) Symmetric BUY NO on overheated buckets (feature flag: enable_buy_no)
+            if self.params.enable_buy_no and not prob.is_impossible and "YES" not in held_sides:
+                no_book = derive_no_book(book, no_token_id=bucket.no_token_id)
+                fair_no = max(0.0, min(1.0, 1.0 - prob.fair_probability))
+                limit_no = self._passive_buy_limit(no_book, fair_no)
+                if limit_no is not None:
+                    if (
+                        limit_no < self.params.min_buy_no_price - _EPS
+                        or limit_no > self.params.max_buy_no_price + _EPS
+                    ):
+                        if not bucket_cands and skip_reason is None:
+                            skip_reason = R_NO_PRICE_BOUNDS
+                            skip_detail = {
+                                "limit_no": limit_no,
+                                "min_buy_no_price": self.params.min_buy_no_price,
+                                "max_buy_no_price": self.params.max_buy_no_price,
+                                "fair_no": fair_no,
+                            }
+                    else:
+                        edge_no = calculate_net_edge(fair_no, limit_no, side="BUY", is_maker=True, event=event)
+                        if edge_no >= self.manifest.min_edge - _EPS:
+                            bucket_cands.append(
+                                _Candidate(
+                                    bucket_id=bucket.bucket_id,
+                                    label=label_by_bucket.get(bucket.bucket_id, bucket.bucket_id),
+                                    token_id=no_book.token_id,
+                                    outcome_side="NO",
+                                    fair=fair_no,
+                                    limit=limit_no,
+                                    edge=edge_no,
+                                    model_version=prob.model_version,
+                                )
+                            )
+
+            if bucket_cands:
+                best_cand = max(bucket_cands, key=lambda c: c.edge)
+                candidates.append(best_cand)
+            else:
                 await self._skip(
-                    result, event, bucket.bucket_id, [R_BELOW_EDGE], prob.model_version,
-                    {"fair": fair, "best_bid": book.best_bid, "best_ask": book.best_ask},
+                    result,
+                    event,
+                    bucket.bucket_id,
+                    [skip_reason or R_BELOW_EDGE],
+                    prob.model_version,
+                    skip_detail,
                 )
-                continue
-            edge = calculate_net_edge(fair, limit, side="BUY", is_maker=True, event=event)
-            if edge < self.manifest.min_edge - _EPS:
-                await self._skip(
-                    result, event, bucket.bucket_id, [R_BELOW_EDGE], prob.model_version,
-                    {"edge": edge},
-                )
-                continue
-            candidates.append(
-                _Candidate(
-                    bucket_id=bucket.bucket_id,
-                    label=label_by_bucket.get(bucket.bucket_id, bucket.bucket_id),
-                    token_id=next(b.token_id for b in event.buckets if b.bucket_id == bucket.bucket_id),
-                    fair=fair,
-                    limit=limit,
-                    edge=edge,
-                    model_version=prob.model_version,
-                )
-            )
 
         candidates.sort(key=lambda c: c.edge, reverse=True)
         for cand in candidates:
@@ -1354,8 +1762,28 @@ class StrategyEngine:
                 {"caps": {k: round(v, 4) for k, v in caps.items()}},
             )
             return
+        min_entry_shares = max(self.params.min_order_shares, self.params.min_entry_shares)
+        if shares < min_entry_shares - _EPS:
+            await self._skip(
+                result,
+                event,
+                cand.bucket_id,
+                [R_MIN_SHARES],
+                cand.model_version,
+                {
+                    "shares": shares,
+                    "min_entry_shares": min_entry_shares,
+                    "limit_price": cand.limit,
+                    "size_usd": notional,
+                    "binding": binding,
+                },
+            )
+            return
 
         reason = R_ENTRY_EDGE if phase == PHASE_PREMARKET else R_INTRADAY_ENTRY_EDGE
+        reason_codes = [reason, f"BINDING_{binding}"]
+        if cand.outcome_side == "NO":
+            reason_codes.append(R_BUY_NO_EDGE)
         signal = SignalCard(
             signal_id=f"sig-{uuid.uuid4().hex[:12]}",
             event_id=event.event_id,
@@ -1364,12 +1792,13 @@ class StrategyEngine:
             bucket_label=cand.label,
             phase=phase,
             side="BUY",
+            outcome_side=cand.outcome_side,
             fair_probability=cand.fair,
             limit_price=cand.limit,
             target_exit_price=None,
             edge=cand.edge,
             suggested_size_usd=notional,
-            reason_codes=[reason, f"BINDING_{binding}"],
+            reason_codes=reason_codes,
             model_version=cand.model_version,
             strategy_version=m.strategy_version,
             created_at_utc=now,
@@ -1383,12 +1812,14 @@ class StrategyEngine:
             bucket_id=cand.bucket_id,
             token_id=cand.token_id,
             side="BUY",
+            outcome_side=cand.outcome_side,
             limit_price=cand.limit,
             size_shares=shares,
             size_usd=notional,
             post_only=True,
             phase=phase,
             status="OPEN",
+            expected_edge=round(cand.edge, 6),
             model_version=cand.model_version,
             strategy_version=m.strategy_version,
             created_at_utc=now,
@@ -1408,7 +1839,11 @@ class StrategyEngine:
                 placed.model_version,
                 event_id=event.event_id,
                 bucket_id=placed.bucket_id,
-                detail={"order_id": placed.order_id, "limit_price": placed.limit_price},
+                detail={
+                    "order_id": placed.order_id,
+                    "outcome_side": placed.outcome_side,
+                    "limit_price": placed.limit_price,
+                },
             )
             return
         result.placed.append(placed)
@@ -1422,12 +1857,15 @@ class StrategyEngine:
                 "order_id": placed.order_id,
                 "signal_id": signal.signal_id,
                 "side": placed.side,
+                "outcome_side": placed.outcome_side,
                 "phase": placed.phase,
                 "limit_price": placed.limit_price,
                 "size_shares": placed.size_shares,
                 "size_usd": placed.size_usd,
                 "edge": signal.edge,
+                "expected_edge": placed.expected_edge if placed.expected_edge is not None else signal.edge,
                 "fair_probability": signal.fair_probability,
+                "post_only": placed.post_only,
             },
         )
 
@@ -1436,23 +1874,65 @@ class StrategyEngine:
         event: WeatherEvent,
         pos: PositionRecord,
         prob: BucketFairProbability | None,
-        book: OrderBookSnapshot | None,
+        yes_book: OrderBookSnapshot | None,
         metar: MetarObservation | None,
         now: datetime,
         result: TickResult,
         default_mv: str,
     ) -> None:
-        if prob is None or book is None or self._is_stale(book, now) or pos.shares <= _EPS:
+        if pos.shares <= _EPS:
             return
-        fair = 0.0 if prob.is_impossible else prob.fair_probability
-        exit_limit = self._passive_sell_limit(book)
-        if exit_limit is None:
+        b_meta = next((b for b in event.buckets if b.bucket_id == pos.bucket_id), None)
+        book = self._effective_book_for_side(
+            yes_book,
+            pos.outcome_side,
+            b_meta.no_token_id if b_meta is not None else None,
+        )
+        tick = resolve_tick_size(book, self.params.tick_size)
+        is_zeroed = bool(prob is not None and prob.is_impossible)
+        side_zeroed = is_zeroed and pos.outcome_side == "YES"
+        no_valid_bid = book is not None and (book.best_bid is None or book.best_bid < tick - _EPS)
+        if side_zeroed or no_valid_bid:
+            existing_active = [
+                o
+                for o in await self.store.list_resting_orders(pos.event_id)
+                if o.bucket_id == pos.bucket_id and o.outcome_side == pos.outcome_side
+            ]
+            for o in existing_active:
+                await self.executor.cancel_order(o.order_id)
+                result.cancelled.append(o.order_id)
+            await self._skip(
+                result,
+                event,
+                pos.bucket_id,
+                [R_SKIP_EXIT_NO_BID],
+                (prob.model_version if prob is not None else None) or default_mv,
+                {
+                    "outcome_side": pos.outcome_side,
+                    "is_impossible": side_zeroed,
+                    "best_bid": book.best_bid if book is not None else None,
+                    "tick_size": tick,
+                    "cancelled_orders": [o.order_id for o in existing_active],
+                },
+            )
             return
-        residual = fair - exit_limit  # expected value left by holding instead of exiting here
-        entry_fair = await self.store.latest_entry_fair(pos.event_id, pos.bucket_id)
+        if self.params.hold_to_expiry:
+            return
+        if prob is None or book is None or self._is_stale(book, now):
+            return
+        fair = (1.0 - prob.fair_probability) if pos.outcome_side == "NO" else prob.fair_probability
+        passive_sell = self._passive_sell_limit(book)
+        if passive_sell is None:
+            return
+        residual = fair - passive_sell  # expected value left by holding instead of exiting here
+        entry_fair = await self.store.latest_entry_fair(
+            pos.event_id, pos.bucket_id, outcome_side=pos.outcome_side
+        )
         if entry_fair is None:
             entry_fair = pos.avg_entry_price + self.manifest.min_edge
-        last_buy = await self.store.last_buy_fill_time(pos.event_id, pos.bucket_id)
+        last_buy = await self.store.last_buy_fill_time(
+            pos.event_id, pos.bucket_id, outcome_side=pos.outcome_side
+        )
         metar_fresh = (
             metar is not None
             and metar.is_routine
@@ -1462,21 +1942,94 @@ class StrategyEngine:
         )
 
         reasons: list[str] = []
-        if (
-            metar_fresh
-            and (entry_fair - fair) >= self.params.erosion_threshold - _EPS
-            and residual < self.manifest.min_edge - _EPS
+        exit_limit: float | None = passive_sell
+        fair_below_market = book.best_bid is not None and fair < book.best_bid - _EPS
+        if metar_fresh and (
+            (
+                (entry_fair - fair) >= self.params.erosion_threshold - _EPS
+                and residual < self.manifest.min_edge - _EPS
+            )
+            or fair_below_market
         ):
             reasons = [R_EARLY_EXIT]
-        elif residual <= self.params.convergence_edge + _EPS and exit_limit > pos.avg_entry_price + _EPS:
+            exit_limit = passive_sell
+        elif self.params.enable_dynamic_take_profit:
+            tp_limit = self._dynamic_take_profit_limit(book, pos.avg_entry_price, fair)
+            if tp_limit is not None:
+                reasons = [R_DYNAMIC_TAKE_PROFIT]
+                exit_limit = tp_limit
+        elif residual <= self.params.convergence_edge + _EPS and passive_sell > pos.avg_entry_price + _EPS:
             reasons = [R_PROFIT_TAKE]
-        if not reasons:
+            exit_limit = passive_sell
+
+        if not reasons or exit_limit is None:
             return
 
         existing = [
-            o for o in await self.store.list_resting_orders(pos.event_id)
-            if o.bucket_id == pos.bucket_id and o.side == "SELL"
+            o
+            for o in await self.store.list_resting_orders(pos.event_id)
+            if o.bucket_id == pos.bucket_id
+            and o.side == "SELL"
+            and o.outcome_side == pos.outcome_side
         ]
+
+        # Polymarket CLOB V2 rejects limit SELL orders < 5 shares (HTTP 400).
+        # Explicitly handle dust (< min_order_shares): never post a limit SELL; either
+        # close via taker market exit when a valid bid exists, or hold to settlement.
+        if pos.shares < self.params.min_order_shares - _EPS:
+            for o in existing:
+                await self.executor.cancel_order(o.order_id)
+                result.cancelled.append(o.order_id)
+            taker_exit_fn = getattr(self.executor, "execute_taker_exit", None)
+            can_market_exit = (
+                callable(taker_exit_fn)
+                and book.best_bid is not None
+                and book.best_bid >= tick - _EPS
+                and (R_EARLY_EXIT in reasons or book.best_bid > pos.avg_entry_price + _EPS)
+            )
+            if can_market_exit:
+                _taker_order, taker_fills = await taker_exit_fn(
+                    event=event,
+                    bucket_id=pos.bucket_id,
+                    shares=pos.shares,
+                    book=book,
+                    model_version=prob.model_version or default_mv,
+                    strategy_version=self.manifest.strategy_version,
+                    limit_price=tick,
+                    phase=PHASE_INTRADAY,
+                    outcome_side=pos.outcome_side,
+                )
+                result.fills.extend(taker_fills)
+                await self._audit(
+                    "DUST_TAKER_EXIT",
+                    [R_EXIT_DUST_HOLD, *reasons],
+                    prob.model_version or default_mv,
+                    event_id=event.event_id,
+                    bucket_id=pos.bucket_id,
+                    detail={
+                        "outcome_side": pos.outcome_side,
+                        "shares": pos.shares,
+                        "best_bid": book.best_bid,
+                        "fills_count": len(taker_fills),
+                    },
+                )
+            else:
+                await self._skip(
+                    result,
+                    event,
+                    pos.bucket_id,
+                    [R_EXIT_DUST_HOLD],
+                    prob.model_version or default_mv,
+                    {
+                        "outcome_side": pos.outcome_side,
+                        "shares": pos.shares,
+                        "min_order_shares": self.params.min_order_shares,
+                        "best_bid": book.best_bid,
+                        "action": "hold_to_settlement",
+                    },
+                )
+            return
+
         if any(abs(o.limit_price - exit_limit) < _EPS and o.size_shares >= pos.shares - _EPS for o in existing):
             return
         for o in existing:
@@ -1491,10 +2044,11 @@ class StrategyEngine:
             bucket_label=pos.bucket_label,
             phase=PHASE_INTRADAY,
             side="SELL",
+            outcome_side=pos.outcome_side,
             fair_probability=fair,
             limit_price=exit_limit,
             target_exit_price=exit_limit,
-            edge=exit_limit - fair,
+            edge=round(exit_limit - fair, 6),
             suggested_size_usd=round(pos.shares * exit_limit, 6),
             reason_codes=reasons,
             model_version=prob.model_version or default_mv,
@@ -1503,7 +2057,10 @@ class StrategyEngine:
         )
         await self.store.insert_signal(signal)
         result.signals.append(signal)
-        token_id = next((b.token_id for b in event.buckets if b.bucket_id == pos.bucket_id), book.token_id)
+        if pos.outcome_side == "NO":
+            token_id = (b_meta.no_token_id if b_meta and b_meta.no_token_id else book.token_id)
+        else:
+            token_id = (b_meta.token_id if b_meta is not None else book.token_id)
         order = MakerOrder(
             order_id=f"ord-{uuid.uuid4().hex[:12]}",
             event_id=pos.event_id,
@@ -1511,12 +2068,14 @@ class StrategyEngine:
             bucket_id=pos.bucket_id,
             token_id=token_id,
             side="SELL",
+            outcome_side=pos.outcome_side,
             limit_price=exit_limit,
             size_shares=pos.shares,
             size_usd=round(pos.shares * exit_limit, 6),
             post_only=True,
             phase=PHASE_INTRADAY,
             status="OPEN",
+            expected_edge=pos.expected_edge,
             model_version=signal.model_version,
             strategy_version=self.manifest.strategy_version,
             created_at_utc=now,
@@ -1537,7 +2096,25 @@ class StrategyEngine:
         from weather_quant.probability.engine import get_latest_event_probability_snapshot
 
         now = self.clock.now()
+        ensure_fresh_fn = getattr(stream, "ensure_fresh_snapshots", None)
+        if callable(ensure_fresh_fn) and events:
+            active_tokens = [
+                bucket.token_id
+                for event in events
+                if settlement_close_utc(event) > now
+                for bucket in event.buckets
+            ]
+            if active_tokens:
+                try:
+                    await ensure_fresh_fn(
+                        token_ids=active_tokens,
+                        now=now,
+                        stale_threshold_seconds=self.manifest.stale_feed_seconds,
+                    )
+                except Exception:
+                    pass
         out: list[TickResult] = []
+        ticked_event_ids: set[str] = set()
         for event in events:
             snap = await get_latest_event_probability_snapshot(self.db, event.event_id, model_version)
             if snap is None:
@@ -1551,4 +2128,24 @@ class StrategyEngine:
                     books[bucket.bucket_id] = book
             metar = (latest_metars or {}).get(event.station.icao)
             out.append(await self.tick_event(event, snap, books, metar))
+            ticked_event_ids.add(event.event_id)
+
+        # Ensure any remaining OPEN positions (e.g. inactive/expired events) still reflect ZEROED losses
+        for pos in await self.store.list_positions(status="OPEN"):
+            if pos.event_id in ticked_event_ids:
+                continue
+            snap = await get_latest_event_probability_snapshot(
+                self.db, pos.event_id, model_version or pos.model_version
+            )
+            if snap is None:
+                continue
+            prob = next((b for b in snap.buckets if b.bucket_id == pos.bucket_id), None)
+            if prob is not None and prob.is_impossible:
+                mark, _ = calculate_liquidation_mark_and_upnl(
+                    shares=pos.shares,
+                    cost_basis_usd=pos.cost_basis_usd,
+                    best_bid=None,
+                    is_impossible=True,
+                )
+                await self.store.mark_position(pos, mark, now)
         return out

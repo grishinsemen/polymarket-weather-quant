@@ -594,3 +594,112 @@ def test_terminal_snapshot_demo_fallback_seed_replay_and_promote(tmp_path: Path)
         assert after_promote["portfolio"]["active_model_version"] == cand_mv
         assert after_promote["portfolio"]["active_strategy_version"] == "aggressive-kelly-100-v2"
 
+
+@pytest.mark.asyncio
+async def test_compare_exit_modes_hold_to_expiry_vs_dynamic_early_exit_and_api(tmp_path: Path) -> None:
+    """TICKET-6: Deterministic replay comparison of Hold-to-Expiry vs Dynamic Early-Exit
+    reporting PnL, Max Drawdown, Sharpe, expected vs actual edge, plus API route verification."""
+    from weather_quant.replay.runner import compare_exit_modes
+
+    db_path = str(tmp_path / "compare.db")
+    archive_dir = tmp_path / "archive"
+    db = Database(db_path)
+    await db.initialize()
+    try:
+        archive = ParquetArchiveStore(archive_dir)
+        event = _make_11_bucket_event(
+            event_id="evt-compare-lfpb",
+            icao="LFPB",
+            city="Paris",
+            tz="Europe/Paris",
+            local_date=date(2026, 11, 26),
+            center_c=12,
+        )
+        await db.upsert_weather_event(event)
+
+        # Ensemble peaks around 12°C (bucket index 5 = "12°C", fair ~45-55%)
+        t0 = datetime(2026, 11, 26, 7, 0, tzinfo=timezone.utc)
+        ens = _make_ensemble(event, ingested_at=t0, peak_c=12.1, n_members=40)
+        archive.write_ensemble_snapshots([ens])
+
+        # Tick 1 (07:05): Bucket 5 ("12°C") undervalued at 0.24 / 0.28 -> passive BUY @ 0.25
+        # Tick 2 (07:15): Ask dips to 0.25 -> BUY fills at 0.25 (0% maker fee)
+        # Tick 3 (09:00): Crowd rallies to 0.60 / 0.64 -> Dynamic Early-Exit sells at TP (>= fair+0.02)!
+        # Tick 4 (11:00): Crowd bids 0.72 -> guarantees TP fills cleanly as Post-Only Maker!
+        # Tick 5 (14:00): Surprise warm METAR 14.0°C -> Bucket 5 ("12°C") loses at settlement ($0)!
+        #   Hold-to-Expiry suffers full loss, whereas Dynamic Early-Exit locked in profit!
+        books_all: list[OrderBookSnapshot] = []
+        books_all.extend(_make_books_for_event(event, ingested_at=t0 + timedelta(minutes=5), target_bucket_idx=5, bid=0.24, ask=0.28))
+        books_all.extend(_make_books_for_event(event, ingested_at=t0 + timedelta(minutes=15), target_bucket_idx=5, bid=0.23, ask=0.25))
+        books_all.extend(_make_books_for_event(event, ingested_at=t0 + timedelta(hours=2), target_bucket_idx=5, bid=0.58, ask=0.62))
+        books_all.extend(_make_books_for_event(event, ingested_at=t0 + timedelta(hours=3), target_bucket_idx=5, bid=0.78, ask=0.82))
+        books_all.extend(_make_books_for_event(event, ingested_at=t0 + timedelta(hours=7), target_bucket_idx=5, bid=0.01, ask=0.02))
+        archive.write_orderbook_snapshots(books_all)
+
+        metars = [
+            _make_metar(
+                "LFPB",
+                observed_at=datetime(2026, 11, 26, 13, 30, tzinfo=timezone.utc),
+                ingested_at=datetime(2026, 11, 26, 13, 35, tzinfo=timezone.utc),
+                temp_c=14.0,
+            ),
+        ]
+        archive.write_metar_observations(metars)
+
+        end_utc = datetime(2026, 11, 27, 1, 0, tzinfo=timezone.utc)
+        comparison = await compare_exit_modes(
+            db=db,
+            archive_store=archive,
+            model_version="ensemble-3layer-v1",
+            strategy_version="conservative-kelly-100-v1",
+            dataset_start_utc=t0 - timedelta(minutes=5),
+            dataset_end_utc=end_utc,
+            events=[event],
+            enable_buy_no=False,
+            take_profit_min_profit=0.03,
+            take_profit_premium=0.02,
+        )
+
+        assert comparison.hold_to_expiry.mode == "hold_to_expiry"
+        assert comparison.dynamic_early_exit.mode == "dynamic_early_exit"
+        # Dynamic Early-Exit locked profit before the 14°C surprise while Hold-to-Expiry lost at settlement
+        assert comparison.dynamic_early_exit.net_pnl_usd > comparison.hold_to_expiry.net_pnl_usd
+        assert comparison.dynamic_early_exit.net_pnl_usd > 0.0
+        assert comparison.hold_to_expiry.net_pnl_usd < 0.0
+        assert comparison.dynamic_early_exit.max_drawdown_usd <= comparison.hold_to_expiry.max_drawdown_usd
+        assert comparison.delta_pnl_usd > 0.0
+        assert comparison.dynamic_early_exit.avg_expected_edge is not None
+        assert comparison.dynamic_early_exit.avg_actual_edge is not None
+        assert comparison.dynamic_early_exit.avg_actual_edge > 0.0
+        assert "Hold-to-Expiry" in comparison.summary_log
+        assert "Dynamic Early-Exit" in comparison.summary_log
+    finally:
+        await db.close()
+
+    # Verify HTTP API endpoint POST /api/replay/compare-exit-modes
+    app = create_app(
+        db_path=db_path,
+        clock=VirtualClock(datetime(2026, 11, 27, 1, 0, tzinfo=timezone.utc)),
+        enable_background_poll=False,
+    )
+    app.state.parquet_archive = ParquetArchiveStore(archive_dir)
+    with TestClient(app) as client:
+        resp = client.post(
+            "/api/replay/compare-exit-modes",
+            json={
+                "model_version": "ensemble-3layer-v1",
+                "strategy_version": "conservative-kelly-100-v1",
+                "dataset_start_utc": (t0 - timedelta(minutes=5)).isoformat(),
+                "dataset_end_utc": end_utc.isoformat(),
+                "enable_buy_no": True,
+                "take_profit_min_profit": 0.03,
+                "take_profit_premium": 0.02,
+            },
+        )
+        assert resp.status_code == 200
+        payload = resp.json()["comparison"]
+        assert payload["enable_buy_no"] is True
+        assert "sharpe_ratio" in payload["hold_to_expiry"]
+        assert "sharpe_ratio" in payload["dynamic_early_exit"]
+        assert "summary_log" in payload
+

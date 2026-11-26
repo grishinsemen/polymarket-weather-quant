@@ -152,6 +152,7 @@ export function WeatherQuantTerminal({
               <CityXRayPanel
                 xray={activeXRay}
                 allXrays={snapshot.xrays}
+                closedPositions={snapshot.closed_positions ?? []}
                 screenerOrder={snapshot.screener.map((r) => r.event_id)}
                 serverTimeUtc={snapshot.server_time_utc}
                 nowMs={nowMs}

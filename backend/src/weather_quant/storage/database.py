@@ -234,8 +234,35 @@ class Database:
         self._conn = await aiosqlite.connect(self.db_path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA_SQL)
+        await self._migrate_columns()
         await self._seed_default_versions()
         await self._conn.commit()
+
+    async def _migrate_columns(self) -> None:
+        """Idempotently add backward-compatible columns to existing SQLite tables."""
+        migrations: tuple[tuple[str, str, str], ...] = (
+            ("signals", "outcome_side", "TEXT NOT NULL DEFAULT 'YES'"),
+            ("orders", "outcome_side", "TEXT NOT NULL DEFAULT 'YES'"),
+            ("orders", "expected_edge", "REAL"),
+            ("fills", "outcome_side", "TEXT NOT NULL DEFAULT 'YES'"),
+            ("fills", "expected_edge", "REAL"),
+            ("fills", "realized_edge", "REAL"),
+            ("positions", "outcome_side", "TEXT NOT NULL DEFAULT 'YES'"),
+            ("positions", "expected_edge", "REAL"),
+            ("positions", "realized_edge", "REAL"),
+            ("clv_snapshots", "outcome_side", "TEXT NOT NULL DEFAULT 'YES'"),
+        )
+        existing_cols_cache: dict[str, set[str]] = {}
+        for table, column, ddl in migrations:
+            cols = existing_cols_cache.get(table)
+            if cols is None:
+                async with self.conn.execute(f"PRAGMA table_info({table})") as cur:
+                    rows = await cur.fetchall()
+                cols = {str(r["name"]) for r in rows}
+                existing_cols_cache[table] = cols
+            if column not in cols:
+                await self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+                cols.add(column)
 
     async def close(self) -> None:
         if self._conn is not None:

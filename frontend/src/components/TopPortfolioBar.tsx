@@ -30,8 +30,9 @@ interface TopPortfolioBarProps {
 }
 
 function fmtSignedUsd(val: number): string {
-  const sign = val > 0 ? "+" : val < 0 ? "-" : "";
-  return `${sign}$${Math.abs(val).toFixed(2)}`;
+  const normalized = Math.abs(val) < 1e-6 ? 0 : val;
+  const sign = normalized > 0 ? "+" : normalized < 0 ? "-" : "";
+  return `${sign}$${Math.abs(normalized).toFixed(2)}`;
 }
 
 export function TopPortfolioBar({
@@ -198,7 +199,9 @@ export function TopPortfolioBar({
             <div className="text-[10px] uppercase tracking-wider text-slate-500">Realized PnL</div>
             <div
               className={`font-mono-tabular text-sm font-semibold mt-0.5 ${
-                portfolio.realized_pnl_usd >= 0 ? "text-emerald-400" : "text-rose-400"
+                (Math.abs(portfolio.realized_pnl_usd) < 1e-6 ? 0 : portfolio.realized_pnl_usd) >= 0
+                  ? "text-emerald-400"
+                  : "text-rose-400"
               }`}
             >
               {fmtSignedUsd(portfolio.realized_pnl_usd)}
@@ -209,7 +212,9 @@ export function TopPortfolioBar({
             <div className="text-[10px] uppercase tracking-wider text-slate-500">Unrealized PnL</div>
             <div
               className={`font-mono-tabular text-sm font-semibold mt-0.5 ${
-                portfolio.unrealized_pnl_usd >= 0 ? "text-emerald-400" : "text-rose-400"
+                (Math.abs(portfolio.unrealized_pnl_usd) < 1e-6 ? 0 : portfolio.unrealized_pnl_usd) >= 0
+                  ? "text-emerald-400"
+                  : "text-rose-400"
               }`}
             >
               {fmtSignedUsd(portfolio.unrealized_pnl_usd)}

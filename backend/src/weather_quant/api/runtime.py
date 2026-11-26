@@ -20,6 +20,7 @@ from weather_quant.domain.models import EnsembleSnapshot, MetarObservation, Weat
 from weather_quant.ml.quantile_mos import load_mos_provider_for_version
 from weather_quant.probability.engine import (
     EnsembleProbabilityEngine,
+    build_daily_bias_observations_from_history,
     list_station_routine_metars,
     save_event_probability_snapshot,
 )
@@ -52,10 +53,12 @@ class AutonomousRuntime:
         *,
         ensemble_refresh_minutes: int = 60,
         metar_shift_threshold_c: float = 1.5,
+        stale_feed_alert_seconds: int = 120,
     ) -> None:
         self.app = app
         self.ensemble_refresh_minutes = ensemble_refresh_minutes
         self.metar_shift_threshold_c = metar_shift_threshold_c
+        self.stale_feed_alert_seconds = stale_feed_alert_seconds
         self._task: asyncio.Task[None] | None = None
         self._ensemble_cache: dict[str, EnsembleSnapshot] = {}
         self._ensemble_warmed_from_archive: bool = False
@@ -63,6 +66,7 @@ class AutonomousRuntime:
         self._archived_ensemble_keys: set[tuple[str, str]] = set()
         self._last_metar_by_station: dict[str, MetarObservation] = {}
         self._archived_metar_keys: set[tuple[str, str]] = set()
+        self._stale_feed_since_utc: datetime | None = None
         self._cycle_lock = asyncio.Lock()
 
     def get_cached_ensembles(self) -> dict[str, EnsembleSnapshot]:
@@ -247,22 +251,63 @@ class AutonomousRuntime:
             bot = getattr(self.app.state, "telegram_bot", None)
             await self._archive_new_metars(latest_metars, archive, bot)
 
-            # 2. Register events on CLOB stream, hydrate cold books via REST, and push live_tick early
+            # 2. Register events on CLOB stream, refresh cold/stale books via REST fallback, and push live_tick early
+            strategy_engine = await self._get_strategy_engine()
+            stale_threshold = strategy_engine.manifest.stale_feed_seconds
             stream = self._get_clob_stream()
             stream.register_events(events)
             active_events = [e for e in events if settlement_close_utc(e) > now_utc]
-            if any(
-                stream.get_snapshot(b.token_id, now=now_utc) is None
-                for e in active_events
-                for b in e.buckets
-            ):
+            active_token_ids = [b.token_id for e in active_events for b in e.buckets]
+            stale_tokens = stream.stale_token_ids(
+                active_token_ids,
+                now=now_utc,
+                stale_threshold_seconds=stale_threshold,
+            )
+            if stale_tokens:
                 try:
-                    await stream.resync_snapshots()
+                    await stream.resync_snapshots(token_ids=stale_tokens)
                 except Exception:
-                    logger.warning("CLOB REST /books resync failed; continuing with WS stream", exc_info=True)
+                    logger.warning(
+                        "CLOB REST /books fallback failed for %d stale token(s); continuing with WS stream",
+                        len(stale_tokens),
+                        exc_info=True,
+                    )
+                if (
+                    stream.last_ws_message_at_utc is not None
+                    and (now_utc - ensure_utc(stream.last_ws_message_at_utc)).total_seconds()
+                    >= self.stale_feed_alert_seconds
+                ):
+                    stream.request_reconnect()
+
+            still_stale = stream.stale_token_ids(
+                active_token_ids,
+                now=now_utc,
+                stale_threshold_seconds=stale_threshold,
+            )
+            if still_stale:
+                if self._stale_feed_since_utc is None:
+                    self._stale_feed_since_utc = now_utc
+                max_age = stream.max_staleness_seconds(still_stale, now=now_utc)
+                tracked_dead = (now_utc - self._stale_feed_since_utc).total_seconds()
+                dead_seconds = max(tracked_dead, max_age or 0.0)
+                if dead_seconds >= self.stale_feed_alert_seconds:
+                    stream.request_reconnect()
+                    if bot is not None and hasattr(bot, "notify_stale_feed"):
+                        try:
+                            await bot.notify_stale_feed(
+                                stale_count=len(still_stale),
+                                total_count=len(active_token_ids),
+                                dead_seconds=dead_seconds,
+                                last_error=stream.last_error,
+                                now_utc=now_utc,
+                            )
+                        except Exception:
+                            logger.exception("Failed sending STALE_FEED alert")
+            else:
+                self._stale_feed_since_utc = None
+
             await radar.broadcast_live_tick(0.0)
 
-            strategy_engine = await self._get_strategy_engine()
             book_snapshots = [
                 snap
                 for event in events
@@ -271,7 +316,7 @@ class AutonomousRuntime:
                     snap := stream.get_snapshot(
                         bucket.token_id,
                         now=now_utc,
-                        stale_threshold_seconds=strategy_engine.manifest.stale_feed_seconds,
+                        stale_threshold_seconds=stale_threshold,
                     )
                 )
                 is not None
@@ -293,6 +338,12 @@ class AutonomousRuntime:
             fetcher = self._get_ensemble_fetcher()
             prob_engine = self._get_probability_engine()
             probs_computed = 0
+            try:
+                hist_ensembles = await archive.aread_ensemble_snapshots(
+                    start_utc=now_utc - timedelta(days=prob_engine.bias_window_days),
+                )
+            except Exception:
+                hist_ensembles = []
 
             for event in events:
                 if settlement_close_utc(event) <= now_utc:
@@ -301,12 +352,23 @@ class AutonomousRuntime:
                 if ensemble is None:
                     continue
                 intraday_metars = await list_station_routine_metars(db, event.station.icao)
+                recent_bias_obs = build_daily_bias_observations_from_history(
+                    station=event.station,
+                    polarity=event.polarity,
+                    remark_tenths_enabled=event.remark_tenths_enabled,
+                    ensembles=hist_ensembles,
+                    metars=intraday_metars,
+                    before_local_date=event.local_date,
+                    window_days=prob_engine.bias_window_days,
+                    decision_time_utc=now_utc,
+                )
                 try:
                     if mos_provider is not None and mos_provider.is_station_covered(event.station.icao):
                         prob_snap = mos_provider.compute_probabilities(
                             station=event.station,
                             event=event,
                             ensemble=ensemble,
+                            recent_bias_obs=recent_bias_obs,
                             intraday_metars=intraday_metars,
                             clock=clock,
                         )
@@ -315,6 +377,7 @@ class AutonomousRuntime:
                             station=event.station,
                             event=event,
                             ensemble=ensemble,
+                            recent_bias_obs=recent_bias_obs,
                             intraday_metars=intraday_metars,
                             clock=clock,
                             model_version=active_mv,

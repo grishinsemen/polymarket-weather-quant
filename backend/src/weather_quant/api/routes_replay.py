@@ -52,8 +52,10 @@ from weather_quant.probability.engine import (
     to_event_unit,
 )
 from weather_quant.replay.runner import (
+    ExitModeComparisonResult,
     ReplayEquityPoint,
     ReplayTradeEntry,
+    compare_exit_modes,
     list_experiment_runs,
     promote_versions,
     run_experiment_replay,
@@ -65,6 +67,8 @@ from weather_quant.strategy.engine import (
     PHASE_PREMARKET,
     StrategyParams,
     StrategyStore,
+    calculate_liquidation_mark_and_upnl,
+    derive_no_book,
     settlement_close_utc,
 )
 
@@ -89,8 +93,37 @@ _REASON_EXPLANATIONS: dict[str, str] = {
     "OPERATOR_PAUSED": "New entries paused by operator; risk-reducing Phase 2 exits stay active.",
     "PRE_SETTLEMENT_CUTOFF": "Halted new entries inside pre-settlement cutoff window.",
     "EDGE_LOST_CANCEL_RESTING_ENTRY": "Cancelled resting Maker BUY after Edge compressed below threshold.",
+    "SKIP_EXIT_NO_BID": "Skipped exit and cancelled active orders because Bucket is ZEROED or has no valid Bid >= tick_size.",
+    "ORDER_SHARES_BELOW_MIN": "Skipped entry because sized shares fell below CLOB V2 minimum entry threshold (>= 6sh / 5sh hard floor).",
+    "EXIT_DUST_BELOW_MIN_SHARES": "Position is below 5-share CLOB V2 limit minimum; closed via taker bid or held to settlement instead of posting invalid limit SELL.",
+    "TAIL_PRICE_BELOW_MIN": "Skipped cheap lottery tail BUY YES below minimum price filter (10c).",
+    "BUY_NO_NET_EDGE_OK": "Overheated Bucket: Fair NO probability exceeds passive Post-Only BUY NO limit by >= min Edge.",
+    "DYNAMIC_TAKE_PROFIT_POST_ONLY": "Posted/repriced dynamic Post-Only SELL take-profit at max(entry + min_profit, fair + premium).",
+    "NO_PRICE_OUT_OF_RANGE": "Skipped BUY NO because passive limit price fell outside configured [min_buy_no_price, max_buy_no_price] bounds.",
+    "TRADE_EDGE_REALIZED": "Logged expected entry Edge vs actual realized Edge upon exit or settlement.",
     "POST_ONLY_WOULD_CROSS": "Post-Only Maker Order rejected because limit price would cross opposing spread.",
 }
+
+
+class CompareExitModesRequest(BaseModel):
+    """Parameters to compare Hold-to-Expiry vs Dynamic Early-Exit over archived Parquet data."""
+
+    model_version: str | None = None
+    strategy_version: str | None = None
+    dataset_start_utc: datetime | None = None
+    dataset_end_utc: datetime | None = None
+    event_ids: list[str] | None = None
+    lookback_hours: float | None = Field(default=None, gt=0)
+    enable_buy_no: bool = False
+    take_profit_min_profit: float = Field(default=0.03, ge=0.0, lt=0.5)
+    take_profit_premium: float = Field(default=0.02, ge=0.0, lt=0.5)
+
+
+class CompareExitModesResponse(BaseModel):
+    """Side-by-side comparison of Hold-to-Expiry vs Dynamic Early-Exit."""
+
+    status: str = "ok"
+    comparison: ExitModeComparisonResult
 
 
 class ReplayRunsResponse(BaseModel):
@@ -176,12 +209,16 @@ class MetarChartPoint(BaseModel):
 
 
 class EnsembleFanSeries(BaseModel):
-    """P10/P50/P90 hourly temperature distribution fan + realized METAR points."""
+    """P10/P50/P90 hourly temperature distribution fan + intraday METAR-shifted profile."""
 
     timestamps: list[datetime] = Field(default_factory=list)
     p10: list[float] = Field(default_factory=list)
     p50: list[float] = Field(default_factory=list)
     p90: list[float] = Field(default_factory=list)
+    adjusted_p10: list[float | None] = Field(default_factory=list)
+    adjusted_p50: list[float | None] = Field(default_factory=list)
+    adjusted_p90: list[float | None] = Field(default_factory=list)
+    intraday_residual_c: float | None = None
     metar_points: list[MetarChartPoint] = Field(default_factory=list)
     unit: Literal["C", "F"] = "C"
 
@@ -251,6 +288,27 @@ class ScreenerRow(BaseModel):
     open_positions_count: int = 0
 
 
+class ClosedPositionItem(BaseModel):
+    """Completed (CLOSED or SETTLED) Bucket position enriched with city and event date."""
+
+    position_id: str
+    event_id: str
+    station_icao: str
+    city: str
+    local_date: date | None = None
+    bucket_id: str
+    bucket_label: str
+    entry_price: float
+    exit_price: float
+    traded_shares: float = 0.0
+    stake_usd: float = 0.0
+    realized_pnl_usd: float
+    status: Literal["CLOSED", "SETTLED"]
+    model_version: str
+    strategy_version: str
+    closed_at_utc: datetime
+
+
 class TerminalSnapshotResponse(BaseModel):
     """Unified Pro Terminal state payload supporting version filtering and Experiment Lab."""
 
@@ -262,6 +320,7 @@ class TerminalSnapshotResponse(BaseModel):
     strategy_versions: list[StrategyVersionRecord] = Field(default_factory=list)
     screener: list[ScreenerRow] = Field(default_factory=list)
     xrays: dict[str, CityXRay] = Field(default_factory=dict)
+    closed_positions: list[ClosedPositionItem] = Field(default_factory=list)
     experiment_runs: list[ExperimentRunSummary] = Field(default_factory=list)
     quarantined_events: list[QuarantinedEvent] = Field(default_factory=list)
 
@@ -326,6 +385,13 @@ def _build_ensemble_fan(
     except ZoneInfoNotFoundError:
         tz = timezone.utc
 
+    day_metars = [
+        m
+        for m in sorted(metars, key=lambda x: _ensure_utc(x.observed_at_utc))
+        if m.is_routine
+        and not m.raw_report.strip().upper().startswith("SPECI")
+        and _ensure_utc(m.observed_at_utc).astimezone(tz).date() == event.local_date
+    ]
     points = [
         MetarChartPoint(
             observed_at_utc=_ensure_utc(m.observed_at_utc),
@@ -333,8 +399,7 @@ def _build_ensemble_fan(
             raw_report=m.raw_report,
             has_remark_tenths=m.has_remark_tenths,
         )
-        for m in sorted(metars, key=lambda x: _ensure_utc(x.observed_at_utc))
-        if m.is_routine and _ensure_utc(m.observed_at_utc).astimezone(tz).date() == event.local_date
+        for m in day_metars
     ]
     if ensemble is None or not ensemble.hourly_timestamps_utc or not ensemble.member_temps_c:
         return EnsembleFanSeries(metar_points=points, unit=event.unit)
@@ -347,29 +412,74 @@ def _build_ensemble_fan(
     if not indices:
         indices = list(range(len(ensemble.hourly_timestamps_utc)))
 
-    timestamps: list[datetime] = []
+    timestamps = [_ensure_utc(ensemble.hourly_timestamps_utc[idx]) for idx in indices]
+    day_trajectories = [
+        [float(traj[idx]) for idx in indices]
+        for traj in ensemble.member_temps_c
+        if len(traj) > max(indices)
+    ]
+    if not day_trajectories:
+        return EnsembleFanSeries(metar_points=points, unit=event.unit)
+
+    prob_engine = EnsembleProbabilityEngine()
+    cal_trajectories = prob_engine.calibrate_day_trajectories(
+        day_trajectories,
+        bias_c=0.0,
+        scale=prob_engine.default_spread_inflation,
+    )
+
     p10: list[float] = []
     p50: list[float] = []
     p90: list[float] = []
-    for idx in indices:
-        vals = [
-            float(traj[idx])
-            for traj in ensemble.member_temps_c
-            if len(traj) > idx
-        ]
-        if not vals:
-            continue
-        arr = np.asarray(vals, dtype=np.float64)
-        timestamps.append(_ensure_utc(ensemble.hourly_timestamps_utc[idx]))
+    for h_idx in range(len(timestamps)):
+        arr = np.asarray([traj[h_idx] for traj in cal_trajectories], dtype=np.float64)
         p10.append(round(to_event_unit(float(np.percentile(arr, 10)), event.unit), 2))
         p50.append(round(to_event_unit(float(np.percentile(arr, 50)), event.unit), 2))
         p90.append(round(to_event_unit(float(np.percentile(arr, 90)), event.unit), 2))
+
+    adjusted_p10: list[float | None] = []
+    adjusted_p50: list[float | None] = []
+    adjusted_p90: list[float | None] = []
+    intraday_residual_c: float | None = None
+    if day_metars:
+        latest_m = day_metars[-1]
+        latest_obs_utc = _ensure_utc(latest_m.observed_at_utc)
+        latest_temp_c = EnsembleProbabilityEngine.obs_settlement_temp_c(
+            latest_m, event.remark_tenths_enabled
+        )
+        shifted_trajs, residual_c, _ = prob_engine.compute_intraday_shifted_trajectories(
+            timestamps,
+            cal_trajectories,
+            latest_obs_utc,
+            latest_temp_c,
+        )
+        intraday_residual_c = round(residual_c, 3)
+        # Include the hour at/immediately preceding latest_obs_utc so the pale curve anchors smoothly at NOW/METAR
+        first_active = next(
+            (i for i, ts in enumerate(timestamps) if ts >= latest_obs_utc),
+            len(timestamps) - 1,
+        )
+        anchor_idx = max(0, first_active - 1) if first_active > 0 and timestamps[first_active] > latest_obs_utc else first_active
+        for h_idx in range(len(timestamps)):
+            if h_idx < anchor_idx:
+                adjusted_p10.append(None)
+                adjusted_p50.append(None)
+                adjusted_p90.append(None)
+            else:
+                arr = np.asarray([traj[h_idx] for traj in shifted_trajs], dtype=np.float64)
+                adjusted_p10.append(round(to_event_unit(float(np.percentile(arr, 10)), event.unit), 2))
+                adjusted_p50.append(round(to_event_unit(float(np.percentile(arr, 50)), event.unit), 2))
+                adjusted_p90.append(round(to_event_unit(float(np.percentile(arr, 90)), event.unit), 2))
 
     return EnsembleFanSeries(
         timestamps=timestamps,
         p10=p10,
         p50=p50,
         p90=p90,
+        adjusted_p10=adjusted_p10,
+        adjusted_p50=adjusted_p50,
+        adjusted_p90=adjusted_p90,
+        intraday_residual_c=intraday_residual_c,
         metar_points=points,
         unit=event.unit,
     )
@@ -385,8 +495,15 @@ async def _version_filtered_portfolio(
     strategy_manifest: StrategyVersionRecord,
     model_version: str,
     now: datetime,
+    *,
+    positions_override: list[PositionRecord] | None = None,
 ) -> PortfolioSummary:
-    return await store.portfolio_summary(strategy_manifest, model_version, now)
+    return await store.portfolio_summary(
+        strategy_manifest,
+        model_version,
+        now,
+        positions_override=positions_override,
+    )
 
 
 def _make_11_buckets(event_id: str, center_c: int) -> list[Bucket]:
@@ -1045,7 +1162,18 @@ def _build_terminal_views(
         prob_map = {b.bucket_id: b for b in snap.buckets} if snap else {}
         books = books_by_event.get(eid, {})
         station_metars = metars_by_station.get(icao, [])
-        latest_metar = station_metars[-1] if station_metars else None
+        try:
+            ev_tz: Any = ZoneInfo(event.station.timezone)
+        except ZoneInfoNotFoundError:
+            ev_tz = timezone.utc
+        day_station_metars = [
+            m
+            for m in station_metars
+            if m.is_routine
+            and not m.raw_report.strip().upper().startswith("SPECI")
+            and _ensure_utc(m.observed_at_utc).astimezone(ev_tz).date() == event.local_date
+        ]
+        latest_metar = day_station_metars[-1] if day_station_metars else None
 
         ev_orders = [
             o
@@ -1073,8 +1201,23 @@ def _build_terminal_views(
             for o in ev_orders
             if o.status in ("OPEN", "PARTIAL")
         }
+        first_buy_by_bucket: dict[str, datetime] = {}
+        for f in ev_fills:
+            if f.side != "BUY":
+                continue
+            ts = _ensure_utc(f.filled_at_utc)
+            prev = first_buy_by_bucket.get(f.bucket_id)
+            if prev is None or ts < prev:
+                first_buy_by_bucket[f.bucket_id] = ts
+
         open_pos_by_bucket = {
-            p.bucket_id: p
+            p.bucket_id: p.model_copy(
+                update={
+                    "opened_at_utc": p.opened_at_utc
+                    or first_buy_by_bucket.get(p.bucket_id)
+                    or _ensure_utc(p.updated_at_utc)
+                }
+            )
             for p in ev_positions
             if p.status == "OPEN"
         }
@@ -1355,6 +1498,67 @@ async def trigger_replay_run(
     )
 
 
+@router.post("/replay/compare-exit-modes", response_model=CompareExitModesResponse)
+async def trigger_compare_exit_modes(
+    request: Request,
+    body: CompareExitModesRequest | None = Body(default=None),
+) -> CompareExitModesResponse:
+    """Compare Hold-to-Expiry vs Dynamic Early-Exit (Post-Only Sell-to-Crowd) on archived data."""
+    db: Database = request.app.state.db
+    archive_store = get_archive_store(request)
+    req = body or CompareExitModesRequest()
+
+    active_mv = (await db.get_active_model_version()).model_version
+    active_sv = (await db.get_active_strategy_version()).strategy_version
+    target_mv = req.model_version or active_mv
+    target_sv = req.strategy_version or active_sv
+
+    events = await db.list_weather_events(active_only=False)
+    if req.event_ids is not None:
+        wanted = set(req.event_ids)
+        events = [e for e in events if e.event_id in wanted]
+
+    provider = get_mos_provider(request)
+    mos_model = (
+        provider.mos_model
+        if provider.mos_model is not None and provider.mos_model.model_version == target_mv
+        else None
+    )
+
+    dataset_start_utc = req.dataset_start_utc
+    dataset_end_utc = req.dataset_end_utc
+    if dataset_start_utc is None and req.lookback_hours is not None:
+        app_clock: Clock = getattr(request.app.state, "clock", None) or SystemClock()
+        resolved_end = (
+            ensure_utc(dataset_end_utc)
+            if dataset_end_utc is not None
+            else ensure_utc(app_clock.now())
+        )
+        dataset_end_utc = resolved_end
+        dataset_start_utc = resolved_end - timedelta(hours=req.lookback_hours)
+
+    try:
+        comparison = await compare_exit_modes(
+            db=db,
+            archive_store=archive_store,
+            model_version=target_mv,
+            strategy_version=target_sv,
+            dataset_start_utc=dataset_start_utc,
+            dataset_end_utc=dataset_end_utc,
+            events=events,
+            mos_model=mos_model,
+            enable_buy_no=req.enable_buy_no,
+            take_profit_min_profit=req.take_profit_min_profit,
+            take_profit_premium=req.take_profit_premium,
+        )
+    except TemporalIntegrityError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return CompareExitModesResponse(comparison=comparison)
+
+
 @router.post("/replay/promote", response_model=PromoteResponse)
 async def promote_experiment_pair(
     request: Request,
@@ -1596,14 +1800,6 @@ async def get_terminal_snapshot(
     strat_map = {s.strategy_version: s for s in strategy_versions}
     selected_strat = strat_map.get(selected_sv, active_sv)
 
-    portfolio = await _version_filtered_portfolio(
-        db=db,
-        store=store,
-        strategy_manifest=selected_strat,
-        model_version=selected_mv,
-        now=now,
-    )
-
     stream = get_clob_stream(request)
     stream.register_events(events)
     archive_store = get_archive_store(request)
@@ -1671,8 +1867,60 @@ async def get_terminal_snapshot(
             if match is not None:
                 ensembles_by_event[event.event_id] = match
 
-    fills = await store.list_fills(limit=500)
-    positions = await store.list_positions()
+    fills = await store.list_fills(limit=2000)
+    raw_positions = await store.list_positions()
+    positions: list[PositionRecord] = []
+    for pos in raw_positions:
+        if pos.status != "OPEN":
+            positions.append(pos)
+            continue
+        snap = probs_by_event.get(pos.event_id)
+        if snap is None:
+            snap = await get_latest_event_probability_snapshot(db, pos.event_id, pos.model_version)
+            if snap is not None:
+                probs_by_event[pos.event_id] = snap
+        prob_rec = (
+            next((b for b in snap.buckets if b.bucket_id == pos.bucket_id), None)
+            if snap is not None
+            else None
+        )
+        is_impossible = bool(prob_rec is not None and prob_rec.is_impossible)
+        book = books_by_event.get(pos.event_id, {}).get(pos.bucket_id)
+        if is_impossible or book is not None:
+            if pos.outcome_side == "NO":
+                no_book = derive_no_book(book) if book is not None else None
+                eff_bid = (
+                    (no_book.best_bid if (no_book is not None and no_book.best_bid and no_book.best_bid > 0) else 1.0)
+                    if is_impossible
+                    else (no_book.best_bid if no_book is not None else None)
+                )
+                mark_price, upnl = calculate_liquidation_mark_and_upnl(
+                    shares=pos.shares,
+                    cost_basis_usd=pos.cost_basis_usd,
+                    best_bid=eff_bid,
+                    is_impossible=False,
+                )
+            else:
+                mark_price, upnl = calculate_liquidation_mark_and_upnl(
+                    shares=pos.shares,
+                    cost_basis_usd=pos.cost_basis_usd,
+                    best_bid=None if is_impossible else (book.best_bid if book is not None else None),
+                    is_impossible=is_impossible,
+                )
+            positions.append(
+                pos.model_copy(update={"mark_price": mark_price, "unrealized_pnl_usd": upnl})
+            )
+        else:
+            positions.append(pos)
+
+    portfolio = await _version_filtered_portfolio(
+        db=db,
+        store=store,
+        strategy_manifest=selected_strat,
+        model_version=selected_mv,
+        now=now,
+        positions_override=positions,
+    )
     raw_audit = await store.list_audit(limit=300)
     audit_items = [
         TerminalAuditItem(
@@ -1706,6 +1954,54 @@ async def get_terminal_snapshot(
         audit_items=audit_items,
     )
 
+    all_events_by_id = {
+        e.event_id: e for e in await db.list_weather_events(active_only=False)
+    }
+    buy_stats_by_bucket: dict[tuple[str, str], tuple[float, float]] = {}
+    for f in fills:
+        if f.side == "BUY" and f.model_version == selected_mv and f.strategy_version == selected_sv:
+            key = (f.event_id, f.bucket_id)
+            prev_sh, prev_usd = buy_stats_by_bucket.get(key, (0.0, 0.0))
+            buy_stats_by_bucket[key] = (prev_sh + f.fill_shares, prev_usd + f.fill_usd)
+
+    closed_positions: list[ClosedPositionItem] = []
+    for p in positions:
+        if (
+            p.status not in ("CLOSED", "SETTLED")
+            or p.model_version != selected_mv
+            or p.strategy_version != selected_sv
+        ):
+            continue
+        ev = all_events_by_id.get(p.event_id)
+        station_meta = ev.station if ev is not None else get_station(p.station_icao)
+        city_name = station_meta.city if station_meta is not None else p.station_icao
+        traded_sh, stake_usd = buy_stats_by_bucket.get((p.event_id, p.bucket_id), (0.0, 0.0))
+        if traded_sh <= 1e-9 and abs(p.mark_price - p.avg_entry_price) > 1e-6:
+            est_sh = abs(p.realized_pnl_usd / (p.mark_price - p.avg_entry_price))
+            traded_sh = round(est_sh, 2)
+            stake_usd = round(est_sh * p.avg_entry_price, 4)
+        closed_positions.append(
+            ClosedPositionItem(
+                position_id=p.position_id,
+                event_id=p.event_id,
+                station_icao=p.station_icao,
+                city=city_name,
+                local_date=ev.local_date if ev is not None else None,
+                bucket_id=p.bucket_id,
+                bucket_label=p.bucket_label,
+                entry_price=round(p.avg_entry_price, 4),
+                exit_price=round(p.mark_price, 4),
+                traded_shares=round(traded_sh, 2),
+                stake_usd=round(stake_usd, 2),
+                realized_pnl_usd=round(p.realized_pnl_usd, 4),
+                status=p.status,
+                model_version=p.model_version,
+                strategy_version=p.strategy_version,
+                closed_at_utc=_ensure_utc(p.updated_at_utc),
+            )
+        )
+    closed_positions.sort(key=lambda item: item.closed_at_utc, reverse=True)
+
     return TerminalSnapshotResponse(
         is_demo=False,
         server_time_utc=now,
@@ -1714,6 +2010,7 @@ async def get_terminal_snapshot(
         strategy_versions=strategy_versions,
         screener=screener,
         xrays=xrays,
+        closed_positions=closed_positions,
         experiment_runs=runs,
         quarantined_events=await db.list_quarantined_events(),
     )

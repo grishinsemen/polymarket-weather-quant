@@ -351,6 +351,34 @@ class TelegramRadarBot:
         )
         return await self._dispatch_once(key, text)
 
+    async def notify_stale_feed(
+        self,
+        *,
+        stale_count: int,
+        total_count: int,
+        dead_seconds: float,
+        last_error: str | None = None,
+        now_utc: datetime | None = None,
+    ) -> bool:
+        """Alert operator when the CLOB orderbook feed stays degraded past the alert threshold."""
+        if not self.enabled or stale_count <= 0:
+            return False
+        if now_utc is None:
+            ref_now = datetime.now(timezone.utc)
+        elif now_utc.tzinfo is None:
+            ref_now = now_utc.replace(tzinfo=timezone.utc)
+        else:
+            ref_now = now_utc.astimezone(timezone.utc)
+        bucket_5m = int(ref_now.timestamp() // 300)
+        key: DedupKey = ("CLOB_FEED", "*", "runtime", f"STALE_FEED:{bucket_5m}")
+        lines = [
+            f"ALERT | CLOB STALE_FEED ({stale_count}/{total_count} books stale)",
+            f"Feed degraded for {int(dead_seconds)}s despite REST fallback; WS reconnect triggered.",
+        ]
+        if last_error:
+            lines.append(f"Last WS error: {last_error}")
+        return await self._dispatch_once(key, "\n".join(lines))
+
     async def send_daily_digest(
         self,
         summary: PortfolioSummary,

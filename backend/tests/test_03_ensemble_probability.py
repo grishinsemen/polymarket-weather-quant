@@ -607,5 +607,217 @@ def test_fastapi_probability_routes_recompute_and_serve_persisted_snapshots() ->
         assert missing_resp.status_code == 404
 
 
+def test_emos_walk_forward_calibration_lifts_p10_p90_coverage_toward_80_pct_and_improves_scores() -> None:
+    import numpy as np
+    from weather_quant.probability.calibration import (
+        CalibrationDaySample,
+        evaluate_calibration_walk_forward,
+    )
+
+    station = get_station("LTAC")
+    assert station is not None
+    rng = np.random.default_rng(42)
+
+    # Simulate 40 days of an overconfident, cold-biased station (raw std=0.45C, true error=+1.6C +- 1.2C)
+    samples: list[CalibrationDaySample] = []
+    start_day = date(2026, 10, 1)
+    for d_idx in range(40):
+        day = start_day + timedelta(days=d_idx)
+        base_peak = 10.0 + 0.1 * d_idx
+        timestamps = [
+            datetime(day.year, day.month, day.day, h, 0, tzinfo=timezone.utc)
+            for h in range(24)
+        ]
+        # Narrow raw ensemble around base_peak (std ~ 0.45C)
+        member_offsets = np.linspace(-0.78, 0.78, 60)
+        trajectories = [
+            [
+                round(base_peak - 4.0 + 4.0 * max(0.0, 1.0 - abs(h - 14) / 7.0) + float(off), 3)
+                for h in range(24)
+            ]
+            for off in member_offsets
+        ]
+        ens = EnsembleSnapshot(
+            event_id=f"cal-ltac-{day.isoformat()}",
+            station_icao="LTAC",
+            fetched_at_utc=datetime(day.year, day.month, day.day, 0, 0, tzinfo=timezone.utc) - timedelta(hours=3),
+            ingested_at_utc=datetime(day.year, day.month, day.day, 0, 0, tzinfo=timezone.utc) - timedelta(hours=3),
+            models=["ecmwf_ifs025", "gfs_seamless", "icon_seamless"],
+            member_count=60,
+            hourly_timestamps_utc=timestamps,
+            member_temps_c=trajectories,
+        )
+        # Actual station extreme has +1.6C warm bias and 1.1C true spread
+        actual_c = float(base_peak + 1.6 + rng.normal(0.0, 1.1))
+        samples.append(
+            CalibrationDaySample(
+                station=station,
+                local_date=day,
+                polarity=Polarity.HIGHEST,
+                remark_tenths_enabled=True,
+                ensemble=ens,
+                actual_extreme_c=actual_c,
+                observed_at_utc=datetime(day.year, day.month, day.day, 15, 0, tzinfo=timezone.utc),
+            )
+        )
+
+    report = evaluate_calibration_walk_forward(samples)
+    assert len(report.stations) == 1
+    st = report.stations[0]
+    assert st.station_icao == "LTAC"
+    assert st.sample_count == 40
+    # Uncalibrated raw ensemble is severely overconfident & cold-biased (< 40% P10-P90 coverage)
+    assert st.raw.coverage_p10_p90 < 0.40
+    # Walk-forward EMOS learns positive bias & spread inflation, pushing P10-P90 coverage near ~80%
+    assert st.learned_bias_c > 1.0
+    assert st.learned_spread_scale > 1.5
+    assert st.calibrated.coverage_p10_p90 >= 0.65
+    assert st.calibrated.brier_score < st.raw.brier_score
+    assert st.calibrated.log_loss < st.raw.log_loss
+
+
+def test_intraday_residual_shift_raises_upper_bucket_probs_before_breakout_and_builds_fan_curve() -> None:
+    from weather_quant.api.routes_replay import _build_ensemble_fan
+
+    event = _make_rksi_event(local_date=date(2026, 11, 26), polarity=Polarity.HIGHEST, remark_tenths=True)
+    # 2026-11-26 01:30 UTC == 10:30 KST (hours before the 14:00 KST afternoon peak)
+    decision_time = datetime(2026, 11, 26, 1, 30, tzinfo=timezone.utc)
+    clock = VirtualClock(decision_time)
+
+    timestamps = [
+        datetime(2026, 11, 25, 15, 0, tzinfo=timezone.utc) + timedelta(hours=h)
+        for h in range(24)
+    ]
+    # Model P50 at 10:00 KST (01:00 UTC) is ~9.5C, afternoon peak at 14:00 KST is ~12.0C
+    trajectories: list[list[float]] = []
+    for m in range(60):
+        off = ((m - 29.5) / 30.0) * 0.7
+        row: list[float] = []
+        for ts in timestamps:
+            kst_hour = (ts.hour + 9) % 24
+            diurnal = 8.0 + 4.0 * max(0.0, 1.0 - abs(kst_hour - 14) / 6.5)
+            row.append(round(diurnal + off, 3))
+        trajectories.append(row)
+
+    ensemble = EnsembleSnapshot(
+        event_id=event.event_id,
+        station_icao="RKSI",
+        fetched_at_utc=decision_time - timedelta(hours=5),
+        ingested_at_utc=decision_time - timedelta(hours=5),
+        models=["ecmwf_ifs025", "gfs_seamless", "icon_seamless"],
+        member_count=60,
+        hourly_timestamps_utc=timestamps,
+        member_temps_c=trajectories,
+    )
+
+    # Routine METAR at 10:00 KST (01:00 UTC) reads 11.4C (+1.9C warmer than model's ~9.5C, still below 12C peak!)
+    warm_morning_obs = _make_metar(
+        "RKSI", datetime(2026, 11, 26, 1, 0, tzinfo=timezone.utc), 11.4, 11, is_routine=True
+    )
+    engine = EnsembleProbabilityEngine()
+    snap_base = engine.compute_probabilities(
+        station=event.station, event=event, ensemble=ensemble, intraday_metars=[], clock=clock
+    )
+    snap_shifted = engine.compute_probabilities(
+        station=event.station,
+        event=event,
+        ensemble=ensemble,
+        intraday_metars=[warm_morning_obs],
+        clock=clock,
+    )
+
+    base_by_id = {b.bucket_id: b for b in snap_base.buckets}
+    shifted_by_id = {b.bucket_id: b for b in snap_shifted.buckets}
+    # 12C is NOT yet ZEROED (11.4C < 12C), yet upper buckets (13C + 14C+) shift strongly upward before peak!
+    assert shifted_by_id["b-12"].is_impossible is False
+    upper_base = base_by_id["b-13"].fair_probability + base_by_id["b-14"].fair_probability
+    upper_shifted = shifted_by_id["b-13"].fair_probability + shifted_by_id["b-14"].fair_probability
+    assert upper_shifted > upper_base + 0.15
+
+    # Fan series exposes the paler intraday-adjusted curve shifted upward for remaining hours
+    fan = _build_ensemble_fan(event, ensemble, [warm_morning_obs])
+    assert fan.intraday_residual_c is not None and fan.intraday_residual_c > 1.5
+    assert len(fan.adjusted_p50) == len(fan.p50)
+    # Peak hour (14:00 KST = index 14) shifted P50 is strictly warmer than baseline P50
+    assert fan.adjusted_p50[14] is not None
+    assert fan.adjusted_p50[14] > fan.p50[14] + 0.5
+
+
+def test_daily_bias_excludes_incomplete_current_local_day_for_tomorrow_event() -> None:
+    """For tomorrow's event (Nov 27), partial-day METARs from today (Nov 26) must not corrupt Station Bias."""
+    from weather_quant.domain.models import Station
+    from weather_quant.probability.engine import build_daily_bias_observations_from_history
+
+    station = Station(
+        icao="SAEZ",
+        name="Ministro Pistarini Airport",
+        city="Buenos Aires",
+        country="AR",
+        lat=-34.8222,
+        lon=-58.5358,
+        elevation_m=20.0,
+        timezone="America/Argentina/Buenos_Aires",
+    )
+    # Current time: 2026-11-26 13:00 ART (16:00 UTC) — Nov 26 afternoon peak has NOT occurred yet
+    decision_time = datetime(2026, 11, 26, 16, 0, tzinfo=timezone.utc)
+
+    # Ensemble covering both Nov 25 (completed) and Nov 26 (still in progress)
+    timestamps = [
+        datetime(2026, 11, 25, 3, 0, tzinfo=timezone.utc) + timedelta(hours=h)
+        for h in range(48)
+    ]
+    ens = EnsembleSnapshot(
+        event_id="evt-saez-hist",
+        station_icao="SAEZ",
+        fetched_at_utc=datetime(2026, 11, 24, 18, 0, tzinfo=timezone.utc),
+        ingested_at_utc=datetime(2026, 11, 24, 18, 0, tzinfo=timezone.utc),
+        models=["ecmwf_ifs025"],
+        member_count=10,
+        hourly_timestamps_utc=timestamps,
+        member_temps_c=[[29.0] * 24 + [27.0] * 24 for _ in range(10)],
+    )
+
+    metars = [
+        # Completed Nov 25 (8 routine hourly METARs, daily max 30.0C -> +1.0C warm bias)
+        *[
+            _make_metar(
+                "SAEZ",
+                datetime(2026, 11, 25, 12 + h, 0, tzinfo=timezone.utc),
+                30.0 if h == 5 else 25.0,
+                30 if h == 5 else 25,
+                is_routine=True,
+            )
+            for h in range(8)
+        ],
+        # In-progress Nov 26 (8 cool morning METARs up to 11:00 ART -> max only 20.0C so far)
+        *[
+            _make_metar(
+                "SAEZ",
+                datetime(2026, 11, 26, 6 + h, 0, tzinfo=timezone.utc),
+                20.0 if h == 7 else 14.0,
+                20 if h == 7 else 14,
+                is_routine=True,
+            )
+            for h in range(8)
+        ],
+    ]
+
+    bias_obs = build_daily_bias_observations_from_history(
+        station=station,
+        polarity=Polarity.HIGHEST,
+        remark_tenths_enabled=False,
+        ensembles=[ens],
+        metars=metars,
+        before_local_date=date(2026, 11, 27),
+        window_days=45,
+        decision_time_utc=decision_time,
+    )
+
+    assert [o.local_date for o in bias_obs] == [date(2026, 11, 25)]
+    assert bias_obs[0].observed_extreme_c == pytest.approx(30.0)
+
+
+
+
 
 

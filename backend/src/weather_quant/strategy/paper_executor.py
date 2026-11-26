@@ -23,6 +23,7 @@ from weather_quant.strategy.engine import (
     PHASE_INTRADAY,
     PRE_SETTLEMENT_HORIZON_MINUTES,
     StrategyStore,
+    derive_no_book,
 )
 
 _EPS = 1e-9
@@ -99,11 +100,13 @@ class PaperExecutor:
         clock: Clock,
         store: StrategyStore | None = None,
         clv_horizons_minutes: tuple[int, ...] = DEFAULT_CLV_HORIZONS_MINUTES,
+        min_limit_shares: float = 5.0,
     ) -> None:
         self.db = db
         self.clock = clock
         self.store = store or StrategyStore(db)
         self.clv_horizons_minutes = tuple(clv_horizons_minutes)
+        self.min_limit_shares = float(min_limit_shares)
         self._events: dict[str, WeatherEvent] = {}
         self._latest_books: dict[str, OrderBookSnapshot] = {}
         self._books_by_bucket: dict[tuple[str, str], OrderBookSnapshot] = {}
@@ -123,14 +126,45 @@ class PaperExecutor:
         return bucket_id
 
     def _book_for_order(self, order: MakerOrder) -> OrderBookSnapshot | None:
-        return self._latest_books.get(order.token_id) or self._books_by_bucket.get(
-            (order.event_id, order.bucket_id)
-        )
+        direct = self._latest_books.get(order.token_id)
+        if direct is not None:
+            return direct
+        yes_book = self._books_by_bucket.get((order.event_id, order.bucket_id))
+        if yes_book is None:
+            return None
+        if order.outcome_side == "NO":
+            return derive_no_book(yes_book, no_token_id=order.token_id)
+        return yes_book
 
     async def place_order(self, order: MakerOrder) -> MakerOrder:
         """Submit a passive Post-Only Maker Order (or taker order if ``post_only=False``)."""
         now = self.clock.now()
         book = self._book_for_order(order)
+        tick = (
+            book.tick_size
+            if (book is not None and book.tick_size is not None and 0.0 < book.tick_size < 0.5)
+            else None
+        )
+        if (
+            not math.isfinite(order.limit_price)
+            or order.limit_price <= 0.0
+            or order.limit_price >= 1.0
+            or (
+                order.post_only
+                and order.size_shares < self.min_limit_shares - _EPS
+            )
+            or (
+                tick is not None
+                and (
+                    order.limit_price < tick - _EPS
+                    or order.limit_price > (1.0 - tick) + _EPS
+                )
+            )
+        ):
+            rejected = order.model_copy(update={"status": "CANCELLED", "updated_at_utc": now})
+            await self.store.insert_order(rejected)
+            return rejected
+
         if order.post_only and book is not None and not book.is_stale and _would_cross(order, book):
             rejected = order.model_copy(update={"status": "CANCELLED", "updated_at_utc": now})
             await self.store.insert_order(rejected)
@@ -162,14 +196,21 @@ class PaperExecutor:
         strategy_version: str,
         limit_price: float = 0.01,
         phase: Literal["PREMARKET_ENTRY", "INTRADAY_REPRICING"] = PHASE_INTRADAY,
+        outcome_side: Literal["YES", "NO"] = "YES",
     ) -> tuple[MakerOrder, list[FillRecord]]:
         """Execute an immediate taker SELL exit against live bids, applying ``weather_fees``."""
+        if not math.isfinite(limit_price) or limit_price <= 0.0 or limit_price >= 1.0:
+            raise ValueError(f"Invalid taker exit limit_price: {limit_price}")
         self.register_event(event)
         self._latest_books[book.token_id] = book
-        self._books_by_bucket[(book.event_id, book.bucket_id)] = book
+        if outcome_side == "YES":
+            self._books_by_bucket[(book.event_id, book.bucket_id)] = book
         now = self.clock.now()
         bucket = next((b for b in event.buckets if b.bucket_id == bucket_id), None)
-        token_id = bucket.token_id if bucket is not None else book.token_id
+        if outcome_side == "NO":
+            token_id = (bucket.no_token_id if bucket is not None and bucket.no_token_id else book.token_id)
+        else:
+            token_id = bucket.token_id if bucket is not None else book.token_id
         order = MakerOrder(
             order_id=f"ord-{uuid.uuid4().hex[:12]}",
             event_id=event.event_id,
@@ -177,6 +218,7 @@ class PaperExecutor:
             bucket_id=bucket_id,
             token_id=token_id,
             side="SELL",
+            outcome_side=outcome_side,
             limit_price=limit_price,
             size_shares=shares,
             size_usd=round(shares * (book.best_bid or limit_price), 6),
@@ -276,7 +318,12 @@ class PaperExecutor:
         created_fills: list[FillRecord] = []
 
         for order in orders:
-            sig = _snapshot_signature(book, order.side)
+            eff_book = (
+                derive_no_book(book, no_token_id=order.token_id)
+                if order.outcome_side == "NO" and book.token_id != order.token_id
+                else book
+            )
+            sig = _snapshot_signature(eff_book, order.side)
             if self._last_consumed_sig.get(order.order_id) == sig:
                 continue
             self._last_consumed_sig[order.order_id] = sig
@@ -286,14 +333,14 @@ class PaperExecutor:
             if remaining <= _EPS:
                 continue
 
-            levels = _opposing_levels(order, book)
+            levels = _opposing_levels(order, eff_book)
             if not levels:
                 continue
 
             matched = 0.0
             matched_notional = 0.0
             for lvl in levels:
-                key = (order.side, lvl.price)
+                key = (order.outcome_side, order.side, lvl.price)
                 already_used = consumed_by_level.get(key, 0.0)
                 avail = max(0.0, lvl.size - already_used)
                 if avail <= _EPS:
@@ -331,11 +378,13 @@ class PaperExecutor:
                 station_icao=order.station_icao,
                 bucket_id=order.bucket_id,
                 side=order.side,
+                outcome_side=order.outcome_side,
                 fill_price=fill_price,
                 fill_shares=fill_shares,
                 fill_usd=round(fill_price * fill_shares, 6),
                 fee_usd=fee_usd,
                 is_maker=is_maker,
+                expected_edge=order.expected_edge,
                 model_version=order.model_version,
                 strategy_version=order.strategy_version,
                 filled_at_utc=now,
@@ -371,8 +420,13 @@ class PaperExecutor:
         if midpoint is None:
             return []
         captured: list[ClvSnapshot] = []
+        event = self._events.get(book.event_id)
+        is_yes_book = not book.token_id.endswith(":NO") and (
+            event is None or not any(b.no_token_id == book.token_id for b in event.buckets)
+        )
         for fill in fills:
             filled_utc = _ensure_utc(fill.filled_at_utc)
+            eff_mid = round(1.0 - midpoint, 6) if (fill.outcome_side == "NO" and is_yes_book) else midpoint
             for horizon in self.clv_horizons_minutes:
                 cache_key = (fill.fill_id, horizon)
                 if cache_key in self._captured_clv_keys:
@@ -384,9 +438,10 @@ class PaperExecutor:
                     fill_id=fill.fill_id,
                     event_id=fill.event_id,
                     bucket_id=fill.bucket_id,
+                    outcome_side=fill.outcome_side,
                     entry_price=fill.fill_price,
-                    benchmark_midpoint=midpoint,
-                    clv=round(midpoint - fill.fill_price, 6),
+                    benchmark_midpoint=eff_mid,
+                    clv=round(eff_mid - fill.fill_price, 6),
                     horizon_minutes=horizon,
                     model_version=fill.model_version,
                     strategy_version=fill.strategy_version,
@@ -416,14 +471,16 @@ class PaperExecutor:
             midpoint = _book_midpoint(book)
             if midpoint is None:
                 continue
+            eff_mid = round(1.0 - midpoint, 6) if fill.outcome_side == "NO" else midpoint
             snap = ClvSnapshot(
                 clv_id=f"clv-{fill.fill_id}-pre",
                 fill_id=fill.fill_id,
                 event_id=fill.event_id,
                 bucket_id=fill.bucket_id,
+                outcome_side=fill.outcome_side,
                 entry_price=fill.fill_price,
-                benchmark_midpoint=midpoint,
-                clv=round(midpoint - fill.fill_price, 6),
+                benchmark_midpoint=eff_mid,
+                clv=round(eff_mid - fill.fill_price, 6),
                 horizon_minutes=PRE_SETTLEMENT_HORIZON_MINUTES,
                 model_version=fill.model_version,
                 strategy_version=fill.strategy_version,

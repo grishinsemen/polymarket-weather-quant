@@ -59,12 +59,14 @@ export interface MakerOrder {
   bucket_id: string;
   token_id: string;
   side: "BUY" | "SELL";
+  outcome_side?: "YES" | "NO";
   limit_price: number;
   size_shares: number;
   size_usd: number;
   post_only: boolean;
   phase: "PREMARKET_ENTRY" | "INTRADAY_REPRICING";
   status: "OPEN" | "FILLED" | "PARTIAL" | "CANCELLED" | "EXPIRED";
+  expected_edge?: number | null;
   model_version: string;
   strategy_version: string;
   created_at_utc: string;
@@ -78,11 +80,14 @@ export interface FillRecord {
   station_icao: string;
   bucket_id: string;
   side: "BUY" | "SELL";
+  outcome_side?: "YES" | "NO";
   fill_price: number;
   fill_shares: number;
   fill_usd: number;
   fee_usd: number;
   is_maker: boolean;
+  expected_edge?: number | null;
+  realized_edge?: number | null;
   model_version: string;
   strategy_version: string;
   filled_at_utc: string;
@@ -94,15 +99,19 @@ export interface PositionRecord {
   station_icao: string;
   bucket_id: string;
   bucket_label: string;
+  outcome_side?: "YES" | "NO";
   shares: number;
   avg_entry_price: number;
   cost_basis_usd: number;
   mark_price: number;
   unrealized_pnl_usd: number;
   realized_pnl_usd: number;
+  expected_edge?: number | null;
+  realized_edge?: number | null;
   status: "OPEN" | "CLOSED" | "SETTLED";
   model_version: string;
   strategy_version: string;
+  opened_at_utc?: string | null;
   updated_at_utc: string;
 }
 
@@ -130,6 +139,10 @@ export interface EnsembleFanSeries {
   p10: number[];
   p50: number[];
   p90: number[];
+  adjusted_p10?: (number | null)[];
+  adjusted_p50?: (number | null)[];
+  adjusted_p90?: (number | null)[];
+  intraday_residual_c?: number | null;
   metar_points: MetarChartPoint[];
   unit: "C" | "F";
 }
@@ -222,6 +235,25 @@ export interface ReplayProgressStatus {
   elapsed_seconds: number;
 }
 
+export interface ClosedPositionItem {
+  position_id: string;
+  event_id: string;
+  station_icao: string;
+  city: string;
+  local_date: string | null;
+  bucket_id: string;
+  bucket_label: string;
+  entry_price: number;
+  exit_price: number;
+  traded_shares: number;
+  stake_usd: number;
+  realized_pnl_usd: number;
+  status: "CLOSED" | "SETTLED";
+  model_version: string;
+  strategy_version: string;
+  closed_at_utc: string;
+}
+
 export interface TerminalSnapshotResponse {
   status: string;
   is_demo: boolean;
@@ -231,6 +263,7 @@ export interface TerminalSnapshotResponse {
   strategy_versions: StrategyVersionRecord[];
   screener: ScreenerRow[];
   xrays: Record<string, CityXRay>;
+  closed_positions?: ClosedPositionItem[];
   experiment_runs: ExperimentRunSummary[];
   quarantined_events: QuarantinedEvent[];
 }

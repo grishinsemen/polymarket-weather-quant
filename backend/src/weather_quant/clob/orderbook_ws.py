@@ -115,6 +115,7 @@ class _BookState:
     token_id: str
     bids: dict[float, float] = field(default_factory=dict)
     asks: dict[float, float] = field(default_factory=dict)
+    tick_size: float | None = None
     updated_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_snapshot(self, *, is_stale: bool) -> OrderBookSnapshot:
@@ -150,6 +151,7 @@ class _BookState:
             best_ask=best_ask,
             midpoint=midpoint,
             spread=spread,
+            tick_size=self.tick_size,
             ingested_at_utc=self.updated_at_utc,
             is_stale=is_stale,
         )
@@ -184,6 +186,7 @@ class ClobOrderBookStream:
         stale_threshold_seconds: float = 30.0,
         ping_interval_seconds: float = 10.0,
         reconnect_delay_seconds: float = 1.0,
+        max_reconnect_delay_seconds: float = 30.0,
         on_snapshot: SnapshotCallback | None = None,
     ) -> None:
         self.ws_url = ws_url
@@ -193,6 +196,7 @@ class ClobOrderBookStream:
         self.stale_threshold_seconds = stale_threshold_seconds
         self.ping_interval_seconds = ping_interval_seconds
         self.reconnect_delay_seconds = reconnect_delay_seconds
+        self.max_reconnect_delay_seconds = max_reconnect_delay_seconds
         self._on_snapshot = on_snapshot
 
         self._token_meta: dict[str, tuple[str, str]] = {}
@@ -200,9 +204,12 @@ class ClobOrderBookStream:
         self._books: dict[str, _BookState] = {}
         self._subscribed_tokens: set[str] = set()
         self._subscription_changed = asyncio.Event()
+        self._reconnect_requested = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self.reconnect_count: int = 0
+        self.consecutive_ws_failures: int = 0
+        self.last_ws_message_at_utc: datetime | None = None
         self.last_error: str | None = None
 
     def register_event(self, event: WeatherEvent) -> None:
@@ -247,6 +254,48 @@ class ClobOrderBookStream:
         )
         age = (ref_now - _ensure_utc(book.updated_at_utc)).total_seconds()
         return age > threshold
+
+    def stale_token_ids(
+        self,
+        token_ids: list[str] | None = None,
+        *,
+        now: datetime | None = None,
+        stale_threshold_seconds: float | None = None,
+    ) -> list[str]:
+        """Return token IDs whose book is missing or older than the stale threshold."""
+        targets = self.active_token_ids() if token_ids is None else list(dict.fromkeys(token_ids))
+        return [
+            tid
+            for tid in targets
+            if self.is_stale(tid, now=now, stale_threshold_seconds=stale_threshold_seconds)
+        ]
+
+    def max_staleness_seconds(
+        self,
+        token_ids: list[str] | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> float | None:
+        """Return the largest book age in seconds across *token_ids* (None if no books exist)."""
+        targets = self.active_token_ids() if token_ids is None else list(dict.fromkeys(token_ids))
+        ref_now = _ensure_utc(now) if now is not None else _ensure_utc(self.clock.now())
+        ages: list[float] = []
+        for tid in targets:
+            book = self._books.get(tid)
+            if book is not None:
+                ages.append(max(0.0, (ref_now - _ensure_utc(book.updated_at_utc)).total_seconds()))
+        return max(ages) if ages else None
+
+    def request_reconnect(self) -> None:
+        """Signal the active WebSocket session to disconnect and reconnect cleanly."""
+        self._reconnect_requested.set()
+
+    def next_reconnect_delay(self, consecutive_failures: int) -> float:
+        """Compute bounded exponential backoff delay for repeated WS reconnect failures."""
+        if self.reconnect_delay_seconds <= 0:
+            return 0.0
+        exponent = max(0, consecutive_failures - 1)
+        return float(min(self.max_reconnect_delay_seconds, self.reconnect_delay_seconds * (2**exponent)))
 
     def get_snapshot(
         self,
@@ -426,6 +475,19 @@ class ClobOrderBookStream:
                 if token_id in self._books:
                     self._books[token_id].updated_at_utc = now_utc
                     updated_tokens[token_id] = self._books[token_id].to_snapshot(is_stale=False)
+            elif event_type == "tick_size_change":
+                token_id = str(msg.get("asset_id") or "")
+                raw_tick = msg.get("new_tick_size") or msg.get("tick_size")
+                if token_id and raw_tick is not None:
+                    try:
+                        parsed_tick = float(raw_tick)
+                    except (TypeError, ValueError):
+                        parsed_tick = 0.0
+                    if 0.0 < parsed_tick < 0.5:
+                        book = self._get_or_create_book(token_id, msg)
+                        book.tick_size = parsed_tick
+                        book.updated_at_utc = now_utc
+                        updated_tokens[token_id] = book.to_snapshot(is_stale=False)
 
         return list(updated_tokens.values())
 
@@ -468,6 +530,14 @@ class ClobOrderBookStream:
             parsed = _parse_level(raw_lvl)
             if parsed is not None and parsed[1] > 0:
                 book.asks[parsed[0]] = parsed[1]
+        raw_tick = msg.get("tick_size") or msg.get("minimum_tick_size")
+        if raw_tick is not None:
+            try:
+                parsed_tick = float(raw_tick)
+            except (TypeError, ValueError):
+                parsed_tick = 0.0
+            if 0.0 < parsed_tick < 0.5:
+                book.tick_size = parsed_tick
         book.updated_at_utc = now_utc
         return book.to_snapshot(is_stale=False)
 
@@ -515,20 +585,39 @@ class ClobOrderBookStream:
         book.updated_at_utc = now_utc
         return book.to_snapshot(is_stale=False)
 
-    async def resync_snapshots(self) -> list[OrderBookSnapshot]:
+    async def resync_snapshots(
+        self, token_ids: list[str] | None = None
+    ) -> list[OrderBookSnapshot]:
         """Optionally invoke external snapshot resync function (e.g. REST /books)."""
         if self._resync_books_fn is None:
             return []
-        token_ids = self.active_token_ids()
-        if not token_ids:
+        targets = self.active_token_ids() if token_ids is None else list(dict.fromkeys(token_ids))
+        if not targets:
             return []
-        raw_books = await self._resync_books_fn(token_ids)
+        raw_books = await self._resync_books_fn(targets)
         snapshots: list[OrderBookSnapshot] = []
         for payload in raw_books:
             if "event_type" not in payload:
                 payload = {"event_type": "book", **payload}
             snapshots.extend(await self.process_raw_message(payload))
         return snapshots
+
+    async def ensure_fresh_snapshots(
+        self,
+        token_ids: list[str] | None = None,
+        *,
+        now: datetime | None = None,
+        stale_threshold_seconds: float | None = None,
+    ) -> list[OrderBookSnapshot]:
+        """Force a targeted REST /books fallback whenever any watched tokens are missing or stale."""
+        stale = self.stale_token_ids(
+            token_ids,
+            now=now,
+            stale_threshold_seconds=stale_threshold_seconds,
+        )
+        if not stale:
+            return []
+        return await self.resync_snapshots(token_ids=stale)
 
     async def _send_subscribe(self, ws: WsConnection) -> None:
         self._subscription_changed.clear()
@@ -553,19 +642,21 @@ class ClobOrderBookStream:
 
     async def _consume_ws(self, ws: WsConnection) -> None:
         self._subscribed_tokens.clear()
+        self._reconnect_requested.clear()
         await self._send_subscribe(ws)
         session_done = asyncio.Event()
         ping_task = asyncio.create_task(self._ping_loop(ws, session_done))
         try:
-            while not self._stop_event.is_set():
+            while not self._stop_event.is_set() and not self._reconnect_requested.is_set():
                 recv_task = asyncio.create_task(ws.recv())
                 sub_task = asyncio.create_task(self._subscription_changed.wait())
+                reconn_task = asyncio.create_task(self._reconnect_requested.wait())
                 done, _ = await asyncio.wait(
-                    {recv_task, ping_task, sub_task},
+                    {recv_task, ping_task, sub_task, reconn_task},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if ping_task in done:
-                    for pending in (recv_task, sub_task):
+                    for pending in (recv_task, sub_task, reconn_task):
                         if not pending.done():
                             pending.cancel()
                         try:
@@ -575,20 +666,32 @@ class ClobOrderBookStream:
                     # Propagate ping error if ping failed
                     ping_task.result()
                     break
+                if reconn_task in done:
+                    for pending in (recv_task, sub_task):
+                        if not pending.done():
+                            pending.cancel()
+                        try:
+                            await pending
+                        except BaseException:
+                            pass
+                    break
                 if recv_task in done:
-                    if not sub_task.done():
-                        sub_task.cancel()
-                    try:
-                        await sub_task
-                    except BaseException:
-                        pass
+                    for pending in (sub_task, reconn_task):
+                        if not pending.done():
+                            pending.cancel()
+                        try:
+                            await pending
+                        except BaseException:
+                            pass
                     raw_msg = recv_task.result()
+                    self.last_ws_message_at_utc = _ensure_utc(self.clock.now())
                     await self.process_raw_message(raw_msg)
                 if sub_task in done:
-                    if not recv_task.done():
-                        recv_task.cancel()
+                    for pending in (recv_task, reconn_task):
+                        if not pending.done():
+                            pending.cancel()
                         try:
-                            await recv_task
+                            await pending
                         except BaseException:
                             pass
                     if not self._stop_event.is_set():
@@ -634,21 +737,24 @@ class ClobOrderBookStream:
                     await self.resync_snapshots()
                 await self.run_session_once()
                 self.last_error = None
+                self.consecutive_ws_failures = 0
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.last_error = str(exc)
+                self.consecutive_ws_failures += 1
                 logger.warning("CLOB WS session ended with error (%s); reconnecting", exc)
 
             if self._stop_event.is_set():
                 break
             if max_sessions is not None and sessions >= max_sessions:
                 break
-            if self.reconnect_delay_seconds > 0:
+            delay = self.next_reconnect_delay(max(1, self.consecutive_ws_failures))
+            if delay > 0:
                 try:
                     await asyncio.wait_for(
                         self._stop_event.wait(),
-                        timeout=self.reconnect_delay_seconds,
+                        timeout=delay,
                     )
                 except asyncio.TimeoutError:
                     pass

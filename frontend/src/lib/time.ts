@@ -99,6 +99,41 @@ const SHORT_MONTHS = [
 ];
 
 /**
+ * Format an ISO timestamp or Date as YYYY-MM-DD in the given IANA timezone.
+ */
+export function formatIsoDateInZone(isoOrDate: string | Date, timeZone: string): string {
+  const date = typeof isoOrDate === "string" ? new Date(isoOrDate) : isoOrDate;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const lookup = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  return `${lookup.year}-${lookup.month}-${lookup.day}`;
+}
+
+/**
+ * Format an ISO timestamp or Date as compact "Nov 26 07:18" in the given IANA timezone.
+ */
+export function formatShortDateTimeInZone(isoOrDate: string | Date, timeZone: string): string {
+  const date = typeof isoOrDate === "string" ? new Date(isoOrDate) : isoOrDate;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(date);
+  const lookup = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  const monthName = SHORT_MONTHS[Number(lookup.month) - 1] ?? lookup.month;
+  const day = Number(lookup.day);
+  const hour = lookup.hour === "24" ? "00" : lookup.hour;
+  return `${monthName} ${day} ${hour}:${lookup.minute}`;
+}
+
+/**
  * Format an ISO local settlement date (YYYY-MM-DD) with relative day prefix
  * ("Today", "Tomorrow", "+2d", "Yesterday") against the reference clock in the given timezone.
  */

@@ -1,15 +1,30 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
-import { formatHhMmInZone } from "@/lib/time";
+import {
+  formatHhMmInZone,
+  formatIsoDateInZone,
+  formatShortDateTimeInZone,
+} from "@/lib/time";
 import type { EnsembleFanSeries } from "@/types/terminal";
+
+export interface PositionEntryMarker {
+  positionId: string;
+  bucketLabel: string;
+  openedAtUtc: string;
+  entryPrice: number;
+  shares: number;
+  costBasisUsd: number;
+}
 
 interface EnsembleFanChartProps {
   fan: EnsembleFanSeries;
   stationTimezone?: string;
+  eventLocalDate?: string;
   serverTimeUtc?: string;
   nowMs?: number;
   latestMetarTempInUnit?: number | null;
+  positionMarkers?: PositionEntryMarker[];
 }
 
 function clientToSvgCoords(
@@ -42,6 +57,23 @@ function clientToSvgCoords(
   };
 }
 
+function parseBucketTargetTemp(label: string): number | null {
+  const rangeMatch = label.match(/(-?\d+(?:\.\d+)?)\s*[-–]\s*(-?\d+(?:\.\d+)?)/);
+  if (rangeMatch) {
+    const lo = Number(rangeMatch[1]);
+    const hi = Number(rangeMatch[2]);
+    if (Number.isFinite(lo) && Number.isFinite(hi)) {
+      return (lo + hi) / 2;
+    }
+  }
+  const singleMatch = label.match(/-?\d+(?:\.\d+)?/);
+  if (singleMatch) {
+    const val = Number(singleMatch[0]);
+    if (Number.isFinite(val)) return val;
+  }
+  return null;
+}
+
 function interpolateSeriesAt(timesMs: number[], values: number[], targetMs: number): number {
   const n = timesMs.length;
   if (n === 0) return 0;
@@ -63,9 +95,11 @@ function interpolateSeriesAt(timesMs: number[], values: number[], targetMs: numb
 export function EnsembleFanChart({
   fan,
   stationTimezone,
+  eventLocalDate,
   serverTimeUtc,
   nowMs: controlledNowMs,
   latestMetarTempInUnit = null,
+  positionMarkers = [],
 }: EnsembleFanChartProps) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [hoverPoint, setHoverPoint] = useState<{ x: number; y: number } | null>(null);
@@ -109,18 +143,71 @@ export function EnsembleFanChart({
   const maxTime = timesMs[n - 1];
   const spanTime = Math.max(1, maxTime - minTime);
 
-  const currentTemp =
-    fan.metar_points.length > 0
+  // Do not plot today's live NOW/METAR dot on tomorrow's future day (no METAR yet) or expired past days
+  const isFutureChart = nowMs < minTime && fan.metar_points.length === 0;
+  const isPastChart = nowMs > maxTime + 3_600_000;
+  const showNowIndicator = !isFutureChart && !isPastChart;
+
+  const currentTemp = showNowIndicator
+    ? fan.metar_points.length > 0
       ? fan.metar_points[fan.metar_points.length - 1].temp_c
       : latestMetarTempInUnit !== null && latestMetarTempInUnit !== undefined
         ? latestMetarTempInUnit
-        : interpolateSeriesAt(timesMs, fan.p50, nowMs);
+        : interpolateSeriesAt(timesMs, fan.p50, nowMs)
+    : null;
+
+  const adjustedP10 =
+    fan.adjusted_p10 && fan.adjusted_p10.length === n ? fan.adjusted_p10 : null;
+  const adjustedP50 =
+    fan.adjusted_p50 && fan.adjusted_p50.length === n ? fan.adjusted_p50 : null;
+  const adjustedP90 =
+    fan.adjusted_p90 && fan.adjusted_p90.length === n ? fan.adjusted_p90 : null;
+
+  const adjustedVals = [
+    ...(adjustedP10 ?? []),
+    ...(adjustedP50 ?? []),
+    ...(adjustedP90 ?? []),
+  ].filter((v): v is number => v !== null && v !== undefined && Number.isFinite(v));
+
+  const metarTimesMs = fan.metar_points.map((pt) => new Date(pt.observed_at_utc).getTime());
+  const parsedMarkers = positionMarkers
+    .map((marker) => {
+      const openedMs = new Date(marker.openedAtUtc).getTime();
+      if (Number.isNaN(openedMs)) return null;
+      const isPremarket = openedMs < minTime;
+      // Anchor pink dot vertically at the position's target Bucket temperature (e.g. 6°C, 31°C, 58.5°F)
+      let targetTemp = parseBucketTargetTemp(marker.bucketLabel);
+      if (targetTemp === null) {
+        for (let i = metarTimesMs.length - 1; i >= 0; i--) {
+          if (metarTimesMs[i] <= openedMs) {
+            targetTemp = fan.metar_points[i].temp_c;
+            break;
+          }
+        }
+      }
+      if (targetTemp === null) {
+        targetTemp = interpolateSeriesAt(
+          timesMs,
+          fan.p50,
+          Math.max(minTime, Math.min(maxTime, openedMs)),
+        );
+      }
+      return {
+        ...marker,
+        openedMs,
+        isPremarket,
+        targetTemp,
+      };
+    })
+    .filter((m): m is NonNullable<typeof m> => m !== null);
 
   const allVals = [
     ...fan.p10,
     ...fan.p90,
+    ...adjustedVals,
     ...fan.metar_points.map((m) => m.temp_c),
-    currentTemp,
+    ...parsedMarkers.map((m) => m.targetTemp),
+    ...(currentTemp !== null ? [currentTemp] : []),
   ];
   const minT = Math.floor(Math.min(...allVals) - 1);
   const maxT = Math.ceil(Math.max(...allVals) + 1);
@@ -145,6 +232,55 @@ export function EnsembleFanChart({
     .map((val, i) => `${i === 0 ? "M" : "L"}${xForIdx(i).toFixed(1)},${yForVal(val).toFixed(1)}`)
     .join(" ");
 
+  const adjustedIndices = adjustedP50
+    ? adjustedP50
+        .map((val, idx) => (val !== null && val !== undefined ? idx : -1))
+        .filter((idx) => idx >= 0)
+    : [];
+
+  const adjustedP50Path =
+    adjustedP50 && adjustedIndices.length >= 2
+      ? adjustedIndices
+          .map(
+            (idx, pos) =>
+              `${pos === 0 ? "M" : "L"}${xForIdx(idx).toFixed(1)},${yForVal(
+                adjustedP50[idx] as number,
+              ).toFixed(1)}`,
+          )
+          .join(" ")
+      : null;
+
+  const adjustedBandPath =
+    adjustedP10 && adjustedP90 && adjustedIndices.length >= 2
+      ? (() => {
+          const valid = adjustedIndices.filter(
+            (idx) =>
+              adjustedP10[idx] !== null &&
+              adjustedP10[idx] !== undefined &&
+              adjustedP90[idx] !== null &&
+              adjustedP90[idx] !== undefined,
+          );
+          if (valid.length < 2) return null;
+          const parts: string[] = [];
+          for (let k = 0; k < valid.length; k++) {
+            const idx = valid[k];
+            parts.push(
+              `${k === 0 ? "M" : "L"}${xForIdx(idx).toFixed(1)},${yForVal(
+                adjustedP90[idx] as number,
+              ).toFixed(1)}`,
+            );
+          }
+          for (let k = valid.length - 1; k >= 0; k--) {
+            const idx = valid[k];
+            parts.push(
+              `L${xForIdx(idx).toFixed(1)},${yForVal(adjustedP10[idx] as number).toFixed(1)}`,
+            );
+          }
+          parts.push("Z");
+          return parts.join(" ");
+        })()
+      : null;
+
   const yTicks = Array.from(new Set([minT, Math.round((minT + maxT) / 2), maxT]));
   const majorSet = new Set(yTicks);
   const degreeStep = spanT > 40 ? Math.ceil(spanT / 30) : 1;
@@ -158,14 +294,36 @@ export function EnsembleFanChart({
   const tz = stationTimezone || "UTC";
   const xTickIndices = Array.from(new Set([0, Math.floor(n / 2), n - 1]));
   const xNow = xForMs(nowMs);
-  const yNow = yForVal(currentTemp);
+  const yNow = currentTemp !== null ? yForVal(currentTemp) : null;
   const currentTimeLabel = formatHhMmInZone(new Date(nowMs), tz);
-  const currentTempLabel = `${currentTemp.toFixed(1)}°${fan.unit}`;
-  const timeLabelX = Math.max(padL + 16, Math.min(width - padR - 16, xNow));
+  const currentTempLabel = currentTemp !== null ? `${currentTemp.toFixed(1)}°${fan.unit}` : null;
+  const timeLabelX = Math.max(padL, Math.min(width - padR, xNow));
 
   const metarTemps = fan.metar_points.map((pt) => pt.temp_c);
   const dayMinTemp = metarTemps.length > 0 ? Math.min(...metarTemps) : null;
   const dayMaxTemp = metarTemps.length > 0 ? Math.max(...metarTemps) : null;
+
+  const chartLocalDate = eventLocalDate || formatIsoDateInZone(new Date(minTime), tz);
+  const resolvedMarkers = parsedMarkers.map((marker) => {
+    const isSameChartDay = formatIsoDateInZone(marker.openedAtUtc, tz) === chartLocalDate;
+    const cx = xForMs(marker.openedMs);
+    const cy = yForVal(marker.targetTemp);
+    return {
+      ...marker,
+      isSameChartDay,
+      cx,
+      cy,
+      tempLabel: `${marker.targetTemp.toFixed(1)}°${fan.unit}`,
+      timeLabel: formatHhMmInZone(marker.openedAtUtc, tz),
+      openedDateTimeLabel: formatShortDateTimeInZone(marker.openedAtUtc, tz),
+      timeLabelX: Math.max(padL, Math.min(width - padR, cx)),
+    };
+  });
+
+  const activeTimeLabelXs: number[] = [
+    ...resolvedMarkers.filter((m) => m.isSameChartDay).map((m) => m.timeLabelX),
+    ...(showNowIndicator ? [timeLabelX] : []),
+  ];
 
   const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = svgRef.current;
@@ -205,7 +363,7 @@ export function EnsembleFanChart({
     : null;
 
   return (
-    <div className="rounded border border-[#1c2638] bg-[#0a101b] p-3">
+    <div className="relative rounded border border-[#1c2638] bg-[#0a101b] p-3">
       <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-300">
@@ -232,18 +390,38 @@ export function EnsembleFanChart({
             <span className="inline-block w-2.5 h-0.5 bg-sky-400" />
             P50
           </span>
+          {adjustedP50Path && (
+            <span
+              data-testid="ensemble-intraday-adjusted-legend"
+              className="flex items-center gap-1 text-sky-200/70"
+            >
+              <span className="inline-block w-3 h-0 border-t border-dashed border-sky-200/70" />
+              METAR Adj
+            </span>
+          )}
           <span className="flex items-center gap-1">
             <span className="inline-block w-2 h-2 rounded-full bg-emerald-400" />
             METAR
           </span>
-          <span className="flex items-center gap-1">
-            <span className="inline-flex items-center justify-center w-2 h-2.5">
-              <span className="inline-block w-0.5 h-2.5 bg-yellow-400 relative">
-                <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-yellow-400" />
-              </span>
+          {resolvedMarkers.length > 0 && (
+            <span
+              data-testid="ensemble-entry-legend"
+              className="flex items-center gap-1 text-pink-300"
+            >
+              <span className="inline-block w-2 h-2 rounded-full bg-pink-400" />
+              ENTRY
             </span>
-            NOW
-          </span>
+          )}
+          {showNowIndicator && (
+            <span className="flex items-center gap-1">
+              <span className="inline-flex items-center justify-center w-2 h-2.5">
+                <span className="inline-block w-0.5 h-2.5 bg-yellow-400 relative">
+                  <span className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-1.5 h-1.5 rounded-full bg-yellow-400" />
+                </span>
+              </span>
+              NOW
+            </span>
+          )}
         </div>
       </div>
 
@@ -311,7 +489,25 @@ export function EnsembleFanChart({
         })}
 
         <path d={bandPathParts.join(" ")} fill="rgba(56, 189, 248, 0.18)" />
+        {adjustedBandPath && (
+          <path
+            data-testid="ensemble-intraday-adjusted-band"
+            d={adjustedBandPath}
+            fill="rgba(186, 230, 253, 0.09)"
+          />
+        )}
         <path d={p50Path} fill="none" stroke="#38bdf8" strokeWidth={2} />
+        {adjustedP50Path && (
+          <path
+            data-testid="ensemble-intraday-adjusted-p50"
+            d={adjustedP50Path}
+            fill="none"
+            stroke="#bae6fd"
+            strokeOpacity={0.62}
+            strokeWidth={1.6}
+            strokeDasharray="4 3"
+          />
+        )}
 
         {fan.metar_points.map((pt, idx) => {
           const cx = xForMs(new Date(pt.observed_at_utc).getTime());
@@ -333,12 +529,15 @@ export function EnsembleFanChart({
 
         {xTickIndices.map((idx) => {
           const label = formatHhMmInZone(fan.timestamps[idx], tz);
+          const tx = xForIdx(idx);
+          const collides = activeTimeLabelXs.some((ax) => Math.abs(ax - tx) < 34);
           return (
             <text
               key={`${idx}-${label}`}
-              x={xForIdx(idx)}
+              x={tx}
               y={height - 6}
               textAnchor="middle"
+              opacity={collides ? 0 : 1}
               className="fill-slate-500 text-[10px] font-mono-tabular"
             >
               {label}
@@ -346,70 +545,147 @@ export function EnsembleFanChart({
           );
         })}
 
-        <g data-testid="ensemble-now-indicator">
-          <line
-            x1={padL}
-            x2={xNow}
-            y1={yNow}
-            y2={yNow}
-            stroke="#facc15"
-            strokeWidth={0.85}
-            strokeOpacity={0.5}
-            strokeDasharray="2 3"
-          />
-          <line
-            x1={xNow}
-            x2={xNow}
-            y1={padT}
-            y2={height - padB}
-            stroke="#facc15"
-            strokeWidth={1}
-            strokeOpacity={0.85}
-          />
-          <circle
-            data-testid="ensemble-now-dot"
-            cx={xNow}
-            cy={yNow}
-            r={3.2}
-            fill="#facc15"
-            stroke="#070b12"
-            strokeWidth={1.2}
-          />
-          <rect
-            x={2}
-            y={yNow - 6.5}
-            width={padL - 5}
-            height={13}
-            rx={2}
-            fill="#0a101b"
-          />
-          <text
-            data-testid="ensemble-now-temp-label"
-            x={padL - 6}
-            y={yNow + 3}
-            textAnchor="end"
-            className="fill-yellow-400 text-[10px] font-semibold font-mono-tabular"
-          >
-            {currentTempLabel}
-          </text>
-          <rect
-            x={timeLabelX - 17}
-            y={height - 16}
-            width={34}
-            height={13}
-            rx={2}
-            fill="#0a101b"
-          />
-          <text
-            data-testid="ensemble-now-time-label"
-            x={timeLabelX}
-            y={height - 6}
-            textAnchor="middle"
-            className="fill-yellow-400 text-[10px] font-semibold font-mono-tabular"
-          >
-            {currentTimeLabel}
-          </text>
-        </g>
+        {resolvedMarkers.map((m) => (
+          <g key={`entry-${m.positionId}`} data-testid={`ensemble-position-marker-${m.positionId}`}>
+            <line
+              data-testid={`ensemble-position-line-${m.positionId}`}
+              x1={padL}
+              x2={width - padR}
+              y1={m.cy}
+              y2={m.cy}
+              stroke="#f472b6"
+              strokeWidth={1}
+              strokeOpacity={0.6}
+              strokeDasharray="3 3"
+            />
+            {m.isSameChartDay && (
+              <>
+                <line
+                  data-testid={`ensemble-position-dropline-${m.positionId}`}
+                  x1={m.cx}
+                  x2={m.cx}
+                  y1={m.cy}
+                  y2={height - padB}
+                  stroke="#f472b6"
+                  strokeWidth={1}
+                  strokeOpacity={0.65}
+                  strokeDasharray="2 3"
+                />
+                <circle cx={m.cx} cy={m.cy} r={6.5} fill="#f472b6" fillOpacity={0.2} />
+                <circle
+                  data-testid={`ensemble-position-dot-${m.positionId}`}
+                  cx={m.cx}
+                  cy={m.cy}
+                  r={3.6}
+                  fill="#f472b6"
+                  stroke="#070b12"
+                  strokeWidth={1.2}
+                />
+                <rect
+                  x={m.timeLabelX - 19}
+                  y={height - 16}
+                  width={38}
+                  height={13}
+                  rx={2}
+                  fill="#0a101b"
+                />
+                <text
+                  data-testid={`ensemble-position-time-${m.positionId}`}
+                  x={m.timeLabelX}
+                  y={height - 6}
+                  textAnchor="middle"
+                  className="fill-pink-400 text-[10px] font-semibold font-mono-tabular"
+                >
+                  {m.timeLabel}
+                </text>
+              </>
+            )}
+            <rect
+              x={2}
+              y={m.cy - 6.5}
+              width={padL - 5}
+              height={13}
+              rx={2}
+              fill="#0a101b"
+            />
+            <text
+              data-testid={`ensemble-position-temp-${m.positionId}`}
+              x={padL - 6}
+              y={m.cy + 3}
+              textAnchor="end"
+              className="fill-pink-400 text-[10px] font-semibold font-mono-tabular"
+            >
+              {m.tempLabel}
+            </text>
+          </g>
+        ))}
+
+        {showNowIndicator && yNow !== null && currentTempLabel !== null && (
+          <g data-testid="ensemble-now-indicator">
+            <line
+              x1={padL}
+              x2={xNow}
+              y1={yNow}
+              y2={yNow}
+              stroke="#facc15"
+              strokeWidth={0.85}
+              strokeOpacity={0.5}
+              strokeDasharray="2 3"
+            />
+            <line
+              x1={xNow}
+              x2={xNow}
+              y1={padT}
+              y2={height - padB}
+              stroke="#facc15"
+              strokeWidth={1}
+              strokeOpacity={0.85}
+            />
+            <circle
+              data-testid="ensemble-now-dot"
+              cx={xNow}
+              cy={yNow}
+              r={3.2}
+              fill="#facc15"
+              stroke="#070b12"
+              strokeWidth={1.2}
+            />
+            <rect
+              x={2}
+              y={yNow - 6.5}
+              width={padL - 5}
+              height={13}
+              rx={2}
+              fill="#0a101b"
+            />
+            <text
+              data-testid="ensemble-now-temp-label"
+              x={padL - 6}
+              y={yNow + 3}
+              textAnchor="end"
+              className="fill-yellow-400 text-[10px] font-semibold font-mono-tabular"
+            >
+              {currentTempLabel}
+            </text>
+            <rect
+              x={timeLabelX - 19}
+              y={height - 16}
+              width={38}
+              height={13}
+              rx={2}
+              fill="#0a101b"
+            />
+            <text
+              data-testid="ensemble-now-time-label"
+              x={timeLabelX}
+              y={height - 6}
+              textAnchor="middle"
+              className="fill-yellow-400 text-[10px] font-semibold font-mono-tabular"
+            >
+              {currentTimeLabel}
+            </text>
+          </g>
+        )}
 
         {hoverCrosshair && (
           <g data-testid="ensemble-hover-crosshair" className="pointer-events-none">
@@ -485,6 +761,20 @@ export function EnsembleFanChart({
           </g>
         )}
       </svg>
+      {resolvedMarkers.length > 0 && (
+        <div
+          data-testid="ensemble-opened-footer"
+          className="pointer-events-none absolute left-3 bottom-2.5 flex flex-col gap-0.5 text-[10px] font-mono-tabular text-pink-400/90"
+        >
+          {resolvedMarkers.map((m) => (
+            <span key={`opened-${m.positionId}`} data-testid={`ensemble-opened-at-${m.positionId}`}>
+              {resolvedMarkers.length > 1
+                ? `Opened ${m.bucketLabel} · ${m.openedDateTimeLabel}`
+                : `Opened ${m.openedDateTimeLabel}`}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

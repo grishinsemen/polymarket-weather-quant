@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Literal, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -47,6 +49,7 @@ from weather_quant.probability.engine import (
 )
 from weather_quant.storage.database import Database
 from weather_quant.strategy.engine import (
+    R_TRADE_EDGE_REALIZED,
     StrategyEngine,
     StrategyStore,
     default_strategy_manifest,
@@ -54,6 +57,7 @@ from weather_quant.strategy.engine import (
 )
 from weather_quant.strategy.paper_executor import PaperExecutor
 
+logger = logging.getLogger(__name__)
 _EPS = 1e-9
 ReplayProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -86,11 +90,14 @@ class ReplayTradeEntry(BaseModel):
     station_icao: str
     bucket_id: str
     side: Literal["BUY", "SELL"]
+    outcome_side: Literal["YES", "NO"] = "YES"
     fill_price: float
     fill_shares: float
     fill_usd: float
     fee_usd: float
     is_maker: bool
+    expected_edge: float | None = None
+    actual_edge: float | None = None
     model_version: str
     strategy_version: str
     filled_at_utc: datetime
@@ -113,6 +120,112 @@ class ExperimentReplayResult(BaseModel):
     equity_curve: list[ReplayEquityPoint] = Field(default_factory=list)
     order_count: int = 0
     filled_order_count: int = 0
+    sharpe_ratio: float = 0.0
+    avg_expected_edge: float | None = None
+    avg_actual_edge: float | None = None
+
+
+class ExitModeMetrics(BaseModel):
+    """Summary risk/return metrics for one exit regime in a head-to-head replay comparison."""
+
+    mode: Literal["hold_to_expiry", "dynamic_early_exit"]
+    strategy_version: str
+    net_pnl_usd: float
+    net_return_pct: float
+    max_drawdown_usd: float
+    sharpe_ratio: float
+    trade_count: int
+    fill_rate: float
+    avg_clv: float
+    avg_expected_edge: float | None = None
+    avg_actual_edge: float | None = None
+    summary: ExperimentRunSummary
+
+
+class ExitModeComparisonResult(BaseModel):
+    """Deterministic comparison of Hold-to-Expiry vs Dynamic Early-Exit (Post-Only Sell-to-Crowd)."""
+
+    model_version: str
+    base_strategy_version: str
+    enable_buy_no: bool = False
+    take_profit_min_profit: float = 0.03
+    take_profit_premium: float = 0.02
+    hold_to_expiry: ExitModeMetrics
+    dynamic_early_exit: ExitModeMetrics
+    delta_pnl_usd: float
+    delta_max_drawdown_usd: float
+    delta_sharpe_ratio: float
+    winner_by_sharpe: Literal["hold_to_expiry", "dynamic_early_exit", "tie"]
+    summary_log: str
+
+
+def compute_equity_sharpe(equity_curve: Sequence[ReplayEquityPoint]) -> float:
+    """Compute a deterministic Sharpe ratio from an Experiment Replay equity curve.
+
+    Uses end-of-day UTC equity returns annualized by ``sqrt(365)`` when >= 2 distinct days
+    are observed; otherwise uses non-zero step returns scaled by ``sqrt(N)`` for intraday runs.
+    """
+    if len(equity_curve) < 2:
+        return 0.0
+
+    by_day: dict[str, float] = {}
+    for pt in equity_curve:
+        day_key = _ensure_utc(pt.timestamp_utc).strftime("%Y-%m-%d")
+        by_day[day_key] = pt.equity_usd
+
+    if len(by_day) >= 3:
+        ordered_eq = [by_day[k] for k in sorted(by_day)]
+        returns = [
+            (ordered_eq[i] - ordered_eq[i - 1]) / ordered_eq[i - 1]
+            for i in range(1, len(ordered_eq))
+            if ordered_eq[i - 1] > _EPS
+        ]
+        scale = math.sqrt(365.0)
+    else:
+        returns = [
+            (equity_curve[i].equity_usd - equity_curve[i - 1].equity_usd) / equity_curve[i - 1].equity_usd
+            for i in range(1, len(equity_curve))
+            if equity_curve[i - 1].equity_usd > _EPS
+            and abs(equity_curve[i].equity_usd - equity_curve[i - 1].equity_usd) > _EPS
+        ]
+        scale = math.sqrt(float(len(returns))) if returns else 0.0
+
+    if len(returns) < 2:
+        return 0.0
+    mean_r = sum(returns) / len(returns)
+    var = sum((r - mean_r) ** 2 for r in returns) / (len(returns) - 1)
+    std = math.sqrt(var)
+    if std <= 1e-12:
+        return 0.0
+    return round((mean_r / std) * scale, 4)
+
+
+def format_exit_mode_comparison(
+    *,
+    hold: ExitModeMetrics,
+    dynamic: ExitModeMetrics,
+    enable_buy_no: bool,
+) -> str:
+    """Format a compact operator log comparing Hold-to-Expiry vs Dynamic Early-Exit."""
+    def _fmt_edge(val: float | None) -> str:
+        return "n/a" if val is None else f"{val * 100:+.2f}c"
+
+    lines = [
+        f"Exit Mode Comparison (BUY_NO={'ON' if enable_buy_no else 'OFF'}):",
+        "Mode                |   Net PnL | Max DD  |  Sharpe | Trades | Exp Edge | Act Edge",
+        "--------------------+-----------+---------+---------+--------+----------+---------",
+        (
+            f"Hold-to-Expiry      | ${hold.net_pnl_usd:+8.2f} | ${hold.max_drawdown_usd:6.2f} "
+            f"| {hold.sharpe_ratio:+7.3f} | {hold.trade_count:6d} "
+            f"| {_fmt_edge(hold.avg_expected_edge):>8s} | {_fmt_edge(hold.avg_actual_edge):>8s}"
+        ),
+        (
+            f"Dynamic Early-Exit  | ${dynamic.net_pnl_usd:+8.2f} | ${dynamic.max_drawdown_usd:6.2f} "
+            f"| {dynamic.sharpe_ratio:+7.3f} | {dynamic.trade_count:6d} "
+            f"| {_fmt_edge(dynamic.avg_expected_edge):>8s} | {_fmt_edge(dynamic.avg_actual_edge):>8s}"
+        ),
+    ]
+    return "\n".join(lines)
 
 
 def _ensure_utc(ts: datetime) -> datetime:
@@ -254,8 +367,14 @@ async def _settle_expired_events(
         for pos in open_positions:
             if pos.shares <= _EPS:
                 continue
-            payout = 1.0 if pos.bucket_id == winning_bucket_id else 0.0
-            pos.realized_pnl_usd += (payout - pos.avg_entry_price) * pos.shares
+            if pos.outcome_side == "NO":
+                payout = 0.0 if pos.bucket_id == winning_bucket_id else 1.0
+            else:
+                payout = 1.0 if pos.bucket_id == winning_bucket_id else 0.0
+            settled_shares = pos.shares
+            pos.realized_pnl_usd += (payout - pos.avg_entry_price) * settled_shares
+            actual_edge = round(payout - pos.avg_entry_price, 6)
+            pos.realized_edge = actual_edge
             pos.shares = 0.0
             pos.cost_basis_usd = 0.0
             pos.mark_price = payout
@@ -263,6 +382,31 @@ async def _settle_expired_events(
             pos.status = "SETTLED"
             pos.updated_at_utc = now_utc
             await store.upsert_position(pos)
+            await store.add_audit(
+                decision=R_TRADE_EDGE_REALIZED,
+                reason_codes=[R_TRADE_EDGE_REALIZED],
+                model_version=pos.model_version,
+                strategy_version=pos.strategy_version,
+                now=now_utc,
+                event_id=pos.event_id,
+                bucket_id=pos.bucket_id,
+                detail={
+                    "position_id": pos.position_id,
+                    "outcome_side": pos.outcome_side,
+                    "settlement_payout": payout,
+                    "entry_price": round(pos.avg_entry_price, 6),
+                    "exit_price": payout,
+                    "shares": round(settled_shares, 6),
+                    "expected_edge": pos.expected_edge,
+                    "actual_edge": actual_edge,
+                    "edge_diff": (
+                        round(actual_edge - pos.expected_edge, 6)
+                        if pos.expected_edge is not None
+                        else None
+                    ),
+                    "realized_pnl_usd": round(pos.realized_pnl_usd, 6),
+                },
+            )
         await store.db.conn.commit()
 
 
@@ -565,6 +709,7 @@ async def _execute_replay_isolated(
         orders = await store.list_orders(limit=100_000)
         fills = await store.list_fills(limit=100_000)
         clvs = await store.list_clv(limit=100_000)
+        all_positions = await store.list_positions()
 
         # Chronological sort for deterministic ID normalization
         orders_chron = sorted(
@@ -592,16 +737,33 @@ async def _execute_replay_isolated(
                     station_icao=f.station_icao,
                     bucket_id=f.bucket_id,
                     side=f.side,
+                    outcome_side=f.outcome_side,
                     fill_price=round(f.fill_price, 6),
                     fill_shares=round(f.fill_shares, 6),
                     fill_usd=round(f.fill_usd, 6),
                     fee_usd=round(f.fee_usd, 6),
                     is_maker=f.is_maker,
+                    expected_edge=f.expected_edge,
+                    actual_edge=f.realized_edge,
                     model_version=f.model_version,
                     strategy_version=f.strategy_version,
                     filled_at_utc=_ensure_utc(f.filled_at_utc),
                 )
             )
+
+        expected_edges = [
+            p.expected_edge for p in all_positions if p.expected_edge is not None
+        ]
+        actual_edges = [
+            p.realized_edge for p in all_positions if p.realized_edge is not None
+        ]
+        avg_expected_edge = (
+            round(sum(expected_edges) / len(expected_edges), 6) if expected_edges else None
+        )
+        avg_actual_edge = (
+            round(sum(actual_edges) / len(actual_edges), 6) if actual_edges else None
+        )
+        sharpe_ratio = compute_equity_sharpe(equity_curve)
 
         submitted_orders = [o for o in orders_chron if o.status != "CANCELLED" or o.order_id in filled_order_ids]
         denom_orders = len(submitted_orders) if submitted_orders else len(orders_chron)
@@ -640,6 +802,9 @@ async def _execute_replay_isolated(
             equity_curve=equity_curve,
             order_count=len(orders_chron),
             filled_order_count=len(filled_order_ids),
+            sharpe_ratio=sharpe_ratio,
+            avg_expected_edge=avg_expected_edge,
+            avg_actual_edge=avg_actual_edge,
         )
     finally:
         await iso_db.close()
@@ -919,3 +1084,201 @@ async def run_experiment_replay(
         await save_experiment_run(db, result.summary)
 
     return result
+
+
+async def compare_exit_modes(
+    *,
+    db: Database,
+    archive_store: ParquetArchiveStore,
+    model_version: str,
+    strategy_version: str,
+    dataset_start_utc: datetime | None = None,
+    dataset_end_utc: datetime | None = None,
+    events: Sequence[WeatherEvent] | None = None,
+    decision_times: Sequence[datetime] | None = None,
+    strict_temporal: bool = True,
+    mos_model: QuantileMosModel | None = None,
+    recent_bias_by_station: Mapping[str, Sequence[DailyBiasObservation]] | None = None,
+    enable_buy_no: bool = False,
+    take_profit_min_profit: float = 0.03,
+    take_profit_premium: float = 0.02,
+) -> ExitModeComparisonResult:
+    """Compare Hold-to-Expiry vs Dynamic Early-Exit (Post-Only Sell-to-Crowd) on identical archived data."""
+    models = {m.model_version: m for m in await db.list_model_versions()}
+    model_rec = models.get(model_version)
+    if model_rec is None:
+        raise ValueError(f"Unknown model_version: {model_version!r}")
+
+    if mos_model is None:
+        loaded_provider = await load_mos_provider_for_version(db, model_version)
+        if loaded_provider is not None:
+            mos_model = loaded_provider.mos_model
+
+    strategies = {s.strategy_version: s for s in await db.list_strategy_versions()}
+    base_strategy = strategies.get(strategy_version)
+    if base_strategy is None:
+        if strategy_version == default_strategy_manifest().strategy_version:
+            base_strategy = default_strategy_manifest()
+        else:
+            raise ValueError(f"Unknown strategy_version: {strategy_version!r}")
+
+    event_list = list(events) if events is not None else await db.list_weather_events(active_only=False)
+    event_ids = {e.event_id for e in event_list}
+
+    def _load_archive() -> tuple[
+        list[OrderBookSnapshot],
+        list[EnsembleSnapshot],
+        list[MetarObservation],
+        datetime,
+        datetime,
+    ]:
+        all_books = archive_store.read_orderbook_snapshots(
+            start_utc=dataset_start_utc,
+            end_utc=dataset_end_utc,
+        )
+        all_ensembles = archive_store.read_ensemble_snapshots(
+            start_utc=dataset_start_utc,
+            end_utc=dataset_end_utc,
+        )
+        all_metars = archive_store.read_metar_observations(
+            start_utc=dataset_start_utc,
+            end_utc=dataset_end_utc,
+        )
+        if event_ids:
+            all_books = [b for b in all_books if b.event_id in event_ids]
+            all_ensembles = [e for e in all_ensembles if e.event_id in event_ids]
+            icaos = {e.station.icao.upper() for e in event_list}
+            all_metars = [m for m in all_metars if m.station_icao.upper() in icaos]
+
+        all_stamps = [
+            *[_ensure_utc(b.ingested_at_utc) for b in all_books],
+            *[_ensure_utc(e.ingested_at_utc) for e in all_ensembles],
+            *[_ensure_utc(m.ingested_at_utc) for m in all_metars],
+        ]
+        resolved_start = (
+            _ensure_utc(dataset_start_utc)
+            if dataset_start_utc is not None
+            else (min(all_stamps) if all_stamps else datetime.now(timezone.utc))
+        )
+        resolved_end = (
+            _ensure_utc(dataset_end_utc)
+            if dataset_end_utc is not None
+            else (max(all_stamps) + timedelta(seconds=1) if all_stamps else resolved_start)
+        )
+        return all_books, all_ensembles, all_metars, resolved_start, resolved_end
+
+    books, ensembles, metars, start_utc, end_utc = await asyncio.to_thread(_load_archive)
+
+    base_cfg = dict(base_strategy.config_json or {})
+    hold_cfg = {
+        **base_cfg,
+        "enable_buy_no": enable_buy_no,
+        "hold_to_expiry": True,
+        "enable_dynamic_take_profit": False,
+    }
+    dynamic_cfg = {
+        **base_cfg,
+        "enable_buy_no": enable_buy_no,
+        "hold_to_expiry": False,
+        "enable_dynamic_take_profit": True,
+        "take_profit_min_profit": take_profit_min_profit,
+        "take_profit_premium": take_profit_premium,
+    }
+
+    hold_strategy = base_strategy.model_copy(
+        update={
+            "strategy_version": f"{base_strategy.strategy_version}-hold-to-expiry",
+            "config_json": hold_cfg,
+        }
+    )
+    dynamic_strategy = base_strategy.model_copy(
+        update={
+            "strategy_version": f"{base_strategy.strategy_version}-dynamic-early-exit",
+            "config_json": dynamic_cfg,
+        }
+    )
+
+    common_kwargs: dict[str, Any] = {
+        "events": event_list,
+        "model_rec": model_rec,
+        "books": books,
+        "ensembles": ensembles,
+        "metars": metars,
+        "dataset_start_utc": start_utc,
+        "dataset_end_utc": end_utc,
+        "decision_times": list(decision_times) if decision_times is not None else None,
+        "strict_temporal": strict_temporal,
+        "mos_model": mos_model,
+        "recent_bias_by_station": recent_bias_by_station or {},
+        "progress_cb": None,
+    }
+
+    hold_res = await asyncio.to_thread(
+        _run_replay_sync,
+        {**common_kwargs, "strategy_rec": hold_strategy},
+    )
+    dynamic_res = await asyncio.to_thread(
+        _run_replay_sync,
+        {**common_kwargs, "strategy_rec": dynamic_strategy},
+    )
+
+    hold_metrics = ExitModeMetrics(
+        mode="hold_to_expiry",
+        strategy_version=hold_strategy.strategy_version,
+        net_pnl_usd=hold_res.summary.net_pnl_usd,
+        net_return_pct=hold_res.summary.net_return_pct,
+        max_drawdown_usd=hold_res.summary.max_drawdown_usd,
+        sharpe_ratio=hold_res.sharpe_ratio,
+        trade_count=hold_res.summary.trade_count,
+        fill_rate=hold_res.summary.fill_rate,
+        avg_clv=hold_res.summary.avg_clv,
+        avg_expected_edge=hold_res.avg_expected_edge,
+        avg_actual_edge=hold_res.avg_actual_edge,
+        summary=hold_res.summary,
+    )
+    dynamic_metrics = ExitModeMetrics(
+        mode="dynamic_early_exit",
+        strategy_version=dynamic_strategy.strategy_version,
+        net_pnl_usd=dynamic_res.summary.net_pnl_usd,
+        net_return_pct=dynamic_res.summary.net_return_pct,
+        max_drawdown_usd=dynamic_res.summary.max_drawdown_usd,
+        sharpe_ratio=dynamic_res.sharpe_ratio,
+        trade_count=dynamic_res.summary.trade_count,
+        fill_rate=dynamic_res.summary.fill_rate,
+        avg_clv=dynamic_res.summary.avg_clv,
+        avg_expected_edge=dynamic_res.avg_expected_edge,
+        avg_actual_edge=dynamic_res.avg_actual_edge,
+        summary=dynamic_res.summary,
+    )
+
+    delta_pnl = round(dynamic_metrics.net_pnl_usd - hold_metrics.net_pnl_usd, 6)
+    delta_dd = round(dynamic_metrics.max_drawdown_usd - hold_metrics.max_drawdown_usd, 6)
+    delta_sharpe = round(dynamic_metrics.sharpe_ratio - hold_metrics.sharpe_ratio, 4)
+    if delta_sharpe > 1e-6:
+        winner: Literal["hold_to_expiry", "dynamic_early_exit", "tie"] = "dynamic_early_exit"
+    elif delta_sharpe < -1e-6:
+        winner = "hold_to_expiry"
+    else:
+        winner = "tie"
+
+    summary_log = format_exit_mode_comparison(
+        hold=hold_metrics,
+        dynamic=dynamic_metrics,
+        enable_buy_no=enable_buy_no,
+    )
+    logger.info("\n%s", summary_log)
+
+    return ExitModeComparisonResult(
+        model_version=model_version,
+        base_strategy_version=base_strategy.strategy_version,
+        enable_buy_no=enable_buy_no,
+        take_profit_min_profit=take_profit_min_profit,
+        take_profit_premium=take_profit_premium,
+        hold_to_expiry=hold_metrics,
+        dynamic_early_exit=dynamic_metrics,
+        delta_pnl_usd=delta_pnl,
+        delta_max_drawdown_usd=delta_dd,
+        delta_sharpe_ratio=delta_sharpe,
+        winner_by_sharpe=winner,
+        summary_log=summary_log,
+    )

@@ -2,6 +2,7 @@
 
 import React, { useMemo, useState } from "react";
 import {
+  formatIsoDateInZone,
   formatMoscowHhMm,
   formatScreenerDateLabel,
   formatStationLocalClock,
@@ -277,24 +278,33 @@ export function EdgeScreenerTable({
                     </td>
 
                     <td className="px-2.5 py-2.5 font-mono-tabular whitespace-nowrap">
-                      {row.latest_metar ? (
-                        <div className="flex items-center gap-1.5">
-                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                          <span className="text-emerald-300 font-semibold">
-                            {row.latest_metar.has_remark_tenths
-                              ? `${row.latest_metar.temp_c.toFixed(1)}°C`
-                              : `${row.latest_metar.whole_temp_c}°C`}
-                          </span>
-                          <span
-                            className="text-[10px] text-slate-500"
-                            title="Moscow time (MSK)"
-                          >
-                            {formatMoscowHhMm(row.latest_metar.observed_at_utc)}
-                          </span>
-                        </div>
-                      ) : (
-                        <span className="text-slate-500 text-[11px]">Pending</span>
-                      )}
+                      {(() => {
+                        const eventMetar =
+                          row.latest_metar &&
+                          formatIsoDateInZone(row.latest_metar.observed_at_utc, row.timezone) ===
+                            row.local_date
+                            ? row.latest_metar
+                            : null;
+                        if (!eventMetar) {
+                          return <span className="text-slate-500 text-[11px]">Pending</span>;
+                        }
+                        return (
+                          <div className="flex items-center gap-1.5">
+                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                            <span className="text-emerald-300 font-semibold">
+                              {eventMetar.has_remark_tenths
+                                ? `${eventMetar.temp_c.toFixed(1)}°C`
+                                : `${eventMetar.whole_temp_c}°C`}
+                            </span>
+                            <span
+                              className="text-[10px] text-slate-500"
+                              title="Moscow time (MSK)"
+                            >
+                              {formatMoscowHhMm(eventMetar.observed_at_utc)}
+                            </span>
+                          </div>
+                        );
+                      })()}
                     </td>
 
                     <td className="px-2.5 py-2.5 text-right font-mono-tabular whitespace-nowrap">

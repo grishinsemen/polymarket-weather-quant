@@ -459,9 +459,11 @@ describe("WeatherQuantTerminal", () => {
       expect(badge).toHaveClass("whitespace-nowrap", "inline-block");
     }
 
-    // Routine METAR time is displayed in Moscow time (18:00Z -> 21:00) without Z suffix
-    expect(within(screenerRows[0]).getByText("21:00")).toBeInTheDocument();
-    expect(within(screenerRows[0]).queryByText(/Z$/)).not.toBeInTheDocument();
+    // Routine METAR time is displayed in Moscow time (18:00Z -> 21:00) for RKSI (already Nov 26 in Seoul),
+    // while LFPB (still Nov 25 in Paris) shows Pending instead of prior-day METAR on its Nov 26 event
+    expect(within(screenerRows[0]).getByText("Pending")).toBeInTheDocument();
+    expect(within(screenerRows[1]).getByText("21:00")).toBeInTheDocument();
+    expect(within(screenerRows[1]).queryByText(/Z$/)).not.toBeInTheDocument();
 
     // Ensemble Fan Chart renders local station times without Z, interior degree guides, and yellow NOW indicator
     const fanSvg = screen.getByTestId("ensemble-fan-svg");
@@ -841,5 +843,532 @@ describe("WeatherQuantTerminal", () => {
 
     fireEvent.click(screen.getByTestId("toggle-settled-btn"));
     expect(screen.getAllByTestId("screener-city-row")).toHaveLength(3);
+  });
+
+  it("renders red negative liquidation uPnL for ZEROED positions and normalizes -0.00 float noise", () => {
+    const customBuckets = make11Buckets("evt-rksi", 11).map((b, idx) => {
+      if (idx === 0) {
+        return {
+          ...b,
+          is_impossible: true,
+          best_bid: null,
+          open_position: {
+            position_id: "pos-zeroed-loss",
+            event_id: "evt-rksi",
+            station_icao: "RKSI",
+            bucket_id: b.bucket_id,
+            bucket_label: b.label,
+            shares: 9.4,
+            avg_entry_price: 0.26,
+            cost_basis_usd: 2.444,
+            mark_price: 0.0,
+            unrealized_pnl_usd: -2.444,
+            realized_pnl_usd: 0.0,
+            status: "OPEN" as const,
+            model_version: "ensemble-3layer-v1",
+            strategy_version: "conservative-kelly-100-v1",
+            updated_at_utc: "2026-11-26T12:00:00Z",
+          },
+        };
+      }
+      if (idx === 6) {
+        return {
+          ...b,
+          open_position: {
+            ...b.open_position!,
+            position_id: "pos-neg-zero",
+            unrealized_pnl_usd: -3.95e-16,
+          },
+        };
+      }
+      return b;
+    });
+
+    const snapshotWithZeroed: TerminalSnapshotResponse = {
+      ...FIXTURE_SNAPSHOT,
+      xrays: {
+        ...FIXTURE_SNAPSHOT.xrays,
+        "evt-rksi": {
+          ...FIXTURE_SNAPSHOT.xrays["evt-rksi"],
+          buckets: customBuckets,
+        },
+      },
+    };
+
+    render(
+      <WeatherQuantTerminal
+        snapshot={snapshotWithZeroed}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    const zeroedUpnl = screen.getByTestId("position-upnl-pos-zeroed-loss");
+    expect(zeroedUpnl).toHaveTextContent("uPnL -$2.44");
+    expect(zeroedUpnl).toHaveClass("text-rose-400");
+
+    const flatUpnl = screen.getByTestId("position-upnl-pos-neg-zero");
+    expect(flatUpnl).toHaveTextContent("uPnL +$0.00");
+    expect(flatUpnl).toHaveClass("text-emerald-400");
+  });
+
+  it("shows target date (Nov 26 / Nov 27) and YES side per position and aligns Locked $ with selected event positions", () => {
+    const nov26Buckets = make11Buckets("evt-eddm-26", 0).map((b, idx) => ({
+      ...b,
+      resting_order: null,
+      open_position:
+        idx === 4
+          ? {
+              position_id: "pos-eddm-26",
+              event_id: "evt-eddm-26",
+              station_icao: "EDDM",
+              bucket_id: b.bucket_id,
+              bucket_label: "-1°C",
+              shares: 9.45,
+              avg_entry_price: 0.26,
+              cost_basis_usd: 2.46,
+              mark_price: 0.0,
+              unrealized_pnl_usd: -2.46,
+              realized_pnl_usd: 0.0,
+              status: "OPEN" as const,
+              model_version: "ensemble-3layer-v1",
+              strategy_version: "conservative-kelly-100-v1",
+              updated_at_utc: "2026-11-26T15:00:00Z",
+            }
+          : null,
+    }));
+
+    const nov27Buckets = make11Buckets("evt-eddm-27", 0).map((b, idx) => ({
+      ...b,
+      resting_order: null,
+      open_position:
+        idx === 5
+          ? {
+              position_id: "pos-eddm-27",
+              event_id: "evt-eddm-27",
+              station_icao: "EDDM",
+              bucket_id: b.bucket_id,
+              bucket_label: "0°C",
+              shares: 8.0,
+              avg_entry_price: 0.5,
+              cost_basis_usd: 4.0,
+              mark_price: 0.55,
+              unrealized_pnl_usd: 0.4,
+              realized_pnl_usd: 0.0,
+              status: "OPEN" as const,
+              model_version: "ensemble-3layer-v1",
+              strategy_version: "conservative-kelly-100-v1",
+              updated_at_utc: "2026-11-26T15:00:00Z",
+            }
+          : null,
+    }));
+
+    const eddmStation = {
+      icao: "EDDM",
+      name: "Munich Airport",
+      city: "Munich",
+      country: "DE",
+      lat: 48.3538,
+      lon: 11.7861,
+      elevation_m: 453,
+      timezone: "Europe/Berlin",
+    };
+
+    const twoDaySnapshot: TerminalSnapshotResponse = {
+      ...FIXTURE_SNAPSHOT,
+      screener: [
+        {
+          ...FIXTURE_SNAPSHOT.screener[0],
+          event_id: "evt-eddm-26",
+          station_icao: "EDDM",
+          city: "Munich",
+          local_date: "2026-11-26",
+          city_exposure_usd: 99.99, // intentionally stale to prove Locked $ derives from unified positions
+        },
+        {
+          ...FIXTURE_SNAPSHOT.screener[0],
+          event_id: "evt-eddm-27",
+          station_icao: "EDDM",
+          city: "Munich",
+          local_date: "2026-11-27",
+          city_exposure_usd: 4.0,
+        },
+      ],
+      xrays: {
+        "evt-eddm-26": {
+          ...FIXTURE_SNAPSHOT.xrays["evt-rksi"],
+          event: {
+            ...FIXTURE_SNAPSHOT.xrays["evt-rksi"].event,
+            event_id: "evt-eddm-26",
+            title: "Highest temperature in Munich on November 26?",
+            station: eddmStation,
+            local_date: "2026-11-26",
+          },
+          city_exposure_usd: 99.99,
+          buckets: nov26Buckets,
+          orders: [],
+        },
+        "evt-eddm-27": {
+          ...FIXTURE_SNAPSHOT.xrays["evt-rksi"],
+          event: {
+            ...FIXTURE_SNAPSHOT.xrays["evt-rksi"].event,
+            event_id: "evt-eddm-27",
+            title: "Highest temperature in Munich on November 27?",
+            station: eddmStation,
+            local_date: "2026-11-27",
+          },
+          city_exposure_usd: 4.0,
+          buckets: nov27Buckets,
+          orders: [],
+        },
+      },
+    };
+
+    render(
+      <WeatherQuantTerminal
+        snapshot={twoDaySnapshot}
+        wsStatus="connected"
+        selectedEventId="evt-eddm-26"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    // Locked $ strictly equals sum of open positions cost_basis for EDDM Nov 26 ($2.46)
+    expect(screen.getByTestId("xray-locked-usd")).toHaveTextContent("Locked $2.46");
+    // Bucket table has POS badge ONLY for Nov 26's -1°C bucket (b4) with shares / dollar stake
+    expect(screen.getByTestId("bucket-pos-badge-evt-eddm-26-b4")).toHaveTextContent(
+      "POS 9sh / $2.46",
+    );
+    expect(screen.queryByTestId("bucket-pos-badge-evt-eddm-26-b5")).not.toBeInTheDocument();
+
+    // Bottom panel clearly distinguishes Nov 26 vs Nov 27, omits YES and =, and centers $stake
+    const row26 = screen.getByTestId("unified-position-row-pos-eddm-26");
+    const row27 = screen.getByTestId("unified-position-row-pos-eddm-27");
+    expect(row26).toHaveTextContent("EDDM Munich · Nov 26 • POS -1°C (9.4sh @ 26¢)");
+    expect(screen.getByTestId("position-stake-pos-eddm-26")).toHaveTextContent("$2.46");
+    expect(row27).toHaveTextContent("EDDM Munich · Nov 27 • POS 0°C (8.0sh @ 50¢)");
+    expect(screen.getByTestId("position-stake-pos-eddm-27")).toHaveTextContent("$4.00");
+    expect(row26).not.toHaveTextContent("YES");
+    expect(row26).not.toHaveTextContent("=");
+
+    // Sort by $ puts $4.00 (Nov 27) above $2.46 (Nov 26); sort by Date puts Nov 26 above Nov 27
+    fireEvent.click(screen.getByTestId("sort-tab-usd"));
+    const rowsByUsd = within(screen.getByTestId("unified-orders-positions-panel")).getAllByTestId(
+      /^unified-position-row-/,
+    );
+    expect(rowsByUsd[0]).toHaveAttribute("data-testid", "unified-position-row-pos-eddm-27");
+    expect(rowsByUsd[1]).toHaveAttribute("data-testid", "unified-position-row-pos-eddm-26");
+
+    fireEvent.click(screen.getByTestId("sort-tab-date"));
+    const rowsByDate = within(screen.getByTestId("unified-orders-positions-panel")).getAllByTestId(
+      /^unified-position-row-/,
+    );
+    expect(rowsByDate[0]).toHaveAttribute("data-testid", "unified-position-row-pos-eddm-26");
+    expect(rowsByDate[1]).toHaveAttribute("data-testid", "unified-position-row-pos-eddm-27");
+  });
+
+  it("opens and closes completed bets history popup below audit log", () => {
+    const snapshotWithHistory: TerminalSnapshotResponse = {
+      ...FIXTURE_SNAPSHOT,
+      closed_positions: [
+        {
+          position_id: "pos-closed-klax",
+          event_id: "evt-klax",
+          station_icao: "KLAX",
+          city: "Los Angeles",
+          local_date: "2026-11-26",
+          bucket_id: "b-klax",
+          bucket_label: "84-85°F",
+          entry_price: 0.09,
+          exit_price: 0.28,
+          traded_shares: 23.8,
+          stake_usd: 2.14,
+          realized_pnl_usd: 4.52,
+          status: "CLOSED",
+          model_version: "ensemble-3layer-v1",
+          strategy_version: "conservative-kelly-100-v1",
+          closed_at_utc: "2026-11-26T11:14:27Z",
+        },
+        {
+          position_id: "pos-closed-eham",
+          event_id: "evt-eham",
+          station_icao: "EHAM",
+          city: "Amsterdam",
+          local_date: "2026-11-26",
+          bucket_id: "b-eham",
+          bucket_label: "0°C",
+          entry_price: 0.14,
+          exit_price: 0.02,
+          traded_shares: 18.9,
+          stake_usd: 2.65,
+          realized_pnl_usd: -2.28,
+          status: "CLOSED",
+          model_version: "ensemble-3layer-v1",
+          strategy_version: "conservative-kelly-100-v1",
+          closed_at_utc: "2026-11-26T11:11:58Z",
+        },
+      ],
+    };
+
+    render(
+      <WeatherQuantTerminal
+        snapshot={snapshotWithHistory}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    const historyBtn = screen.getByTestId("closed-bets-history-btn");
+    expect(historyBtn).toHaveTextContent("История завершённых ставок");
+    expect(historyBtn).toHaveTextContent("2");
+    expect(historyBtn).toHaveTextContent("+$2.24");
+    expect(screen.queryByTestId("closed-bets-history-panel")).not.toBeInTheDocument();
+
+    fireEvent.click(historyBtn);
+    const panel = screen.getByTestId("closed-bets-history-panel");
+    expect(panel).toBeInTheDocument();
+    expect(within(panel).getByTestId("closed-bet-row-pos-closed-klax")).toHaveTextContent("+$4.52");
+    expect(within(panel).getByTestId("closed-bet-row-pos-closed-eham")).toHaveTextContent("-$2.28");
+
+    fireEvent.click(historyBtn);
+    expect(screen.queryByTestId("closed-bets-history-panel")).not.toBeInTheDocument();
+  });
+
+  it("renders paler intraday METAR-adjusted forecast curve when adjusted_p50 is provided", () => {
+    const adjustedSnapshot: TerminalSnapshotResponse = {
+      ...FIXTURE_SNAPSHOT,
+      xrays: {
+        ...FIXTURE_SNAPSHOT.xrays,
+        "evt-rksi": {
+          ...FIXTURE_SNAPSHOT.xrays["evt-rksi"],
+          ensemble_fan: {
+            ...FIXTURE_SNAPSHOT.xrays["evt-rksi"].ensemble_fan,
+            adjusted_p10: [null, 10.7, 9.8],
+            adjusted_p50: [null, 12.3, 11.2],
+            adjusted_p90: [null, 13.8, 12.5],
+            intraday_residual_c: 1.5,
+          },
+        },
+      },
+    };
+
+    render(
+      <WeatherQuantTerminal
+        snapshot={adjustedSnapshot}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    expect(screen.getByTestId("ensemble-intraday-adjusted-p50")).toBeInTheDocument();
+    expect(screen.getByTestId("ensemble-intraday-adjusted-band")).toBeInTheDocument();
+    expect(screen.getByTestId("ensemble-intraday-adjusted-legend")).toHaveTextContent("METAR Adj");
+  });
+
+  it("switches between All, Orders, and Open Positions in the unified panel", () => {
+    render(
+      <WeatherQuantTerminal
+        snapshot={FIXTURE_SNAPSHOT}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    const panel = screen.getByTestId("unified-orders-positions-panel");
+    expect(screen.queryByTestId("filter-tab-all")).not.toBeInTheDocument();
+
+    // Default (both tabs grey) shows 2 orders + 2 positions
+    expect(within(panel).getByTestId("unified-order-row-ord-evt-rksi-5")).toBeInTheDocument();
+    expect(within(panel).getByTestId("unified-position-row-pos-evt-rksi-6")).toBeInTheDocument();
+
+    // Click Orders -> shows orders only; click Orders again -> resets to all
+    fireEvent.click(screen.getByTestId("filter-tab-orders"));
+    expect(within(panel).getByTestId("unified-order-row-ord-evt-rksi-5")).toBeInTheDocument();
+    expect(within(panel).queryByTestId("unified-position-row-pos-evt-rksi-6")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("filter-tab-orders"));
+    expect(within(panel).getByTestId("unified-order-row-ord-evt-rksi-5")).toBeInTheDocument();
+    expect(within(panel).getByTestId("unified-position-row-pos-evt-rksi-6")).toBeInTheDocument();
+
+    // Click Positions -> shows open positions only; click Positions again -> resets to all
+    fireEvent.click(screen.getByTestId("filter-tab-positions"));
+    expect(within(panel).queryByTestId("unified-order-row-ord-evt-rksi-5")).not.toBeInTheDocument();
+    expect(within(panel).getByTestId("unified-position-row-pos-evt-rksi-6")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("filter-tab-positions"));
+    expect(within(panel).getByTestId("unified-order-row-ord-evt-rksi-5")).toBeInTheDocument();
+    expect(within(panel).getByTestId("unified-position-row-pos-evt-rksi-6")).toBeInTheDocument();
+  });
+
+  it("renders horizontal pink bucket level + same-day pink dot without vertical time axis label", () => {
+    render(
+      <WeatherQuantTerminal
+        snapshot={FIXTURE_SNAPSHOT}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    expect(screen.getByTestId("ensemble-entry-legend")).toHaveTextContent("ENTRY");
+    expect(screen.queryByTestId("ensemble-position-opened-panel")).not.toBeInTheDocument();
+    expect(screen.getByTestId("ensemble-position-line-pos-evt-rksi-6")).toBeInTheDocument();
+    // Opened on the same local date (2026-11-26 03:20 KST) -> pink dot, drop line, and pink time label
+    const dot = screen.getByTestId("ensemble-position-dot-pos-evt-rksi-6");
+    expect(dot).toHaveAttribute("fill", "#f472b6");
+    expect(screen.getByTestId("ensemble-position-dropline-pos-evt-rksi-6")).toBeInTheDocument();
+    // pos-evt-rksi-6 is on the 12°C bucket -> Y-axis pink label matches the bucket temperature (12.0°C)
+    expect(screen.getByTestId("ensemble-position-temp-pos-evt-rksi-6")).toHaveTextContent("12.0°C");
+    expect(screen.getByTestId("ensemble-position-time-pos-evt-rksi-6")).toHaveTextContent("03:20");
+    // Exact Opened date & time sits in the bottom-left corner of the chart card
+    expect(screen.getByTestId("ensemble-opened-at-pos-evt-rksi-6")).toHaveTextContent(
+      "Opened Nov 26 03:20",
+    );
+    expect(screen.queryByTestId("position-opened-at-pos-evt-rksi-6")).not.toBeInTheDocument();
+  });
+
+  it("hides yellow NOW indicator and same-day pink dot on tomorrow's chart while keeping horizontal pink level", () => {
+    const tomorrowSnapshot: TerminalSnapshotResponse = {
+      ...FIXTURE_SNAPSHOT,
+      server_time_utc: "2026-11-26T16:30:00Z", // Nov 26 13:30 Buenos Aires
+      xrays: {
+        ...FIXTURE_SNAPSHOT.xrays,
+        "evt-rksi": {
+          ...FIXTURE_SNAPSHOT.xrays["evt-rksi"],
+          event: {
+            ...FIXTURE_SNAPSHOT.xrays["evt-rksi"].event,
+            local_date: "2026-11-27",
+            station: {
+              ...FIXTURE_SNAPSHOT.xrays["evt-rksi"].event.station,
+              icao: "SAEZ",
+              city: "Buenos Aires",
+              timezone: "America/Argentina/Buenos_Aires",
+            },
+          },
+          latest_metar: {
+            ...FIXTURE_SNAPSHOT.xrays["evt-rksi"].latest_metar!,
+            station_icao: "SAEZ",
+            observed_at_utc: "2026-11-26T16:00:00Z",
+            temp_c: 26.0,
+            whole_temp_c: 26,
+          },
+          ensemble_fan: {
+            timestamps: [
+              "2026-11-27T03:00:00Z",
+              "2026-11-27T15:00:00Z",
+              "2026-11-28T02:00:00Z",
+            ],
+            p10: [17.0, 29.0, 22.0],
+            p50: [19.1, 31.9, 24.5],
+            p90: [21.0, 33.2, 26.5],
+            metar_points: [],
+            unit: "C",
+          },
+        },
+      },
+    };
+
+    render(
+      <WeatherQuantTerminal
+        snapshot={tomorrowSnapshot}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    expect(screen.queryByTestId("ensemble-now-indicator")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("ensemble-now-temp-label")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("ensemble-now-time-label")).not.toBeInTheDocument();
+    // Prior-day METAR (Nov 26) must not be displayed in the X-Ray header of a future-day (Nov 27) event
+    expect(screen.queryByTestId("xray-metar-line")).not.toBeInTheDocument();
+    // Position opened on a prior day (Nov 25) -> horizontal pink level + Y-axis temp + bottom-left Opened label, no dot/dropline/time
+    expect(screen.getByTestId("ensemble-position-line-pos-evt-rksi-6")).toBeInTheDocument();
+    expect(screen.getByTestId("ensemble-position-temp-pos-evt-rksi-6")).toHaveTextContent("12.0°C");
+    expect(screen.getByTestId("ensemble-opened-at-pos-evt-rksi-6")).toHaveTextContent("Opened Nov 25");
+    expect(screen.queryByTestId("ensemble-position-dot-pos-evt-rksi-6")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("ensemble-position-dropline-pos-evt-rksi-6")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("ensemble-position-time-pos-evt-rksi-6")).not.toBeInTheDocument();
   });
 });

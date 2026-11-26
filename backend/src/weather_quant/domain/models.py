@@ -112,6 +112,7 @@ class OrderBookSnapshot(BaseModel):
     best_ask: float | None = None
     midpoint: float | None = None
     spread: float | None = None
+    tick_size: float | None = None
     ingested_at_utc: datetime
     is_stale: bool = False
 
@@ -200,6 +201,7 @@ class SignalCard(BaseModel):
     bucket_label: str
     phase: Literal["PREMARKET_ENTRY", "INTRADAY_REPRICING"]
     side: Literal["BUY", "SELL"]
+    outcome_side: Literal["YES", "NO"] = "YES"
     fair_probability: float
     limit_price: float
     target_exit_price: float | None = None
@@ -220,12 +222,14 @@ class MakerOrder(BaseModel):
     bucket_id: str
     token_id: str
     side: Literal["BUY", "SELL"]
+    outcome_side: Literal["YES", "NO"] = "YES"
     limit_price: float
     size_shares: float
     size_usd: float
     post_only: bool = True
     phase: Literal["PREMARKET_ENTRY", "INTRADAY_REPRICING"]
     status: Literal["OPEN", "FILLED", "PARTIAL", "CANCELLED", "EXPIRED"] = "OPEN"
+    expected_edge: float | None = None
     model_version: str
     strategy_version: str
     created_at_utc: datetime
@@ -241,11 +245,14 @@ class FillRecord(BaseModel):
     station_icao: str
     bucket_id: str
     side: Literal["BUY", "SELL"]
+    outcome_side: Literal["YES", "NO"] = "YES"
     fill_price: float
     fill_shares: float
     fill_usd: float
     fee_usd: float = 0.0
     is_maker: bool = True
+    expected_edge: float | None = None
+    realized_edge: float | None = None
     model_version: str
     strategy_version: str
     filled_at_utc: datetime
@@ -259,15 +266,19 @@ class PositionRecord(BaseModel):
     station_icao: str
     bucket_id: str
     bucket_label: str
+    outcome_side: Literal["YES", "NO"] = "YES"
     shares: float
     avg_entry_price: float
     cost_basis_usd: float
     mark_price: float
     unrealized_pnl_usd: float = 0.0
     realized_pnl_usd: float = 0.0
+    expected_edge: float | None = None
+    realized_edge: float | None = None
     status: Literal["OPEN", "CLOSED", "SETTLED"] = "OPEN"
     model_version: str
     strategy_version: str
+    opened_at_utc: datetime | None = None
     updated_at_utc: datetime
 
 
@@ -278,6 +289,7 @@ class ClvSnapshot(BaseModel):
     fill_id: str
     event_id: str
     bucket_id: str
+    outcome_side: Literal["YES", "NO"] = "YES"
     entry_price: float
     benchmark_midpoint: float
     clv: float
