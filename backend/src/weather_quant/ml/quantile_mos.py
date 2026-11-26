@@ -267,12 +267,22 @@ class QuantileMosModel:
         if not valid:
             raise ValueError("Cannot train QuantileMosModel on empty training dataset.")
 
-        x_train = np.asarray([features_to_vector(s.features) for s in valid], dtype=np.float64)
-        y_train = np.asarray([float(s.target_temp_c) for s in valid], dtype=np.float64)
-
         merged_params = dict(DEFAULT_LGBM_PARAMS)
+        merged_params.setdefault("target_mode", "residual")
         if lgbm_params:
             merged_params.update(lgbm_params)
+
+        x_train = np.asarray([features_to_vector(s.features) for s in valid], dtype=np.float64)
+        if merged_params.get("target_mode") == "residual":
+            y_train = np.asarray(
+                [
+                    float(s.target_temp_c) - float(s.features.get("ensemble_mean_c", s.baseline_mean_c))
+                    for s in valid
+                ],
+                dtype=np.float64,
+            )
+        else:
+            y_train = np.asarray([float(s.target_temp_c) for s in valid], dtype=np.float64)
 
         num_boost_round = int(merged_params.get("n_estimators", 80))
         core_params: dict[str, Any] = {
@@ -321,10 +331,12 @@ class QuantileMosModel:
         x_mat = np.asarray([features_to_vector(f) for f in feature_dicts], dtype=np.float64)
         raw_by_q = {q: self.boosters[q].predict(x_mat) for q in self.quantiles}
 
+        is_residual = self.lgbm_params.get("target_mode") == "residual"
         results: list[dict[float, float]] = []
-        for idx in range(len(feature_dicts)):
+        for idx, feat in enumerate(feature_dicts):
+            base = float(feat.get("ensemble_mean_c", 0.0)) if is_residual else 0.0
             # Sort across quantiles to eliminate quantile crossing
-            sorted_vals = sorted(float(raw_by_q[q][idx]) for q in self.quantiles)
+            sorted_vals = sorted(base + float(raw_by_q[q][idx]) for q in self.quantiles)
             results.append({q: val for q, val in zip(self.quantiles, sorted_vals)})
         return results
 

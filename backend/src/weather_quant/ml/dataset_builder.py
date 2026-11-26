@@ -214,45 +214,61 @@ class HistoricalArchiveFetcher:
         for idx, block in enumerate(blocks):
             if not isinstance(block, dict):
                 continue
-            model_name = str(
-                block.get("model")
-                or (self._models[idx] if idx < len(self._models) else "unknown")
-            )
             hourly = block.get("hourly")
             if not isinstance(hourly, dict):
                 continue
             raw_times = hourly.get("time") or []
-            temps = hourly.get("temperature_2m") or []
-            winds = hourly.get("wind_speed_10m") or []
-            wind_dirs = hourly.get("wind_direction_10m") or []
-            clouds = hourly.get("cloud_cover") or []
-            rhs = hourly.get("relative_humidity_2m") or []
 
-            for pos, raw_ts in enumerate(raw_times):
-                if pos >= len(temps) or temps[pos] is None:
-                    continue
-                valid_utc = _parse_iso_utc(str(raw_ts))
-                # Archived forecast run was issued strictly before valid time (e.g. previous day 12Z)
-                run_day = (valid_utc - timedelta(hours=self._forecast_lead_hours)).date()
-                available_utc = datetime(run_day.year, run_day.month, run_day.day, 12, 0, tzinfo=timezone.utc)
-                if available_utc >= valid_utc:
-                    available_utc = valid_utc - timedelta(hours=self._forecast_lead_hours)
-
-                points.append(
-                    HistoricalForecastPoint(
-                        station_icao=station.icao,
-                        model=model_name,
-                        valid_at_utc=valid_utc,
-                        available_at_utc=available_utc,
-                        temperature_2m_c=float(temps[pos]),
-                        wind_speed_10m=float(winds[pos]) if pos < len(winds) and winds[pos] is not None else None,
-                        wind_direction_10m=(
-                            float(wind_dirs[pos]) if pos < len(wind_dirs) and wind_dirs[pos] is not None else None
-                        ),
-                        cloud_cover=float(clouds[pos]) if pos < len(clouds) and clouds[pos] is not None else None,
-                        relative_humidity_2m=float(rhs[pos]) if pos < len(rhs) and rhs[pos] is not None else None,
-                    )
+            # Open-Meteo returns model-suffixed keys (e.g. temperature_2m_ecmwf_ifs025) when
+            # multiple models are requested in a single dict block, and unsuffixed keys for a single model.
+            model_series: list[tuple[str, str]] = []
+            if "temperature_2m" in hourly:
+                model_name = str(
+                    block.get("model")
+                    or (self._models[idx] if idx < len(self._models) else "unknown")
                 )
+                model_series.append((model_name, ""))
+            else:
+                for m_name in self._models:
+                    if f"temperature_2m_{m_name}" in hourly:
+                        model_series.append((m_name, f"_{m_name}"))
+
+            station_tz = ZoneInfo(station.timezone)
+            for model_name, suffix in model_series:
+                temps = hourly.get(f"temperature_2m{suffix}") or []
+                winds = hourly.get(f"wind_speed_10m{suffix}") or []
+                wind_dirs = hourly.get(f"wind_direction_10m{suffix}") or []
+                clouds = hourly.get(f"cloud_cover{suffix}") or []
+                rhs = hourly.get(f"relative_humidity_2m{suffix}") or []
+
+                for pos, raw_ts in enumerate(raw_times):
+                    if pos >= len(temps) or temps[pos] is None:
+                        continue
+                    valid_utc = _parse_iso_utc(str(raw_ts))
+                    # Archived NWP run was issued strictly before the target local day's premarket window
+                    local_day = valid_utc.astimezone(station_tz).date()
+                    local_midnight_utc = datetime(
+                        local_day.year, local_day.month, local_day.day, 0, 0, tzinfo=station_tz
+                    ).astimezone(timezone.utc)
+                    available_utc = local_midnight_utc - timedelta(hours=self._forecast_lead_hours)
+                    if available_utc >= valid_utc:
+                        available_utc = valid_utc - timedelta(hours=self._forecast_lead_hours)
+
+                    points.append(
+                        HistoricalForecastPoint(
+                            station_icao=station.icao,
+                            model=model_name,
+                            valid_at_utc=valid_utc,
+                            available_at_utc=available_utc,
+                            temperature_2m_c=float(temps[pos]),
+                            wind_speed_10m=float(winds[pos]) if pos < len(winds) and winds[pos] is not None else None,
+                            wind_direction_10m=(
+                                float(wind_dirs[pos]) if pos < len(wind_dirs) and wind_dirs[pos] is not None else None
+                            ),
+                            cloud_cover=float(clouds[pos]) if pos < len(clouds) and clouds[pos] is not None else None,
+                            relative_humidity_2m=float(rhs[pos]) if pos < len(rhs) and rhs[pos] is not None else None,
+                        )
+                    )
         return points
 
     async def fetch_historical_routine_metars(

@@ -58,10 +58,10 @@ const METRIC_CHEATSHEET: Array<{
 }> = [
   {
     metric: "Brier Score (11 бакетов)",
-    great: "< 0.40",
-    ok: "0.40 – 0.55",
-    bad: "> 0.65",
-    note: "Суммарная квадратичная ошибка по всем 11 бакетам события. Чем ниже — тем точнее вероятности.",
+    great: "< 0.45 (Replay) / < 0.78 (Audit)",
+    ok: "0.45 – 0.58 / 0.78 – 0.82",
+    bad: "> 0.65 / > 0.86",
+    note: "В Replay ниже за счёт intraday METAR; в Audit — чистый premarket 00:00 на 1°C бакетах (ниже = точнее).",
   },
   {
     metric: "Log-Loss",

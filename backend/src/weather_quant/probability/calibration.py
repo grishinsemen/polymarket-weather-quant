@@ -454,7 +454,11 @@ async def load_local_calibration_samples(
                 else e.ingested_at_utc.replace(tzinfo=timezone.utc)
             ),
         )
+        today_local = now_utc.astimezone(tz).date()
         for d, day_obs in sorted(metars_by_day.items()):
+            # Strictly exclude incomplete in-progress/future local days
+            if d >= today_local:
+                continue
             if len(day_obs) < min_metars_per_day:
                 continue
             matched_snap = next(
