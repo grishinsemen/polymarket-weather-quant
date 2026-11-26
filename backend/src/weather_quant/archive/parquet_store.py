@@ -416,6 +416,18 @@ class ParquetArchiveStore:
             if max_date is not None and dt_str > max_date:
                 continue
             for file_path in sorted(part_dir.glob("*.parquet")):
+                if decision_utc is not None or start_norm is not None or end_norm is not None:
+                    ts_table = pq.read_table(file_path, columns=["ingested_at_utc"])
+                    if ts_table.num_rows == 0:
+                        continue
+                    has_match = any(
+                        (decision_utc is None or _ensure_utc(ts) < decision_utc)
+                        and (start_norm is None or _ensure_utc(ts) >= start_norm)
+                        and (end_norm is None or _ensure_utc(ts) <= end_norm)
+                        for ts in ts_table.column("ingested_at_utc").to_pylist()
+                    )
+                    if not has_match:
+                        continue
                 table = pq.read_table(file_path)
                 for row in table.to_pylist():
                     ingested = _ensure_utc(row["ingested_at_utc"])

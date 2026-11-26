@@ -728,3 +728,19 @@ async def test_replay_run_respects_lookback_hours_and_skips_missing_horizon(
         run = resp.json()["run"]
         assert run["strategy_version"] == "conservative-kelly-100-v1"
         assert datetime.fromisoformat(run["dataset_start_utc"]) >= now - timedelta(hours=24)
+
+
+def test_coalesce_replay_ticks_reduces_dense_ws_stamps_while_preserving_small_runs() -> None:
+    from weather_quant.replay.runner import _coalesce_replay_ticks
+
+    t0 = datetime(2026, 11, 26, 0, 0, tzinfo=timezone.utc)
+    small = {t0 + timedelta(seconds=i) for i in range(10)}
+    assert len(_coalesce_replay_ticks(small)) == 10
+
+    dense = {t0 + timedelta(seconds=i) for i in range(600)}
+    coalesced = _coalesce_replay_ticks(dense)
+    assert coalesced[0] == min(dense)
+    assert coalesced[-1] == max(dense)
+    assert len(coalesced) <= 12
+    for prev, nxt in zip(coalesced, coalesced[1:-1]):
+        assert (nxt - prev) >= timedelta(seconds=60)

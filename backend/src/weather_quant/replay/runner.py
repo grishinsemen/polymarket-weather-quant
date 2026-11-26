@@ -57,6 +57,25 @@ from weather_quant.strategy.paper_executor import PaperExecutor
 _EPS = 1e-9
 
 
+def _coalesce_replay_ticks(
+    raw_stamps: set[datetime],
+    *,
+    max_uncoalesced: int = 250,
+    min_step: timedelta = timedelta(seconds=60),
+) -> list[datetime]:
+    """Coalesce dense millisecond WS timestamps into 60s bars while preserving exact endpoints."""
+    ordered = sorted(raw_stamps)
+    if len(ordered) <= max_uncoalesced:
+        return ordered
+    coalesced = [ordered[0]]
+    for ts in ordered[1:-1]:
+        if ts - coalesced[-1] >= min_step:
+            coalesced.append(ts)
+    if ordered[-1] > coalesced[-1]:
+        coalesced.append(ordered[-1])
+    return coalesced
+
+
 class ReplayTradeEntry(BaseModel):
     """Normalized chronological trade log entry produced during an Experiment Replay."""
 
@@ -298,7 +317,7 @@ async def _execute_replay_isolated(
             raw_stamps.add(_ensure_utc(e.ingested_at_utc) + timedelta(milliseconds=1))
         for m in metars_sorted:
             raw_stamps.add(_ensure_utc(m.ingested_at_utc) + timedelta(milliseconds=1))
-        ticks = sorted(raw_stamps)
+        ticks = _coalesce_replay_ticks(raw_stamps)
 
     run_id = _deterministic_run_id(
         model_version=model_rec.model_version,
