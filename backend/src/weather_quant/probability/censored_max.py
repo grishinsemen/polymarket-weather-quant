@@ -58,16 +58,13 @@ def _build_covariance_matrix(
     stds: np.ndarray,
     *,
     phi: float,
-    obs_noise_c: float,
     synoptic_share: float,
 ) -> np.ndarray:
-    """Construct joint error covariance: Sigma_ij = syn_i*syn_j + u_i*u_j*phi^|t_i-t_j| + eps^2*delta_ij."""
+    """Construct latent diurnal error covariance: Sigma_ij = syn_i*syn_j + u_i*u_j*phi^|t_i-t_j|."""
     syn_scale = np.sqrt(max(0.0, min(1.0, synoptic_share))) * stds
     meso_scale = np.sqrt(max(0.0, 1.0 - max(0.0, min(1.0, synoptic_share)))) * stds
     lag_matrix = np.abs(hours[:, None] - hours[None, :])
-    cov = np.outer(syn_scale, syn_scale) + np.outer(meso_scale, meso_scale) * (phi ** lag_matrix)
-    cov += (obs_noise_c ** 2) * np.eye(len(hours), dtype=np.float64)
-    return cov
+    return np.outer(syn_scale, syn_scale) + np.outer(meso_scale, meso_scale) * (phi ** lag_matrix)
 
 
 def _safe_cholesky(matrix: np.ndarray) -> np.ndarray:
@@ -140,12 +137,12 @@ def simulate_censored_extreme(
         all_hours,
         all_stds,
         phi=phi,
-        obs_noise_c=obs_noise_c,
         synoptic_share=synoptic_share,
     )
 
     n_o = len(obs_hours)
-    sigma_oo = cov[:n_o, :n_o] + 1e-6 * np.eye(n_o, dtype=np.float64)
+    # Observation noise applies strictly to the observed METAR block sigma_oo, NOT future latent hours sigma_rr
+    sigma_oo = cov[:n_o, :n_o] + (obs_noise_c ** 2 + 1e-6) * np.eye(n_o, dtype=np.float64)
     sigma_ro = cov[n_o:, :n_o]
     sigma_rr = cov[n_o:, n_o:]
 

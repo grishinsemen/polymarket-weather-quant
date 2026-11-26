@@ -332,6 +332,43 @@ class Database:
                 now_iso,
             ),
         )
+        await self.conn.execute(
+            """
+            INSERT OR IGNORE INTO strategy_versions (
+                strategy_version, description, reference_bankroll, kelly_fraction,
+                max_bucket_usd, max_city_exposure_usd, intraday_cash_reserve_ratio,
+                min_edge, min_top_liquidity_usd, stale_feed_seconds,
+                cutoff_minutes_before_settlement, config_json, is_active, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "kelly-multi-strict-v2",
+                "V2 Multi-Outcome Fractional Kelly with market shrinkage, blackout/SPECI guards & strict fills",
+                100.0,
+                0.2,
+                5.0,
+                8.0,
+                0.4,
+                0.05,
+                5.0,
+                30,
+                30,
+                json.dumps(
+                    {
+                        "post_only": True,
+                        "phases": ["PREMARKET_ENTRY", "INTRADAY_REPRICING"],
+                        "enable_buy_no": True,
+                        "enable_market_shrinkage": True,
+                        "enable_multi_kelly": True,
+                        "enable_blackout_windows": True,
+                        "max_anomaly_divergence": 0.28,
+                        "strict_maker_fills": True,
+                    }
+                ),
+                0,
+                now_iso,
+            ),
+        )
 
     async def list_tables(self) -> list[str]:
         async with self.conn.execute(

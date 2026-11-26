@@ -271,7 +271,7 @@ class EnsembleProbabilityEngine:
         intraday_decay_hours: float = 6.0,
         obs_noise_c: float = 0.4,
         default_spread_inflation: float = DEFAULT_SPREAD_INFLATION,
-        use_censored_max: bool = True,
+        use_censored_max: bool = False,
     ) -> None:
         self.smoothing_alpha = smoothing_alpha
         self.bias_window_days = bias_window_days
