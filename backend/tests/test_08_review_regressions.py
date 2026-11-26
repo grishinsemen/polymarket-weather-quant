@@ -870,3 +870,76 @@ async def test_paper_executor_on_books_batches_fills_and_clv(tmp_path: Path) -> 
         assert clvs[0].clv == pytest.approx(0.10)
     finally:
         await db.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_progress_callback_and_status_endpoint(tmp_path: Path) -> None:
+    now = datetime(2026, 11, 26, 18, 0, tzinfo=timezone.utc)
+    clock = VirtualClock(now)
+    app = create_app(
+        db_path=":memory:",
+        world_feed=_FakeWorldFeed("LFPB", date(2026, 11, 26)),
+        clock=clock,
+        enable_background_poll=False,
+        archive_dir=str(tmp_path / "archive_progress"),
+    )
+    archive = ParquetArchiveStore(base_dir=tmp_path / "archive_progress")
+    app.state.parquet_archive = archive
+    app.state.ensemble_fetcher = _FakeEnsembleFetcher(clock)
+
+    with TestClient(app) as client:
+        idle = client.get("/api/replay/status")
+        assert idle.status_code == 200
+        assert idle.json()["is_running"] is False
+        assert idle.json()["pct"] == 0
+
+        await app.state.radar_service.sync_once()
+        event = (await app.state.db.list_weather_events(active_only=False))[0]
+        hours = [datetime(2026, 11, 26, h, 0, tzinfo=timezone.utc) for h in range(24)]
+        members = [[10.0 if h == 14 else 7.0 for h in range(24)] for _ in range(30)]
+        archive.write_ensemble_snapshots(
+            [
+                EnsembleSnapshot(
+                    event_id=event.event_id,
+                    station_icao=event.station.icao,
+                    fetched_at_utc=now - timedelta(hours=2),
+                    ingested_at_utc=now - timedelta(hours=2),
+                    models=["ecmwf_ifs025"],
+                    member_count=len(members),
+                    hourly_timestamps_utc=hours,
+                    member_temps_c=members,
+                )
+            ]
+        )
+        archive.write_orderbook_snapshots(
+            [
+                OrderBookSnapshot(
+                    event_id=event.event_id,
+                    bucket_id=event.buckets[0].bucket_id,
+                    token_id=event.buckets[0].token_id,
+                    bids=[OrderLevel(price=0.40, size=50.0)],
+                    asks=[OrderLevel(price=0.55, size=50.0)],
+                    best_bid=0.40,
+                    best_ask=0.55,
+                    midpoint=0.475,
+                    spread=0.15,
+                    tick_size=0.01,
+                    ingested_at_utc=now - timedelta(hours=1),
+                )
+            ]
+        )
+
+        updates: list[dict[str, Any]] = []
+        await run_experiment_replay(
+            db=app.state.db,
+            archive_store=archive,
+            model_version="ensemble-3layer-v1",
+            strategy_version="conservative-kelly-100-v1",
+            persist=False,
+            progress_cb=updates.append,
+        )
+        stages = [u["stage"] for u in updates]
+        assert "loading_archive" in stages
+        assert "simulating" in stages
+        assert "finalizing" in stages
+        assert updates[-1]["pct"] == 97

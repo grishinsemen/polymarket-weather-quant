@@ -5,7 +5,11 @@ import { CityXRayPanel } from "./CityXRayPanel";
 import { EdgeScreenerTable } from "./EdgeScreenerTable";
 import { ExperimentLabPanel } from "./ExperimentLabPanel";
 import { TopPortfolioBar, type TerminalTab, type WsStatus } from "./TopPortfolioBar";
-import type { ExperimentRunSummary, TerminalSnapshotResponse } from "@/types/terminal";
+import type {
+  ExperimentRunSummary,
+  ReplayProgressStatus,
+  TerminalSnapshotResponse,
+} from "@/types/terminal";
 
 interface WeatherQuantTerminalProps {
   snapshot: TerminalSnapshotResponse;
@@ -17,6 +21,7 @@ interface WeatherQuantTerminalProps {
   isSyncing?: boolean;
   isTogglingPause?: boolean;
   isRunningReplay?: boolean;
+  replayProgress?: ReplayProgressStatus | null;
   isActivatingPair?: boolean;
   promotingRunId?: string | null;
   replayWindowHours?: number | null;
@@ -44,6 +49,7 @@ export function WeatherQuantTerminal({
   isSyncing = false,
   isTogglingPause = false,
   isRunningReplay = false,
+  replayProgress = null,
   isActivatingPair = false,
   promotingRunId = null,
   replayWindowHours = 24,
@@ -163,6 +169,7 @@ export function WeatherQuantTerminal({
             activeModelVersion={snapshot.portfolio.active_model_version}
             activeStrategyVersion={snapshot.portfolio.active_strategy_version}
             isRunningReplay={isRunningReplay}
+            replayProgress={replayProgress}
             isActivatingPair={isActivatingPair}
             promotingRunId={promotingRunId}
             replayWindowHours={replayWindowHours}

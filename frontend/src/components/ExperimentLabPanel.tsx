@@ -4,6 +4,7 @@ import React from "react";
 import type {
   ExperimentRunSummary,
   ModelVersionRecord,
+  ReplayProgressStatus,
   StrategyVersionRecord,
 } from "@/types/terminal";
 
@@ -16,6 +17,7 @@ interface ExperimentLabPanelProps {
   activeModelVersion?: string;
   activeStrategyVersion?: string;
   isRunningReplay: boolean;
+  replayProgress?: ReplayProgressStatus | null;
   isActivatingPair?: boolean;
   promotingRunId: string | null;
   replayWindowHours?: number | null;
@@ -36,6 +38,7 @@ export function ExperimentLabPanel({
   activeModelVersion,
   activeStrategyVersion,
   isRunningReplay,
+  replayProgress = null,
   isActivatingPair = false,
   promotingRunId,
   replayWindowHours = 24,
@@ -51,6 +54,9 @@ export function ExperimentLabPanel({
     activeStrategyVersion !== undefined &&
     selectedModelVersion === activeModelVersion &&
     selectedStrategyVersion === activeStrategyVersion;
+  const showProgress = isRunningReplay || Boolean(replayProgress?.is_running);
+  const progressPct = Math.max(5, Math.min(100, replayProgress?.pct ?? 5));
+  const progressLabel = replayProgress?.label || "Starting Experiment Replay...";
 
   return (
     <section
@@ -133,6 +139,33 @@ export function ExperimentLabPanel({
           )}
         </div>
       </div>
+
+      {showProgress && (
+        <div
+          data-testid="replay-progress-bar"
+          className="px-4 py-2 border-b border-[#1c2638] bg-[#0a101b] space-y-1.5"
+        >
+          <div className="flex items-center justify-between text-[11px] font-mono-tabular">
+            <span className="text-sky-300">{progressLabel}</span>
+            <span className="text-slate-400">
+              {progressPct}%
+              {replayProgress && replayProgress.elapsed_seconds > 0
+                ? ` • ${replayProgress.elapsed_seconds.toFixed(1)}s`
+                : ""}
+            </span>
+          </div>
+          <div className="h-1.5 w-full rounded-full bg-[#162033] overflow-hidden">
+            <div
+              role="progressbar"
+              aria-valuenow={progressPct}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              style={{ width: `${progressPct}%` }}
+              className="h-full bg-sky-500 transition-[width] duration-300 ease-out"
+            />
+          </div>
+        </div>
+      )}
 
       {runs.length === 0 ? (
         <div className="p-8 text-center text-xs text-slate-500">

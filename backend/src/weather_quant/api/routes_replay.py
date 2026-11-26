@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -117,6 +119,20 @@ class ReplayRunResponse(BaseModel):
     run: ExperimentRunSummary
     trade_log: list[ReplayTradeEntry] = Field(default_factory=list)
     equity_curve: list[ReplayEquityPoint] = Field(default_factory=list)
+
+
+class ReplayProgressResponse(BaseModel):
+    """Live progress snapshot of an in-flight Experiment Replay."""
+
+    is_running: bool = False
+    stage: str = "idle"
+    label: str = ""
+    current: int = 0
+    total: int = 0
+    pct: int = 0
+    model_version: str | None = None
+    strategy_version: str | None = None
+    elapsed_seconds: float = 0.0
 
 
 class PromoteRequest(BaseModel):
@@ -1197,6 +1213,51 @@ async def get_replay_runs(
     return ReplayRunsResponse(count=len(runs), runs=runs)
 
 
+def _get_replay_progress_tracker(request: Request) -> tuple[threading.Lock, dict[str, Any]]:
+    tracker = getattr(request.app.state, "replay_progress_tracker", None)
+    if tracker is None:
+        tracker = (
+            threading.Lock(),
+            {
+                "is_running": False,
+                "stage": "idle",
+                "label": "",
+                "current": 0,
+                "total": 0,
+                "pct": 0,
+                "model_version": None,
+                "strategy_version": None,
+                "started_monotonic": None,
+            },
+        )
+        request.app.state.replay_progress_tracker = tracker
+    return tracker
+
+
+@router.get("/replay/status", response_model=ReplayProgressResponse)
+async def get_replay_status(request: Request) -> ReplayProgressResponse:
+    """Return current progress of an active Experiment Replay run."""
+    lock, state = _get_replay_progress_tracker(request)
+    with lock:
+        started = state.get("started_monotonic")
+        elapsed = (
+            round(max(0.0, time.monotonic() - started), 1)
+            if state["is_running"] and started is not None
+            else 0.0
+        )
+        return ReplayProgressResponse(
+            is_running=bool(state["is_running"]),
+            stage=str(state["stage"]),
+            label=str(state["label"]),
+            current=int(state["current"]),
+            total=int(state["total"]),
+            pct=int(state["pct"]),
+            model_version=state["model_version"],
+            strategy_version=state["strategy_version"],
+            elapsed_seconds=elapsed,
+        )
+
+
 @router.post("/replay/run", response_model=ReplayRunResponse)
 async def trigger_replay_run(
     request: Request,
@@ -1236,6 +1297,26 @@ async def trigger_replay_run(
         dataset_end_utc = resolved_end
         dataset_start_utc = resolved_end - timedelta(hours=req.lookback_hours)
 
+    lock, state = _get_replay_progress_tracker(request)
+    with lock:
+        state.update(
+            {
+                "is_running": True,
+                "stage": "loading_archive",
+                "label": "Reading Parquet archive...",
+                "current": 0,
+                "total": 0,
+                "pct": 5,
+                "model_version": target_mv,
+                "strategy_version": target_sv,
+                "started_monotonic": time.monotonic(),
+            }
+        )
+
+    def _on_progress(update: dict[str, Any]) -> None:
+        with lock:
+            state.update(update)
+
     try:
         res = await run_experiment_replay(
             db=db,
@@ -1247,11 +1328,25 @@ async def trigger_replay_run(
             events=events,
             mos_model=mos_model,
             persist=True,
+            progress_cb=_on_progress,
         )
     except TemporalIntegrityError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        with lock:
+            state.update(
+                {
+                    "is_running": False,
+                    "stage": "idle",
+                    "label": "",
+                    "current": 0,
+                    "total": 0,
+                    "pct": 0,
+                    "started_monotonic": None,
+                }
+            )
 
     return ReplayRunResponse(
         run=res.summary,

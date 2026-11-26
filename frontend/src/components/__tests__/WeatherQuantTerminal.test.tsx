@@ -644,4 +644,42 @@ describe("WeatherQuantTerminal", () => {
     fireEvent.click(screen.getByTestId("promote-run-exp-mos-2"));
     expect(onPromoteRun).toHaveBeenCalledWith(FIXTURE_SNAPSHOT.experiment_runs[1]);
   });
+
+  it("renders live replay progress bar beneath controls while replay is running", () => {
+    render(
+      <WeatherQuantTerminal
+        snapshot={FIXTURE_SNAPSHOT}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="experiments"
+        selectedModelVersion="mos-lgbm-v1"
+        selectedStrategyVersion="aggressive-kelly-100-v2"
+        isRunningReplay={true}
+        replayProgress={{
+          is_running: true,
+          stage: "simulating",
+          label: "Tick 120 / 200",
+          current: 120,
+          total: 200,
+          pct: 63,
+          elapsed_seconds: 12.4,
+        }}
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    const bar = screen.getByTestId("replay-progress-bar");
+    expect(bar).toHaveTextContent("Tick 120 / 200");
+    expect(bar).toHaveTextContent("63%");
+    expect(bar).toHaveTextContent("12.4s");
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "63");
+  });
 });

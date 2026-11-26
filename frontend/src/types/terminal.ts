@@ -210,6 +210,18 @@ export interface ExperimentRunSummary {
   created_at_utc: string;
 }
 
+export interface ReplayProgressStatus {
+  is_running: boolean;
+  stage: string;
+  label: string;
+  current: number;
+  total: number;
+  pct: number;
+  model_version?: string | null;
+  strategy_version?: string | null;
+  elapsed_seconds: number;
+}
+
 export interface TerminalSnapshotResponse {
   status: string;
   is_demo: boolean;

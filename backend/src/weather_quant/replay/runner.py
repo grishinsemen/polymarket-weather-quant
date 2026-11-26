@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field
@@ -55,6 +55,7 @@ from weather_quant.strategy.engine import (
 from weather_quant.strategy.paper_executor import PaperExecutor
 
 _EPS = 1e-9
+ReplayProgressCallback = Callable[[dict[str, Any]], None]
 
 
 def _coalesce_replay_ticks(
@@ -279,6 +280,7 @@ async def _execute_replay_isolated(
     strict_temporal: bool,
     mos_model: QuantileMosModel | None,
     recent_bias_by_station: Mapping[str, Sequence[DailyBiasObservation]],
+    progress_cb: ReplayProgressCallback | None = None,
 ) -> ExperimentReplayResult:
     start_utc = _ensure_utc(dataset_start_utc)
     end_utc = _ensure_utc(dataset_end_utc)
@@ -404,8 +406,20 @@ async def _execute_replay_isolated(
         for ev in events_sorted:
             events_by_icao.setdefault(ev.station.icao.upper(), []).append(ev.event_id)
         checked_close_events: set[str] = set()
+        total_ticks = len(ticks)
+        progress_step = max(1, total_ticks // 50) if total_ticks > 0 else 1
+        if progress_cb is not None:
+            progress_cb(
+                {
+                    "stage": "simulating",
+                    "label": f"Simulating 0 / {total_ticks} ticks",
+                    "current": 0,
+                    "total": total_ticks,
+                    "pct": 15,
+                }
+            )
 
-        for tick_time in ticks:
+        for tick_idx, tick_time in enumerate(ticks, start=1):
             clock.set(tick_time)
             dirty_events: set[str] = set()
             metar_arrived = False
@@ -517,6 +531,27 @@ async def _execute_replay_isolated(
                     realized_pnl_usd=round(portfolio.realized_pnl_usd, 6),
                     unrealized_pnl_usd=round(portfolio.unrealized_pnl_usd, 6),
                 )
+            )
+            if progress_cb is not None and (tick_idx % progress_step == 0 or tick_idx == total_ticks):
+                progress_cb(
+                    {
+                        "stage": "simulating",
+                        "label": f"Tick {tick_idx} / {total_ticks}",
+                        "current": tick_idx,
+                        "total": total_ticks,
+                        "pct": 15 + int(80 * (tick_idx / max(1, total_ticks))),
+                    }
+                )
+
+        if progress_cb is not None:
+            progress_cb(
+                {
+                    "stage": "finalizing",
+                    "label": "Computing metrics & saving...",
+                    "current": total_ticks,
+                    "total": total_ticks,
+                    "pct": 97,
+                }
             )
 
         # Final settlement check at dataset_end_utc
@@ -782,6 +817,7 @@ async def run_experiment_replay(
     mos_model: QuantileMosModel | None = None,
     recent_bias_by_station: Mapping[str, Sequence[DailyBiasObservation]] | None = None,
     persist: bool = True,
+    progress_cb: ReplayProgressCallback | None = None,
 ) -> ExperimentReplayResult:
     """Run a deterministic Parquet Experiment Replay off the live event loop."""
     models = {m.model_version: m for m in await db.list_model_versions()}
@@ -847,6 +883,17 @@ async def run_experiment_replay(
         )
         return all_books, all_ensembles, all_metars, resolved_start, resolved_end
 
+    if progress_cb is not None:
+        progress_cb(
+            {
+                "stage": "loading_archive",
+                "label": "Reading Parquet archive...",
+                "current": 0,
+                "total": 0,
+                "pct": 5,
+            }
+        )
+
     books, ensembles, metars, start_utc, end_utc = await asyncio.to_thread(_load_archive)
 
     result = await asyncio.to_thread(
@@ -864,6 +911,7 @@ async def run_experiment_replay(
             "strict_temporal": strict_temporal,
             "mos_model": mos_model,
             "recent_bias_by_station": recent_bias_by_station or {},
+            "progress_cb": progress_cb,
         },
     )
 

@@ -3,7 +3,11 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import type { TerminalTab, WsStatus } from "@/components/TopPortfolioBar";
 import { WeatherQuantTerminal } from "@/components/WeatherQuantTerminal";
-import type { ExperimentRunSummary, TerminalSnapshotResponse } from "@/types/terminal";
+import type {
+  ExperimentRunSummary,
+  ReplayProgressStatus,
+  TerminalSnapshotResponse,
+} from "@/types/terminal";
 
 const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE_URL ??
@@ -49,6 +53,7 @@ export function LiveRadarShell() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [isTogglingPause, setIsTogglingPause] = useState(false);
   const [isRunningReplay, setIsRunningReplay] = useState(false);
+  const [replayProgress, setReplayProgress] = useState<ReplayProgressStatus | null>(null);
   const [isActivatingPair, setIsActivatingPair] = useState(false);
   const [promotingRunId, setPromotingRunId] = useState<string | null>(null);
   const [replayWindowHours, setReplayWindowHours] = useState<number | null>(24);
@@ -141,6 +146,43 @@ export function LiveRadarShell() {
       socket?.close();
     };
   }, [fetchSnapshot]);
+
+  useEffect(() => {
+    if (!isRunningReplay) {
+      setReplayProgress(null);
+      return;
+    }
+    let cancelled = false;
+    setReplayProgress({
+      is_running: true,
+      stage: "loading_archive",
+      label: "Reading Parquet archive...",
+      current: 0,
+      total: 0,
+      pct: 5,
+      elapsed_seconds: 0,
+    });
+    const pollStatus = async () => {
+      try {
+        const resp = await fetch(`${API_BASE}/api/replay/status`, { cache: "no-store" });
+        if (!resp.ok || cancelled) return;
+        const data = (await resp.json()) as ReplayProgressStatus;
+        if (!cancelled && data.is_running) {
+          setReplayProgress(data);
+        }
+      } catch {
+        // Ignore transient poll errors while replay is computing
+      }
+    };
+    void pollStatus();
+    const timer = setInterval(() => {
+      void pollStatus();
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [isRunningReplay]);
 
   const handleFilterModel = useCallback(
     (mv: string) => {
@@ -280,6 +322,7 @@ export function LiveRadarShell() {
       isSyncing={isSyncing}
       isTogglingPause={isTogglingPause}
       isRunningReplay={isRunningReplay}
+      replayProgress={replayProgress}
       isActivatingPair={isActivatingPair}
       promotingRunId={promotingRunId}
       replayWindowHours={replayWindowHours}
