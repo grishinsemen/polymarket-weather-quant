@@ -306,8 +306,7 @@ def v2_multi_kelly_strict_manifest(created_at_utc: datetime | None = None) -> St
             "enable_buy_no": True,
             "enable_market_shrinkage": True,
             "enable_multi_kelly": True,
-            "enable_blackout_windows": True,
-            "max_anomaly_divergence": 0.28,
+            "enable_blackout_windows": False,
             "strict_maker_fills": True,
         },
         is_active=False,
@@ -1548,7 +1547,12 @@ class StrategyEngine:
             )
         )
         in_blackout, blackout_reason = (
-            is_metar_or_nwp_blackout(now, event.station.country)
+            is_metar_or_nwp_blackout(
+                now,
+                event.station.country,
+                metar_blackout_enabled=intraday,
+                nwp_blackout_enabled=True,
+            )
             if self.params.enable_blackout_windows
             else (False, None)
         )

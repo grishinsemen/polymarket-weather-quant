@@ -47,8 +47,14 @@ def test_bayesian_market_shrinkage_devigs_and_guards_wide_spreads() -> None:
     assert sum(shrunk) == pytest.approx(1.0, abs=1e-9)
     assert shrunk[0] == pytest.approx(0.70 * 0.60 + 0.30 * 0.40, abs=1e-6)
 
-    # Wide spread (> 6c) must bypass shrinkage and return raw model probs
-    unchanged = shrink_probabilities_to_market(model_p, mids, [0.10, 0.02, 0.02], lambda_mkt=0.30)
+    # Partial valid two-sided subset shrinks valid buckets while leaving wide-spread bucket unshrunk
+    partial = shrink_probabilities_to_market(model_p, mids, [0.10, 0.02, 0.02], lambda_mkt=0.30)
+    assert sum(partial) == pytest.approx(1.0, abs=1e-9)
+    assert partial[0] == pytest.approx(model_p[0], abs=1e-6)
+    assert partial[1] != pytest.approx(model_p[1])
+
+    # Fewer than 2 valid buckets must bypass shrinkage completely
+    unchanged = shrink_probabilities_to_market(model_p, mids, [0.10, 0.10, 0.02], lambda_mkt=0.30)
     assert unchanged == pytest.approx(model_p)
 
 
@@ -176,6 +182,12 @@ async def test_v2_strategy_engine_cancels_on_speci_and_blocks_anomaly_divergence
         clock = VirtualClock(t0)
         store = StrategyStore(db)
         manifest = v2_multi_kelly_strict_manifest(t0)
+        cfg = dict(manifest.config_json)
+        cfg["enable_blackout_windows"] = True
+        cfg["max_anomaly_divergence"] = 0.28
+        manifest = manifest.model_copy(
+            update={"strategy_version": "kelly-multi-strict-v2-guarded", "config_json": cfg}
+        )
         executor = PaperExecutor(db=db, clock=clock, store=store, strict_maker_fills=True)
         engine = StrategyEngine(db=db, executor=executor, clock=clock, manifest=manifest, store=store)
         await engine.initialize()

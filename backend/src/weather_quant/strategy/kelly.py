@@ -32,8 +32,10 @@ def shrink_probabilities_to_market(
 ) -> list[float]:
     """Bayesian shrinkage toward de-vigged two-sided CLOB midpoints.
 
-    Returns unchanged ``model_probs`` if books are incomplete, spreads exceed
-    ``max_spread``, or the sum of midpoints falls outside ``[min_mid_sum, max_mid_sum]``.
+    Applies shrinkage on all buckets with valid two-sided quotes (``spread <= max_spread``)
+    while leaving one-sided/illiquid tail buckets at their model probabilities.
+    Requires at least 2 valid buckets; when all buckets are valid, enforces
+    ``min_mid_sum <= sum(mids) <= max_mid_sum``.
     """
     n = len(model_probs)
     if n == 0 or lambda_mkt <= 0.0:
@@ -43,16 +45,39 @@ def shrink_probabilities_to_market(
     if len(market_mids) != n or len(spreads) != n:
         return [float(p) for p in model_probs]
 
-    if any(m is None or s is None or s > max_spread + _EPS or m < 0.0 for m, s in zip(market_mids, spreads)):
+    valid_idx = [
+        i
+        for i in range(n)
+        if market_mids[i] is not None
+        and spreads[i] is not None
+        and float(spreads[i]) <= max_spread + _EPS  # type: ignore[arg-type]
+        and float(market_mids[i]) >= 0.0  # type: ignore[arg-type]
+    ]
+    if len(valid_idx) < 2:
         return [float(p) for p in model_probs]
 
-    raw_mids = [float(m) for m in market_mids]  # type: ignore[arg-type]
-    mid_sum = sum(raw_mids)
-    if mid_sum < min_mid_sum or mid_sum > max_mid_sum or mid_sum <= _EPS:
+    valid_mid_sum = sum(float(market_mids[i]) for i in valid_idx)  # type: ignore[arg-type]
+    if valid_mid_sum <= _EPS:
         return [float(p) for p in model_probs]
 
-    devigged = [m / mid_sum for m in raw_mids]
-    blended = [(1.0 - lam) * float(p) + lam * q for p, q in zip(model_probs, devigged)]
+    if len(valid_idx) == n:
+        if valid_mid_sum < min_mid_sum or valid_mid_sum > max_mid_sum:
+            return [float(p) for p in model_probs]
+        valid_mass = 1.0
+    else:
+        valid_mass = sum(float(model_probs[i]) for i in valid_idx)
+        if valid_mass <= _EPS:
+            return [float(p) for p in model_probs]
+
+    valid_set = set(valid_idx)
+    blended: list[float] = []
+    for i in range(n):
+        if i in valid_set:
+            q_i = (float(market_mids[i]) / valid_mid_sum) * valid_mass  # type: ignore[arg-type]
+            blended.append((1.0 - lam) * float(model_probs[i]) + lam * q_i)
+        else:
+            blended.append(float(model_probs[i]))
+
     total = sum(blended)
     if total <= _EPS:
         return [float(p) for p in model_probs]

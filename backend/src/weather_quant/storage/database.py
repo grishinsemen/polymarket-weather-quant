@@ -360,8 +360,7 @@ class Database:
                         "enable_buy_no": True,
                         "enable_market_shrinkage": True,
                         "enable_multi_kelly": True,
-                        "enable_blackout_windows": True,
-                        "max_anomaly_divergence": 0.28,
+                        "enable_blackout_windows": False,
                         "strict_maker_fills": True,
                     }
                 ),
