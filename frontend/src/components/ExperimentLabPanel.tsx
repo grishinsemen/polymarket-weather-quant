@@ -327,9 +327,12 @@ export function ExperimentLabPanel({
           No Experiment Replay runs recorded yet. Click Run Experiment Replay above.
         </div>
       ) : (
-        <div className="overflow-x-auto">
+        <div
+          data-testid="experiment-runs-scroll"
+          className={`overflow-x-auto ${visibleRuns.length > 15 ? "max-h-[708px] overflow-y-auto" : ""}`}
+        >
           <table className="w-full text-left border-collapse text-xs">
-            <thead>
+            <thead className="sticky top-0 z-10 bg-[#0a101b]">
               <tr className="border-b border-[#1c2638] bg-[#0a101b] text-[10px] uppercase tracking-wider text-slate-400">
                 <th className="px-3 py-2 font-medium whitespace-nowrap">
                   <button

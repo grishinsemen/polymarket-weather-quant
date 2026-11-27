@@ -162,8 +162,9 @@ class ExitModeComparisonResult(BaseModel):
 def compute_equity_sharpe(equity_curve: Sequence[ReplayEquityPoint]) -> float:
     """Compute a deterministic Sharpe ratio from an Experiment Replay equity curve.
 
-    Uses end-of-day UTC equity returns annualized by ``sqrt(365)`` when >= 2 distinct days
-    are observed; otherwise uses non-zero step returns scaled by ``sqrt(N)`` for intraday runs.
+    Uses end-of-day UTC equity returns annualized by ``sqrt(365)`` when >= 7 distinct days
+    are observed (avoiding small-sample inflation on 2-day transitions); otherwise uses
+    non-zero step returns scaled by ``sqrt(N)`` for short/intraday runs.
     """
     if len(equity_curve) < 2:
         return 0.0
@@ -173,7 +174,7 @@ def compute_equity_sharpe(equity_curve: Sequence[ReplayEquityPoint]) -> float:
         day_key = _ensure_utc(pt.timestamp_utc).strftime("%Y-%m-%d")
         by_day[day_key] = pt.equity_usd
 
-    if len(by_day) >= 3:
+    if len(by_day) >= 7:
         ordered_eq = [by_day[k] for k in sorted(by_day)]
         returns = [
             (ordered_eq[i] - ordered_eq[i - 1]) / ordered_eq[i - 1]

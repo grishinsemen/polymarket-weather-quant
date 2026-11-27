@@ -211,3 +211,29 @@ async def test_residual_mos_train_persist_reload_and_drift_route(tmp_path: Path)
         body = resp.json()
         assert body["alert_count"] == 0
         assert body["station_count"] == 0
+
+
+def test_compute_equity_sharpe_requires_seven_days_before_annualizing() -> None:
+    """Short 3-day replays should not inflate Sharpe via sqrt(365) on just 2 daily returns."""
+    from weather_quant.replay.runner import ReplayEquityPoint, compute_equity_sharpe
+
+    t0 = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    three_day_curve = [
+        ReplayEquityPoint(timestamp_utc=t0, equity_usd=100.0, realized_pnl_usd=0.0, unrealized_pnl_usd=0.0),
+        ReplayEquityPoint(timestamp_utc=t0 + timedelta(days=1), equity_usd=104.0, realized_pnl_usd=4.0, unrealized_pnl_usd=0.0),
+        ReplayEquityPoint(timestamp_utc=t0 + timedelta(days=2), equity_usd=109.0, realized_pnl_usd=9.0, unrealized_pnl_usd=0.0),
+    ]
+    short_sharpe = compute_equity_sharpe(three_day_curve)
+    assert 0.0 < short_sharpe < 15.0  # step-scaled sqrt(2), not sqrt(365) (~100+)
+
+    seven_day_curve = [
+        ReplayEquityPoint(
+            timestamp_utc=t0 + timedelta(days=i),
+            equity_usd=100.0 + i * 2.0 + (0.5 if i % 2 else 0.0),
+            realized_pnl_usd=i * 2.0,
+            unrealized_pnl_usd=0.0,
+        )
+        for i in range(7)
+    ]
+    long_sharpe = compute_equity_sharpe(seven_day_curve)
+    assert long_sharpe > short_sharpe
