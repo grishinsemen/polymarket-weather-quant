@@ -17,8 +17,10 @@ from weather_quant.archive.parquet_store import ParquetArchiveStore
 from weather_quant.clob.orderbook_ws import ClobOrderBookStream
 from weather_quant.domain.clock import Clock, SystemClock, ensure_utc
 from weather_quant.domain.models import EnsembleSnapshot, MetarObservation, WeatherEvent
+from weather_quant.feeds.hub import ExternalMosFeedHub
 from weather_quant.ml.quantile_mos import load_mos_provider_for_version
 from weather_quant.probability.engine import (
+    DailyBiasObservation,
     EnsembleProbabilityEngine,
     build_daily_bias_observations_from_history,
     list_station_routine_metars,
@@ -110,6 +112,16 @@ class AutonomousRuntime:
             engine = EnsembleProbabilityEngine()
             self.app.state.probability_engine = engine
         return engine
+
+    def _get_mos_feed_hub(self) -> ExternalMosFeedHub:
+        hub = getattr(self.app.state, "mos_feed_hub", None)
+        if not isinstance(hub, ExternalMosFeedHub):
+            db: Database = self.app.state.db
+            clock: Clock = getattr(self.app.state, "clock", None) or SystemClock()
+            # Disable live external HTTP feeds in ephemeral :memory: test runs unless explicitly injected
+            hub = ExternalMosFeedHub(clock=clock, enabled=(db.db_path != ":memory:"))
+            self.app.state.mos_feed_hub = hub
+        return hub
 
     async def _get_strategy_engine(self) -> StrategyEngine:
         engine: StrategyEngine | None = getattr(self.app.state, "strategy_engine", None)
@@ -362,6 +374,35 @@ class AutonomousRuntime:
                 except Exception:
                     self._hist_ensembles_cache = []
             hist_ensembles = self._hist_ensembles_cache
+            mos_hub = self._get_mos_feed_hub()
+
+            # Build per-event station bias and cross-station hierarchical global bias pool
+            event_metars_cache: dict[str, list[MetarObservation]] = {}
+            station_bias_by_event: dict[str, list[DailyBiasObservation]] = {}
+            global_bias_pool: list[DailyBiasObservation] = []
+            seen_global_keys: set[tuple[str, str]] = set()
+            for event in events:
+                if settlement_close_utc(event) <= now_utc:
+                    continue
+                icao = event.station.icao.upper()
+                if icao not in event_metars_cache:
+                    event_metars_cache[icao] = await list_station_routine_metars(db, icao)
+                s_bias = build_daily_bias_observations_from_history(
+                    station=event.station,
+                    polarity=event.polarity,
+                    remark_tenths_enabled=event.remark_tenths_enabled,
+                    ensembles=hist_ensembles,
+                    metars=event_metars_cache[icao],
+                    before_local_date=event.local_date,
+                    window_days=prob_engine.bias_window_days,
+                    decision_time_utc=now_utc,
+                )
+                station_bias_by_event[event.event_id] = s_bias
+                for b_obs in s_bias:
+                    gk = (icao, b_obs.local_date.isoformat())
+                    if gk not in seen_global_keys:
+                        seen_global_keys.add(gk)
+                        global_bias_pool.append(b_obs)
 
             for event in events:
                 if settlement_close_utc(event) <= now_utc:
@@ -369,17 +410,9 @@ class AutonomousRuntime:
                 ensemble = await self._ensure_event_ensemble(event, fetcher, archive, now_utc)
                 if ensemble is None:
                     continue
-                intraday_metars = await list_station_routine_metars(db, event.station.icao)
-                recent_bias_obs = build_daily_bias_observations_from_history(
-                    station=event.station,
-                    polarity=event.polarity,
-                    remark_tenths_enabled=event.remark_tenths_enabled,
-                    ensembles=hist_ensembles,
-                    metars=intraday_metars,
-                    before_local_date=event.local_date,
-                    window_days=prob_engine.bias_window_days,
-                    decision_time_utc=now_utc,
-                )
+                ensemble = await mos_hub.enrich_ensemble(ensemble, event.station, event.local_date)
+                intraday_metars = event_metars_cache.get(event.station.icao.upper(), [])
+                recent_bias_obs = station_bias_by_event.get(event.event_id, [])
                 try:
                     if mos_provider is not None and mos_provider.is_station_covered(event.station.icao):
                         prob_snap = mos_provider.compute_probabilities(
@@ -399,6 +432,7 @@ class AutonomousRuntime:
                             intraday_metars=intraday_metars,
                             clock=clock,
                             model_version=active_mv,
+                            global_bias_obs=global_bias_pool,
                         )
                 except (ValueError, ZoneInfoNotFoundError) as exc:
                     logger.warning(

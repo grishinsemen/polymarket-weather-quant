@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from weather_quant.archive.parquet_store import ParquetArchiveStore
 from weather_quant.discovery.stations import get_station
 from weather_quant.domain.clock import Clock, TemporalIntegrityError
 from weather_quant.domain.models import ModelVersionRecord, Polarity, Station
+from weather_quant.feeds.previous_runs import PreviousRunsArchiveFetcher
 from weather_quant.ml.dataset_builder import (
     TOP_LIQUIDITY_STATIONS,
     HistoricalArchiveFetcher,
@@ -25,6 +27,9 @@ from weather_quant.ml.quantile_mos import (
     MosProbabilityProvider,
     train_and_register_mos,
 )
+from weather_quant.ml.residual_mos import train_and_register_residual_mos
+from weather_quant.probability.calibration import load_local_calibration_samples
+from weather_quant.probability.drift import DriftReport, evaluate_residual_drift
 from weather_quant.probability.engine import DEFAULT_MODEL_VERSION
 from weather_quant.storage.database import Database
 
@@ -56,9 +61,11 @@ class MlBenchmarksResponse(BaseModel):
 
 
 class MlTrainRequest(BaseModel):
-    """Request payload to trigger out-of-band Quantile LightGBM MOS training."""
+    """Request payload to trigger out-of-band Quantile/Residual LightGBM MOS training."""
 
     model_version: str | None = None
+    model_family: Literal["quantile", "residual"] = "quantile"
+    use_previous_runs: bool = False
     samples: list[MosDatasetSample] | None = None
     station_icaos: list[str] = Field(default_factory=lambda: list(TOP_LIQUIDITY_STATIONS))
     start_date: date | None = None
@@ -69,6 +76,14 @@ class MlTrainRequest(BaseModel):
     quantiles: list[float] = Field(default_factory=lambda: list(DEFAULT_QUANTILES))
     lgbm_params: dict[str, Any] | None = None
     activate: bool = True
+
+
+class MlDriftResponse(BaseModel):
+    """Per-station residual KS + CUSUM concept-drift diagnostics."""
+
+    alert_count: int
+    station_count: int
+    reports: list[DriftReport] = Field(default_factory=list)
 
 
 class MlTrainResponse(BaseModel):
@@ -186,7 +201,11 @@ async def train_mos_model(
     if req.samples is not None:
         samples = sorted(req.samples, key=lambda s: s.decision_time_utc)
     else:
-        fetcher = _get_historical_fetcher(request, clock)
+        fetcher: HistoricalArchiveFetcherPort = (
+            PreviousRunsArchiveFetcher(clock=clock)
+            if req.use_previous_runs and getattr(request.app.state, "historical_fetcher", None) is None
+            else _get_historical_fetcher(request, clock)
+        )
         end_d = req.end_date or (now_utc.date() - timedelta(days=1))
         start_d = req.start_date or (end_d - timedelta(days=90))
         samples = []
@@ -214,19 +233,34 @@ async def train_mos_model(
         else:
             t_train_end, t_val_start, t_test_start = _derive_default_split(samples)
 
-        mos_model, record, benchmark = await train_and_register_mos(
-            db=db,
-            samples=samples,
-            model_version=model_version,
-            train_end_utc=t_train_end,
-            val_start_utc=t_val_start,
-            test_start_utc=t_test_start,
-            quantiles=req.quantiles,
-            covered_stations=req.station_icaos,
-            lgbm_params=req.lgbm_params,
-            activate=req.activate,
-            clock=clock,
-        )
+        if req.model_family == "residual":
+            mos_model, record, benchmark = await train_and_register_residual_mos(
+                db=db,
+                samples=samples,
+                model_version=model_version,
+                train_end_utc=t_train_end,
+                val_start_utc=t_val_start,
+                test_start_utc=t_test_start,
+                quantiles=req.quantiles,
+                covered_stations=req.station_icaos,
+                lgbm_params=req.lgbm_params,
+                activate=req.activate,
+                clock=clock,
+            )
+        else:
+            mos_model, record, benchmark = await train_and_register_mos(
+                db=db,
+                samples=samples,
+                model_version=model_version,
+                train_end_utc=t_train_end,
+                val_start_utc=t_val_start,
+                test_start_utc=t_test_start,
+                quantiles=req.quantiles,
+                covered_stations=req.station_icaos,
+                lgbm_params=req.lgbm_params,
+                activate=req.activate,
+                clock=clock,
+            )
     except TemporalIntegrityError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ValueError as exc:
@@ -239,4 +273,42 @@ async def train_mos_model(
         model_version=record,
         benchmark=benchmark,
         covered_stations=list(mos_model.covered_stations),
+    )
+
+
+@router.get("/drift", response_model=MlDriftResponse)
+async def get_residual_drift_reports(
+    request: Request,
+    lookback_days: int = 45,
+) -> MlDriftResponse:
+    """Evaluate per-station forecast residual KS + 14-day CUSUM drift from local archives."""
+    db = _get_db(request)
+    archive = getattr(request.app.state, "parquet_archive", None)
+    if not isinstance(archive, ParquetArchiveStore):
+        archive_dir = getattr(request.app.state, "archive_dir", "data/archive")
+        archive = ParquetArchiveStore(base_dir=archive_dir)
+
+    samples = await load_local_calibration_samples(db, archive, lookback_days=lookback_days)
+    residuals_by_station: dict[str, list[float]] = {}
+    for sample in sorted(samples, key=lambda s: s.local_date):
+        icao = sample.station.icao.strip().upper()
+        day_temps = [
+            max(traj) if sample.polarity == Polarity.HIGHEST else min(traj)
+            for traj in sample.ensemble.member_temps_c
+            if traj
+        ]
+        if not day_temps:
+            continue
+        day_temps.sort()
+        p50 = day_temps[len(day_temps) // 2]
+        residuals_by_station.setdefault(icao, []).append(sample.actual_extreme_c - p50)
+
+    reports = [
+        evaluate_residual_drift(icao, res_list)
+        for icao, res_list in sorted(residuals_by_station.items())
+    ]
+    return MlDriftResponse(
+        alert_count=sum(1 for r in reports if r.alert),
+        station_count=len(reports),
+        reports=reports,
     )

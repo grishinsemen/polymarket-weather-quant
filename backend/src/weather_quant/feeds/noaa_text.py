@@ -119,6 +119,31 @@ def parse_noaa_text_bulletin(
     )
 
 
+def _index_bulletin_blocks(raw_text: str) -> dict[str, str]:
+    """Index ASCII bulletin text by 4-char station header (keeps only US/K-prefix & ICAO blocks)."""
+    blocks: dict[str, str] = {}
+    current_icao: str | None = None
+    buf: list[str] = []
+    for line in raw_text.splitlines():
+        m = _HEADER_RE.match(line)
+        if m:
+            if current_icao is not None and buf:
+                blocks[current_icao] = "\n".join(buf)
+            cand = m.group(1).upper()
+            # Keep standard 4-letter US ICAO stations (K*, P*) to keep cache tiny
+            if cand.startswith(("K", "P")):
+                current_icao = cand
+                buf = [line]
+            else:
+                current_icao = None
+                buf = []
+        elif current_icao is not None:
+            buf.append(line)
+    if current_icao is not None and buf:
+        blocks[current_icao] = "\n".join(buf)
+    return blocks
+
+
 class NoaaTextMosClient:
     """Async client fetching NOAA NBS (NBM v5.0) and LAMP (LAV) text bulletins."""
 
@@ -127,11 +152,12 @@ class NoaaTextMosClient:
         *,
         client: httpx.AsyncClient | None = None,
         clock: Clock | None = None,
-        timeout_seconds: float = 20.0,
+        timeout_seconds: float = 25.0,
     ) -> None:
         self._external_client = client
         self._clock: Clock = clock or SystemClock()
         self._timeout_seconds = timeout_seconds
+        self._nbm_block_cache: dict[tuple[str, int], dict[str, str]] = {}
 
     async def fetch_nbm_nbs(
         self,
@@ -140,21 +166,43 @@ class NoaaTextMosClient:
         *,
         cycle_utc: datetime | None = None,
     ) -> ExternalMosForecast | None:
-        ref = cycle_utc or self._clock.now()
-        cycle_hour = (ref.hour // 6) * 6
-        url = NOAA_NBM_NBS_URL.format(ymd=ref.strftime("%Y%m%d"), cycle=cycle_hour)
+        if cycle_utc is not None:
+            candidate_refs = [cycle_utc]
+        else:
+            # Account for ~75m NBM publication latency and fall back one 6h cycle if 404.
+            base = self._clock.now() - timedelta(minutes=75)
+            candidate_refs = [base, base - timedelta(hours=6)]
+
+        target_icao = station.icao.strip().upper()
         owns = self._external_client is None
         client = self._external_client or httpx.AsyncClient(timeout=self._timeout_seconds)
         try:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            return parse_noaa_text_bulletin(
-                resp.text,
-                station=station,
-                target_local_date=target_local_date,
-                source="noaa_nbm_nbs",
-                ingested_at_utc=self._clock.now(),
-            )
+            for idx, ref in enumerate(candidate_refs):
+                ymd = ref.strftime("%Y%m%d")
+                cycle_hour = (ref.hour // 6) * 6
+                cache_key = (ymd, cycle_hour)
+                blocks = self._nbm_block_cache.get(cache_key)
+                if blocks is None:
+                    url = NOAA_NBM_NBS_URL.format(ymd=ymd, cycle=cycle_hour)
+                    resp = await client.get(url)
+                    if resp.status_code == 404 and idx + 1 < len(candidate_refs):
+                        continue
+                    resp.raise_for_status()
+                    blocks = _index_bulletin_blocks(resp.text)
+                    if len(self._nbm_block_cache) >= 2:
+                        self._nbm_block_cache.clear()
+                    self._nbm_block_cache[cache_key] = blocks
+                station_block = blocks.get(target_icao)
+                if not station_block:
+                    return None
+                return parse_noaa_text_bulletin(
+                    station_block,
+                    station=station,
+                    target_local_date=target_local_date,
+                    source="noaa_nbm_nbs",
+                    ingested_at_utc=self._clock.now(),
+                )
+            return None
         finally:
             if owns:
                 await client.aclose()

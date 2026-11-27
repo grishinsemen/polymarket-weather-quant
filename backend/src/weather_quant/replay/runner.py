@@ -659,6 +659,11 @@ async def _execute_replay_isolated(
                 prob_key = (_ensure_utc(ens.ingested_at_utc), len(station_metars))
                 if last_prob_input_stamp.get(event.event_id) != prob_key:
                     bias_obs = recent_bias_by_station.get(event.station.icao.upper(), ())
+                    global_bias_obs = [
+                        obs
+                        for obs_list in recent_bias_by_station.values()
+                        for obs in obs_list
+                    ]
                     try:
                         if mos_provider is not None and mos_provider.is_station_covered(event.station.icao):
                             snap = mos_provider.compute_probabilities(
@@ -690,6 +695,7 @@ async def _execute_replay_isolated(
                                 clock=clock,
                                 model_version=model_rec.model_version,
                                 strict_temporal=strict_temporal,
+                                global_bias_obs=global_bias_obs,
                             )
                     except TemporalIntegrityError:
                         raise

@@ -7,18 +7,23 @@ extrapolate linearly via EMOS rather than plateauing at tree leaf bounds.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import math
-from typing import Any, Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Sequence
 
 import lightgbm as lgb
 import numpy as np
 from scipy.optimize import minimize_scalar
 
-from weather_quant.domain.clock import Clock
+from weather_quant.domain.clock import Clock, SystemClock, ensure_utc
 from weather_quant.domain.models import (
     EnsembleSnapshot,
     EventProbabilitySnapshot,
     MetarObservation,
+    ModelVersionRecord,
     Station,
     WeatherEvent,
 )
@@ -30,10 +35,18 @@ from weather_quant.ml.dataset_builder import (
 )
 from weather_quant.ml.quantile_mos import (
     DEFAULT_LGBM_PARAMS,
+    DEFAULT_MODELS_DIR,
     DEFAULT_QUANTILES,
+    ChronologicalBenchmarkReport,
     QuantileMosModel,
+    evaluate_mos_vs_baseline,
+    register_model_version,
+    split_chronologically,
 )
-from weather_quant.probability.engine import DailyBiasObservation
+from weather_quant.probability.engine import DailyBiasObservation, map_extremes_c_to_probabilities
+
+if TYPE_CHECKING:
+    from weather_quant.storage.database import Database
 
 DEFAULT_MAX_RESIDUAL_DELTA_C = 3.0
 _LOG_EPS = 1e-9
@@ -272,3 +285,164 @@ class ResidualMosModel(QuantileMosModel):
                 "probability_sum": sum(b.fair_probability for b in updated_buckets),
             }
         )
+
+
+def save_residual_mos_model(
+    mos_model: ResidualMosModel,
+    models_dir: Path | str = DEFAULT_MODELS_DIR,
+) -> Path:
+    """Persist trained ResidualMosModel LightGBM boosters + temperature metadata as JSON."""
+    out_dir = Path(models_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = mos_model.model_version.replace("/", "_").replace("\\", "_")
+    path = out_dir / f"{safe_name}.json"
+    payload = {
+        "model_family": "residual",
+        "model_version": mos_model.model_version,
+        "quantiles": list(mos_model.quantiles),
+        "covered_stations": list(mos_model.covered_stations),
+        "feature_columns": list(mos_model.feature_columns),
+        "lgbm_params": mos_model.lgbm_params,
+        "max_residual_delta_c": mos_model.max_residual_delta_c,
+        "temperature": mos_model.temperature,
+        "boosters": {str(q): booster.model_to_string() for q, booster in mos_model.boosters.items()},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _train_and_eval_residual_sync(
+    samples: Sequence[MosDatasetSample],
+    *,
+    model_version: str,
+    train_end_utc: datetime,
+    val_start_utc: datetime,
+    test_start_utc: datetime,
+    quantiles: Sequence[float],
+    covered_stations: Sequence[str],
+    lgbm_params: dict[str, Any] | None,
+    max_residual_delta_c: float,
+) -> tuple[ResidualMosModel, ChronologicalBenchmarkReport, bool]:
+    train_s, val_s, test_s = split_chronologically(
+        samples,
+        train_end=train_end_utc,
+        val_start=val_start_utc,
+        test_start=test_start_utc,
+    )
+    model = ResidualMosModel.fit(
+        train_s,
+        model_version=model_version,
+        quantiles=quantiles,
+        covered_stations=covered_stations,
+        lgbm_params=lgbm_params,
+        max_residual_delta_c=max_residual_delta_c,
+        temperature=1.0,
+    )
+    # Fit 1-parameter Temperature Scaling on validation set multi-class Log-Loss
+    from weather_quant.probability.calibration import build_synthetic_degree_buckets, resolve_bucket_index
+    from weather_quant.probability.engine import round_half_away
+
+    val_labeled = [s for s in val_s if s.target_temp_c is not None]
+    if val_labeled:
+        q_preds = model.predict_quantiles([s.features for s in val_labeled])
+        probs_list: list[list[float]] = []
+        true_indices: list[int] = []
+        for sample, q_map in zip(val_labeled, q_preds):
+            assert sample.target_temp_c is not None
+            center = round_half_away(sample.baseline_mean_c)
+            buckets = build_synthetic_degree_buckets(center)
+            true_idx = resolve_bucket_index(sample.target_temp_c, buckets)
+            extremes = model.quantiles_to_extremes(q_map)
+            probs = map_extremes_c_to_probabilities(extremes, buckets, [False] * len(buckets))
+            probs_list.append(probs)
+            true_indices.append(true_idx)
+        model.temperature = fit_temperature_scaling(probs_list, true_indices)
+
+    report = evaluate_mos_vs_baseline(
+        model,
+        train_samples=train_s,
+        val_samples=val_s,
+        test_samples=test_s,
+    )
+    passed_gate = evaluate_station_overfit_gate(
+        mos_val_brier=report.validation_mos.brier_score,
+        base_val_brier=report.validation_baseline.brier_score,
+        mos_test_brier=report.test_mos.brier_score,
+        base_test_brier=report.test_baseline.brier_score,
+    )
+    return model, report, passed_gate
+
+
+async def train_and_register_residual_mos(
+    *,
+    db: Database,
+    samples: Sequence[MosDatasetSample],
+    model_version: str,
+    train_end_utc: datetime,
+    val_start_utc: datetime,
+    test_start_utc: datetime,
+    quantiles: Sequence[float] = DEFAULT_QUANTILES,
+    covered_stations: Sequence[str] = TOP_LIQUIDITY_STATIONS,
+    lgbm_params: dict[str, Any] | None = None,
+    max_residual_delta_c: float = DEFAULT_MAX_RESIDUAL_DELTA_C,
+    activate: bool = False,
+    clock: Clock | None = None,
+    models_dir: Path | str | None = DEFAULT_MODELS_DIR,
+) -> tuple[ResidualMosModel, ModelVersionRecord, ChronologicalBenchmarkReport]:
+    """Train ResidualMosModel + Temperature Scaling out-of-band and register Model Version."""
+    async with db.conn.execute(
+        "SELECT 1 FROM model_versions WHERE model_version = ?",
+        (model_version,),
+    ) as cursor:
+        if await cursor.fetchone() is not None:
+            raise ValueError(f"ModelVersion '{model_version}' already exists and is immutable.")
+
+    mos_model, report, passed_gate = await asyncio.to_thread(
+        _train_and_eval_residual_sync,
+        list(samples),
+        model_version=model_version,
+        train_end_utc=train_end_utc,
+        val_start_utc=val_start_utc,
+        test_start_utc=test_start_utc,
+        quantiles=quantiles,
+        covered_stations=covered_stations,
+        lgbm_params=lgbm_params,
+        max_residual_delta_c=max_residual_delta_c,
+    )
+
+    artifact_path: Path | None = None
+    if models_dir is not None:
+        artifact_path = await asyncio.to_thread(save_residual_mos_model, mos_model, models_dir)
+
+    now_utc = ensure_utc((clock or SystemClock()).now())
+    config_payload: dict[str, Any] = {
+        "model_family": "residual",
+        "quantiles": list(mos_model.quantiles),
+        "covered_stations": list(mos_model.covered_stations),
+        "feature_columns": list(mos_model.feature_columns),
+        "lgbm_params": mos_model.lgbm_params,
+        "max_residual_delta_c": mos_model.max_residual_delta_c,
+        "temperature": mos_model.temperature,
+        "passed_overfit_gate": passed_gate,
+        "artifact_path": str(artifact_path) if artifact_path is not None else None,
+        "reliability_curve": [b.model_dump(mode="json") for b in report.test_mos.reliability_curve],
+        "benchmark": report.model_dump(mode="json"),
+    }
+    record = ModelVersionRecord(
+        model_version=model_version,
+        model_type="residual_lightgbm_mos",
+        description=(
+            f"Residual LightGBM MOS over EMOS (tau={mos_model.temperature:.2f}, "
+            f"gate={'PASS' if passed_gate else 'HOLD'}) covering {len(mos_model.covered_stations)} Stations"
+        ),
+        feature_schema_hash=mos_model.feature_schema_hash,
+        train_start_utc=report.train_start_utc,
+        train_end_utc=report.train_end_utc,
+        brier_score=report.test_mos.brier_score,
+        pinball_loss=report.test_mos.pinball_loss,
+        config_json=config_payload,
+        is_active=activate,
+        created_at_utc=now_utc,
+    )
+    saved_record = await register_model_version(db, record, activate=activate)
+    return mos_model, saved_record, report

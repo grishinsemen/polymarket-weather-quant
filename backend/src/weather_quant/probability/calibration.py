@@ -305,19 +305,28 @@ def evaluate_calibration_walk_forward(
     for s in samples:
         by_station.setdefault(s.station.icao.strip().upper(), []).append(s)
 
-    station_reports: list[StationCalibrationReport] = []
+    # Strict chronological day-by-day walk-forward across all stations so hierarchical
+    # global_bias_obs only ever sees days strictly < item.local_date (zero leakage).
+    station_history: dict[str, list[DailyBiasObservation]] = {icao: [] for icao in by_station}
+    station_raw_records: dict[str, list[dict[str, float | int | list[float]]]] = {icao: [] for icao in by_station}
+    station_cal_records: dict[str, list[dict[str, float | int | list[float]]]] = {icao: [] for icao in by_station}
+    station_last_params: dict[str, tuple[float, float]] = {
+        icao: (0.0, cal_engine.default_spread_inflation) for icao in by_station
+    }
+    global_history: list[DailyBiasObservation] = []
     all_raw_records: list[dict[str, float | int | list[float]]] = []
     all_cal_records: list[dict[str, float | int | list[float]]] = []
 
-    for icao in sorted(by_station):
-        ordered = sorted(by_station[icao], key=lambda x: x.local_date)
-        history_bias: list[DailyBiasObservation] = []
-        raw_records: list[dict[str, float | int | list[float]]] = []
-        cal_records: list[dict[str, float | int | list[float]]] = []
-        last_bias = 0.0
-        last_scale = cal_engine.default_spread_inflation
+    by_date: dict[date, list[CalibrationDaySample]] = {}
+    for s in samples:
+        by_date.setdefault(s.local_date, []).append(s)
 
-        for item in ordered:
+    for current_date in sorted(by_date):
+        day_items = sorted(by_date[current_date], key=lambda x: x.station.icao.strip().upper())
+        day_new_obs: list[tuple[str, DailyBiasObservation]] = []
+
+        for item in day_items:
+            icao = item.station.icao.strip().upper()
             raw_extremes_c = _extract_day_extremes_c(
                 item.ensemble, item.station, item.local_date, item.polarity
             )
@@ -329,14 +338,15 @@ def evaluate_calibration_walk_forward(
             raw_std = float(np.std(raw_arr))
             center = round_half_away(raw_mean)
             buckets = build_synthetic_degree_buckets(center, event_id=f"cal-{icao}-{item.local_date.isoformat()}")
+            station_tz = ZoneInfo(item.station.timezone)
             decision_time = datetime(
                 item.local_date.year,
                 item.local_date.month,
                 item.local_date.day,
                 0,
                 0,
-                tzinfo=timezone.utc,
-            )
+                tzinfo=station_tz,
+            ).astimezone(timezone.utc)
             clock = VirtualClock(decision_time)
             event = WeatherEvent(
                 event_id=f"cal-{icao}-{item.local_date.isoformat()}",
@@ -363,26 +373,27 @@ def evaluate_calibration_walk_forward(
                 intraday_metars=[],
                 clock=clock,
             )
-            raw_records.append(
-                {
-                    "probs": [b.fair_probability for b in raw_snap.buckets],
-                    "true_idx": true_idx,
-                    "actual_c": item.actual_extreme_c,
-                    "p10_c": float(np.percentile(raw_arr, 10)),
-                    "p50_c": float(np.percentile(raw_arr, 50)),
-                    "p90_c": float(np.percentile(raw_arr, 90)),
-                }
-            )
+            raw_rec = {
+                "probs": [b.fair_probability for b in raw_snap.buckets],
+                "true_idx": true_idx,
+                "actual_c": item.actual_extreme_c,
+                "p10_c": float(np.percentile(raw_arr, 10)),
+                "p50_c": float(np.percentile(raw_arr, 50)),
+                "p90_c": float(np.percentile(raw_arr, 90)),
+            }
+            station_raw_records[icao].append(raw_rec)
 
-            # Calibrated Layer 2 evaluation (walk-forward strictly prior days only)
+            # Calibrated Layer 2 evaluation (hierarchical walk-forward: strictly prior days only)
+            history_bias = station_history[icao]
             bias_c, scale = cal_engine.compute_station_bias(
                 recent_bias_obs=history_bias,
                 event_local_date=item.local_date,
                 decision_time=decision_time,
                 raw_extremes_c=raw_extremes_c,
                 strict_temporal=False,
+                global_bias_obs=global_history,
             )
-            last_bias, last_scale = bias_c, scale
+            station_last_params[icao] = (bias_c, scale)
             cal_snap = cal_engine.compute_probabilities(
                 station=item.station,
                 event=event,
@@ -390,6 +401,7 @@ def evaluate_calibration_walk_forward(
                 recent_bias_obs=history_bias,
                 intraday_metars=[],
                 clock=clock,
+                global_bias_obs=global_history,
             )
             cal_arr = raw_mean + bias_c + scale * (raw_arr - raw_mean)
             pit_val = float(np.mean(cal_arr <= item.actual_extreme_c))
@@ -397,38 +409,49 @@ def evaluate_calibration_walk_forward(
             day_brier = sum(
                 (p - (1.0 if k == true_idx else 0.0)) ** 2 for k, p in enumerate(cal_probs)
             )
-            cal_records.append(
-                {
-                    "probs": cal_probs,
-                    "true_idx": true_idx,
-                    "actual_c": item.actual_extreme_c,
-                    "p10_c": float(np.percentile(cal_arr, 10)),
-                    "p50_c": float(np.percentile(cal_arr, 50)),
-                    "p90_c": float(np.percentile(cal_arr, 90)),
-                    "station_icao": icao,
-                    "local_date": item.local_date,
-                    "pit": pit_val,
-                    "brier": day_brier,
-                }
-            )
+            cal_rec = {
+                "probs": cal_probs,
+                "true_idx": true_idx,
+                "actual_c": item.actual_extreme_c,
+                "p10_c": float(np.percentile(cal_arr, 10)),
+                "p50_c": float(np.percentile(cal_arr, 50)),
+                "p90_c": float(np.percentile(cal_arr, 90)),
+                "station_icao": icao,
+                "local_date": item.local_date,
+                "pit": pit_val,
+                "brier": day_brier,
+            }
+            station_cal_records[icao].append(cal_rec)
 
-            # Append today's verified observation ONLY AFTER scoring today (leak-free walk-forward)
-            history_bias.append(
-                DailyBiasObservation(
-                    local_date=item.local_date,
-                    forecast_extreme_c=raw_mean,
-                    observed_extreme_c=item.actual_extreme_c,
-                    forecast_std_c=raw_std if raw_std > 1e-6 else None,
-                    observed_at_utc=item.observed_at_utc,
-                    is_routine=True,
+            day_new_obs.append(
+                (
+                    icao,
+                    DailyBiasObservation(
+                        local_date=item.local_date,
+                        forecast_extreme_c=raw_mean,
+                        observed_extreme_c=item.actual_extreme_c,
+                        forecast_std_c=raw_std if raw_std > 1e-6 else None,
+                        observed_at_utc=item.observed_at_utc,
+                        is_routine=True,
+                    ),
                 )
             )
 
+        # Append today's verified observations ONLY AFTER scoring all stations for current_date
+        for icao, bias_obs in day_new_obs:
+            station_history[icao].append(bias_obs)
+            global_history.append(bias_obs)
+
+    station_reports: list[StationCalibrationReport] = []
+    for icao in sorted(by_station):
+        raw_records = station_raw_records[icao]
+        cal_records = station_cal_records[icao]
         if raw_records:
+            last_bias, last_scale = station_last_params[icao]
             station_reports.append(
                 StationCalibrationReport(
                     station_icao=icao,
-                    city=ordered[0].station.city,
+                    city=by_station[icao][0].station.city,
                     sample_count=len(raw_records),
                     raw=_summarize_records(raw_records, tail_price_threshold),
                     calibrated=_summarize_records(cal_records, tail_price_threshold),

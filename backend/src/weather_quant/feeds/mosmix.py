@@ -19,6 +19,31 @@ DWD_MOSMIX_S_URL_TEMPLATE = (
     "https://opendata.dwd.de/weather/local_forecasts/mos/MOSMIX_L/single_stations/"
     "{dwd_station_id}/kml/MOSMIX_L_LATEST_{dwd_station_id}.kmz"
 )
+# Verified DWD MOSMIX_L 5-digit WMO station IDs for cataloged non-US ICAO airports.
+ICAO_TO_DWD_STATION_ID: dict[str, str] = {
+    "EDDM": "10870",
+    "EGLL": "03772",
+    "EGLC": "03768",
+    "LFPB": "07150",
+    "LFPG": "07157",
+    "EHAM": "06240",
+    "RKSI": "47110",
+    "RJTT": "47671",
+    "LEMD": "08221",
+    "LIRF": "16242",
+    "LOWW": "11036",
+    "LSZH": "06670",
+    "UUEE": "27612",
+    "WSSS": "48698",
+    "VILK": "42369",
+    "VIDP": "42181",
+    "MMMX": "76679",
+    "SBGR": "83780",
+    "SAEZ": "87576",
+    "CYYZ": "71624",
+    "LTAC": "17128",
+    "NZWN": "93439",
+}
 # P95 publication latency for DWD MOSMIX_S/L (~60 min after issue time)
 MOSMIX_PUB_LATENCY_MINUTES = 60
 
@@ -156,7 +181,8 @@ class DwdMosmixClient:
         *,
         dwd_station_id: str | None = None,
     ) -> ExternalMosForecast | None:
-        sid = (dwd_station_id or station.icao).strip().upper()
+        icao_upper = station.icao.strip().upper()
+        sid = (dwd_station_id or ICAO_TO_DWD_STATION_ID.get(icao_upper) or icao_upper).strip().upper()
         url = DWD_MOSMIX_S_URL_TEMPLATE.format(dwd_station_id=sid)
         owns = self._external_client is None
         client = self._external_client or httpx.AsyncClient(timeout=self._timeout_seconds)

@@ -272,6 +272,7 @@ class EnsembleProbabilityEngine:
         obs_noise_c: float = 0.4,
         default_spread_inflation: float = DEFAULT_SPREAD_INFLATION,
         use_censored_max: bool = False,
+        mos_anchor_weight: float = 0.30,
     ) -> None:
         self.smoothing_alpha = smoothing_alpha
         self.bias_window_days = bias_window_days
@@ -279,6 +280,67 @@ class EnsembleProbabilityEngine:
         self.obs_noise_c = obs_noise_c
         self.default_spread_inflation = max(1.0, float(default_spread_inflation))
         self.use_censored_max = use_censored_max
+        self.mos_anchor_weight = max(0.0, min(0.6, float(mos_anchor_weight)))
+
+    def _compute_global_prior(
+        self,
+        global_bias_obs: Sequence[DailyBiasObservation],
+        event_local_date: date,
+        decision_time: datetime,
+        strict_temporal: bool,
+    ) -> tuple[float, float]:
+        """Compute leak-free cross-station hierarchical prior (prior_bias_c, prior_scale)."""
+        valid: list[DailyBiasObservation] = []
+        for obs in global_bias_obs:
+            if not obs.is_routine:
+                continue
+            age_days = (event_local_date - obs.local_date).days
+            if age_days <= 0 or age_days > self.bias_window_days:
+                continue
+            if obs.observed_at_utc is not None:
+                try:
+                    assert_before_decision(obs.observed_at_utc, decision_time, label="global_bias_observation")
+                except TemporalIntegrityError:
+                    if strict_temporal:
+                        raise
+                    continue
+            valid.append(obs)
+
+        n_g = len(valid)
+        if n_g < 5:
+            return 0.0, self.default_spread_inflation
+
+        # Robust median cross-station prior bias (immune to single-station storm outliers like -6.9C)
+        sorted_errors = sorted(
+            obs.observed_extreme_c - obs.forecast_extreme_c
+            for obs in valid
+        )
+        mid = n_g // 2
+        median_global_bias = (
+            sorted_errors[mid]
+            if n_g % 2 == 1
+            else 0.5 * (sorted_errors[mid - 1] + sorted_errors[mid])
+        )
+        prior_bias_c = (n_g / (n_g + 10.0)) * median_global_bias
+
+        # Empirical 80% coverage scale across all stations after removing global bias
+        z_scores: list[float] = []
+        for obs in valid:
+            if obs.forecast_std_c is not None and obs.forecast_std_c > 1e-6:
+                err = (obs.observed_extreme_c - obs.forecast_extreme_c) - prior_bias_c
+                z_scores.append(abs(err) / obs.forecast_std_c)
+        if len(z_scores) < 5:
+            return prior_bias_c, self.default_spread_inflation
+
+        z_scores.sort()
+        q80_pos = 0.80 * (len(z_scores) - 1)
+        lo_idx = int(math.floor(q80_pos))
+        hi_idx = min(len(z_scores) - 1, lo_idx + 1)
+        frac = q80_pos - lo_idx
+        q80_z = z_scores[lo_idx] + frac * (z_scores[hi_idx] - z_scores[lo_idx])
+        raw_global_scale = max(1.0, min(2.8, q80_z / Z_P90))
+        prior_scale = (n_g * raw_global_scale + 15.0 * self.default_spread_inflation) / (n_g + 15.0)
+        return prior_bias_c, max(1.0, min(2.8, prior_scale))
 
     def _compute_station_bias(
         self,
@@ -287,8 +349,20 @@ class EnsembleProbabilityEngine:
         decision_time: datetime,
         raw_extremes_c: Sequence[float],
         strict_temporal: bool,
+        global_bias_obs: Sequence[DailyBiasObservation] = (),
     ) -> tuple[float, float]:
-        """Compute rolling EMOS Station Bias (mean offset bias_c, P10-P90 calibrated scale)."""
+        """Compute hierarchical rolling EMOS Station Bias (mean offset bias_c, P10-P90 calibrated scale)."""
+        prior_bias_c, prior_scale = (
+            self._compute_global_prior(
+                global_bias_obs,
+                event_local_date=event_local_date,
+                decision_time=decision_time,
+                strict_temporal=strict_temporal,
+            )
+            if global_bias_obs
+            else (0.0, self.default_spread_inflation)
+        )
+
         valid: list[DailyBiasObservation] = []
         for obs in recent_bias_obs:
             if not obs.is_routine:
@@ -306,16 +380,18 @@ class EnsembleProbabilityEngine:
             valid.append(obs)
 
         if not valid:
-            return 0.0, self.default_spread_inflation
+            return prior_bias_c, prior_scale
 
         n = len(valid)
         errors = [obs.observed_extreme_c - obs.forecast_extreme_c for obs in valid]
         raw_bias_c = sum(errors) / n
-        # Empirical Bayes shrinkage prevents small-sample (1-3 day) noise overfitting
-        bias_c = (n / (n + DEFAULT_BIAS_SHRINKAGE_DAYS)) * raw_bias_c
+        # Hierarchical Empirical Bayes shrinkage toward cross-station global prior
+        bias_c = (n * raw_bias_c + DEFAULT_BIAS_SHRINKAGE_DAYS * prior_bias_c) / (
+            n + DEFAULT_BIAS_SHRINKAGE_DAYS
+        )
 
         if n < 2:
-            return bias_c, self.default_spread_inflation
+            return bias_c, prior_scale
 
         # Bessel-corrected residual std for unbiased small-sample dispersion estimation
         residuals = [e - raw_bias_c for e in errors]
@@ -334,7 +410,7 @@ class EnsembleProbabilityEngine:
             ref_std = 0.0
 
         if ref_std <= 1e-6:
-            return bias_c, self.default_spread_inflation
+            return bias_c, prior_scale
 
         scale_var = err_std / ref_std
         scale_cov = scale_var
@@ -358,7 +434,7 @@ class EnsembleProbabilityEngine:
 
         raw_scale = max(scale_var, scale_cov)
         shrunk_scale = (
-            n * raw_scale + DEFAULT_SCALE_SHRINKAGE_DAYS * self.default_spread_inflation
+            n * raw_scale + DEFAULT_SCALE_SHRINKAGE_DAYS * prior_scale
         ) / (n + DEFAULT_SCALE_SHRINKAGE_DAYS)
         min_scale = 1.0 if n < 10 else 0.85
         scale = max(min_scale, min(3.0, shrunk_scale))
@@ -500,6 +576,49 @@ class EnsembleProbabilityEngine:
             for traj in bias_trajectories
         ]
         return shifted, residual_c, alpha
+
+    def _compute_external_mos_anchor_shift(
+        self,
+        *,
+        ensemble: EnsembleSnapshot,
+        polarity: Polarity,
+        emos_mean_c: float,
+    ) -> float:
+        """Blend bounded external $0 MOS anchors (MOSMIX/NBM/NWS) into Layer 2 mean offset."""
+        if self.mos_anchor_weight <= 0.0 or not isinstance(ensemble.metadata, dict):
+            return 0.0
+        meta = ensemble.metadata
+        suffix = "high_c" if polarity == Polarity.HIGHEST else "low_c"
+        candidate_keys = (
+            f"mosmix_{suffix}",
+            f"nbm_{suffix}",
+            f"nws_point_{suffix}",
+        )
+        anchors: list[float] = []
+        for k in candidate_keys:
+            v = meta.get(k)
+            if v is not None:
+                try:
+                    val = float(v)
+                    if math.isfinite(val):
+                        anchors.append(val)
+                except (TypeError, ValueError):
+                    continue
+        if not anchors and polarity == Polarity.HIGHEST:
+            for k in ("mosmix_extreme_c", "nbm_extreme_c", "nws_point_extreme_c"):
+                v = meta.get(k)
+                if v is not None:
+                    try:
+                        val = float(v)
+                        if math.isfinite(val):
+                            anchors.append(val)
+                    except (TypeError, ValueError):
+                        continue
+        if not anchors:
+            return 0.0
+        anchor_mean = sum(anchors) / len(anchors)
+        raw_delta = max(-2.5, min(2.5, anchor_mean - emos_mean_c))
+        return self.mos_anchor_weight * raw_delta
 
     def calibrate_day_trajectories(
         self,
@@ -650,6 +769,7 @@ class EnsembleProbabilityEngine:
         clock: Clock | None = None,
         model_version: str = DEFAULT_MODEL_VERSION,
         strict_temporal: bool = False,
+        global_bias_obs: Sequence[DailyBiasObservation] = (),
     ) -> EventProbabilitySnapshot:
         """Compute normalized 3-layer Bucket Fair Probabilities strictly prior to decision_time."""
         active_clock: Clock = clock or SystemClock()
@@ -702,17 +822,23 @@ class EnsembleProbabilityEngine:
             smoothing_alpha=self.smoothing_alpha,
         )
 
-        # Layer 2: Rolling Station Bias mean offset & dispersion scaling
+        # Layer 2: Hierarchical rolling Station Bias mean offset, dispersion scaling & external $0 MOS anchor
         bias_c, scale = self._compute_station_bias(
             recent_bias_obs=recent_bias_obs,
             event_local_date=event.local_date,
             decision_time=decision_time,
             raw_extremes_c=raw_extremes_c,
             strict_temporal=strict_temporal,
+            global_bias_obs=global_bias_obs,
+        )
+        anchor_shift_c = self._compute_external_mos_anchor_shift(
+            ensemble=ensemble,
+            polarity=event.polarity,
+            emos_mean_c=(sum(raw_extremes_c) / len(raw_extremes_c)) + bias_c,
         )
         bias_trajectories = self.calibrate_day_trajectories(
             day_trajectories,
-            bias_c=bias_c,
+            bias_c=bias_c + anchor_shift_c,
             scale=scale,
         )
         bias_extremes_c = [

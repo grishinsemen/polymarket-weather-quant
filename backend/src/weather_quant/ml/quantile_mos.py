@@ -800,22 +800,26 @@ def save_mos_model(
     return path
 
 
-def load_mos_model(
-    model_version: str,
-    models_dir: Path | str = DEFAULT_MODELS_DIR,
-) -> QuantileMosModel | None:
-    """Load persisted QuantileMosModel from disk if present."""
-    safe_name = model_version.replace("/", "_").replace("\\", "_")
-    path = Path(models_dir) / f"{safe_name}.json"
-    if not path.exists():
-        return None
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def _instantiate_mos_from_payload(payload: dict[str, Any]) -> QuantileMosModel | None:
     boosters = {
         float(q): lgb.Booster(model_str=model_str)
         for q, model_str in (payload.get("boosters") or {}).items()
     }
     if not boosters:
         return None
+    if payload.get("model_family") == "residual":
+        from weather_quant.ml.residual_mos import ResidualMosModel
+
+        return ResidualMosModel(
+            model_version=str(payload["model_version"]),
+            quantiles=[float(q) for q in payload["quantiles"]],
+            boosters=boosters,
+            covered_stations=payload.get("covered_stations") or TOP_LIQUIDITY_STATIONS,
+            feature_columns=payload.get("feature_columns") or FEATURE_COLUMNS,
+            lgbm_params=payload.get("lgbm_params"),
+            max_residual_delta_c=float(payload.get("max_residual_delta_c", 3.0)),
+            temperature=float(payload.get("temperature", 1.0)),
+        )
     return QuantileMosModel(
         model_version=str(payload["model_version"]),
         quantiles=[float(q) for q in payload["quantiles"]],
@@ -824,6 +828,19 @@ def load_mos_model(
         feature_columns=payload.get("feature_columns") or FEATURE_COLUMNS,
         lgbm_params=payload.get("lgbm_params"),
     )
+
+
+def load_mos_model(
+    model_version: str,
+    models_dir: Path | str = DEFAULT_MODELS_DIR,
+) -> QuantileMosModel | None:
+    """Load persisted QuantileMosModel or ResidualMosModel from disk if present."""
+    safe_name = model_version.replace("/", "_").replace("\\", "_")
+    path = Path(models_dir) / f"{safe_name}.json"
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return _instantiate_mos_from_payload(payload)
 
 
 async def load_mos_provider_for_version(
@@ -844,15 +861,7 @@ async def load_mos_provider_for_version(
     artifact_path = (rec.config_json or {}).get("artifact_path")
     if artifact_path and Path(artifact_path).exists():
         payload = json.loads(Path(artifact_path).read_text(encoding="utf-8"))
-        boosters = {float(q): lgb.Booster(model_str=s) for q, s in (payload.get("boosters") or {}).items()}
-        loaded = QuantileMosModel(
-            model_version=str(payload["model_version"]),
-            quantiles=[float(q) for q in payload["quantiles"]],
-            boosters=boosters,
-            covered_stations=payload.get("covered_stations") or TOP_LIQUIDITY_STATIONS,
-            feature_columns=payload.get("feature_columns") or FEATURE_COLUMNS,
-            lgbm_params=payload.get("lgbm_params"),
-        ) if boosters else None
+        loaded = _instantiate_mos_from_payload(payload)
     else:
         loaded = await asyncio.to_thread(load_mos_model, model_version, models_dir)
     if loaded is None:
