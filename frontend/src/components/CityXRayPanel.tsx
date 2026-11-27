@@ -400,14 +400,6 @@ export function CityXRayPanel({
                     noTokenBySelectedBucket.get(b.bucket_id),
                   )
                 : null;
-              const isNoOrder = orderOutcome === "NO";
-              const noOrderEdge =
-                isNoOrder &&
-                b.resting_order?.expected_edge !== null &&
-                b.resting_order?.expected_edge !== undefined &&
-                b.resting_order.expected_edge > 0
-                  ? b.resting_order.expected_edge
-                  : null;
               return (
                 <tr
                   key={b.bucket_id}
@@ -466,25 +458,13 @@ export function CityXRayPanel({
                   </td>
 
                   <td className="px-2.5 py-1.5 text-right font-mono-tabular whitespace-nowrap">
-                    {b.net_edge > 0 ? (
-                      <span
-                        className={
-                          b.net_edge >= 0.05 ? "text-emerald-400 font-semibold" : "text-slate-400"
-                        }
-                      >
-                        {`+${(b.net_edge * 100).toFixed(1)}¢`}
-                      </span>
-                    ) : noOrderEdge !== null ? (
-                      <span
-                        className={
-                          noOrderEdge >= 0.05 ? "text-emerald-400 font-semibold" : "text-slate-400"
-                        }
-                      >
-                        {`NO +${(noOrderEdge * 100).toFixed(1)}¢`}
-                      </span>
-                    ) : (
-                      <span className="text-slate-400">—</span>
-                    )}
+                    <span
+                      className={
+                        b.net_edge >= 0.05 ? "text-emerald-400 font-semibold" : "text-slate-400"
+                      }
+                    >
+                      {b.net_edge > 0 ? `+${(b.net_edge * 100).toFixed(1)}¢` : "—"}
+                    </span>
                   </td>
 
                   <td className="px-2.5 py-1.5 text-right whitespace-nowrap">

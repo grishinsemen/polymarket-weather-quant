@@ -1703,8 +1703,6 @@ describe("WeatherQuantTerminal", () => {
     expect(yesBucketBadge).toHaveTextContent("BUY YES 25¢");
     expect(yesBucketBadge).toHaveClass("text-sky-300");
 
-    expect(screen.getByText("NO +37.4¢")).toHaveClass("text-emerald-400");
-
     const noOrderRow = screen.getByTestId("unified-order-row-ord-rksi-no-3");
     expect(noOrderRow).toHaveTextContent("ORDER BUY NO (8.28sh @ 56¢)");
     expect(within(noOrderRow).getByText(/ORDER BUY NO/).className).toContain("text-sky-300");
