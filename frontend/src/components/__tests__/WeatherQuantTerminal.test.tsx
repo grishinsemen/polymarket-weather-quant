@@ -1697,17 +1697,17 @@ describe("WeatherQuantTerminal", () => {
 
     const noBucketBadge = screen.getByTestId("bucket-order-badge-evt-rksi-b3");
     expect(noBucketBadge).toHaveTextContent("BUY NO 56¢");
-    expect(noBucketBadge).toHaveClass("text-amber-300");
+    expect(noBucketBadge).toHaveClass("text-sky-300");
 
     const yesBucketBadge = screen.getByTestId("bucket-order-badge-evt-rksi-b5");
     expect(yesBucketBadge).toHaveTextContent("BUY YES 25¢");
     expect(yesBucketBadge).toHaveClass("text-sky-300");
 
-    expect(screen.getByText("NO +37.4¢")).toHaveClass("text-amber-400");
+    expect(screen.getByText("NO +37.4¢")).toHaveClass("text-emerald-400");
 
     const noOrderRow = screen.getByTestId("unified-order-row-ord-rksi-no-3");
     expect(noOrderRow).toHaveTextContent("ORDER BUY NO (8.28sh @ 56¢)");
-    expect(within(noOrderRow).getByText(/ORDER BUY NO/).className).toContain("text-amber-300");
+    expect(within(noOrderRow).getByText(/ORDER BUY NO/).className).toContain("text-sky-300");
 
     const yesOrderRow = screen.getByTestId("unified-order-row-ord-evt-rksi-5");
     expect(yesOrderRow).toHaveTextContent("ORDER BUY YES (14sh @ 25¢)");

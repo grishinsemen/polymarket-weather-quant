@@ -475,7 +475,11 @@ export function CityXRayPanel({
                         {`+${(b.net_edge * 100).toFixed(1)}¢`}
                       </span>
                     ) : noOrderEdge !== null ? (
-                      <span className="text-amber-400 font-semibold">
+                      <span
+                        className={
+                          noOrderEdge >= 0.05 ? "text-emerald-400 font-semibold" : "text-slate-400"
+                        }
+                      >
                         {`NO +${(noOrderEdge * 100).toFixed(1)}¢`}
                       </span>
                     ) : (
@@ -493,11 +497,7 @@ export function CityXRayPanel({
                       {b.resting_order && orderOutcome && (
                         <span
                           data-testid={`bucket-order-badge-${b.bucket_id}`}
-                          className={`inline-block whitespace-nowrap px-1.5 py-0.5 rounded border ${
-                            isNoOrder
-                              ? "bg-amber-950/80 text-amber-300 border-amber-700"
-                              : "bg-sky-950/80 text-sky-300 border-sky-700"
-                          }`}
+                          className="inline-block whitespace-nowrap px-1.5 py-0.5 rounded bg-sky-950/80 text-sky-300 border border-sky-700"
                         >
                           {b.resting_order.side} {orderOutcome} {fmtPrice(b.resting_order.limit_price)}
                         </span>
@@ -660,7 +660,6 @@ export function CityXRayPanel({
                     const isSelectedCity = eventId === xray.event.event_id;
                     const phaseLabel = o.phase === "INTRADAY_REPRICING" ? "INTRADAY" : "PREMARKET";
                     const dateLabel = formatTargetDate(targetDate);
-                    const isNoOrder = outcomeSide === "NO";
                     return (
                       <button
                         key={o.order_id}
@@ -669,13 +668,11 @@ export function CityXRayPanel({
                         onClick={() => onSelectEvent?.(eventId)}
                         className={`w-full text-left flex items-center justify-between gap-2 px-2.5 py-1.5 rounded bg-[#0f1726] border transition-colors ${
                           isSelectedCity
-                            ? isNoOrder
-                              ? "border-amber-600/70 bg-[#1f1a10]"
-                              : "border-sky-700/70 bg-[#121e33]"
+                            ? "border-sky-700/70 bg-[#121e33]"
                             : "border-[#1c2638] hover:border-slate-600"
                         }`}
                       >
-                        <span className={`${isNoOrder ? "text-amber-300" : "text-sky-300"} truncate`}>
+                        <span className="text-sky-300 truncate">
                           <span className="font-semibold">{stationIcao}</span>{" "}
                           <span className="text-slate-400">
                             {city} · {dateLabel}
