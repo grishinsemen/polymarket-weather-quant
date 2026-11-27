@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   formatIsoDateInZone,
   formatMetarMinutesAgo,
@@ -240,9 +240,34 @@ export function CityXRayPanel({
   onSelectEvent,
 }: CityXRayPanelProps) {
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [isFaqOpen, setIsFaqOpen] = useState(false);
   const [historyScope, setHistoryScope] = useState<"all" | "current">("all");
   const [panelFilter, setPanelFilter] = useState<"all" | "orders" | "positions">("all");
   const [panelSort, setPanelSort] = useState<"date" | "usd" | null>(null);
+  const faqContainerRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!isFaqOpen) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsFaqOpen(false);
+      }
+    };
+    const handlePointerDown = (event: MouseEvent) => {
+      if (
+        faqContainerRef.current &&
+        !faqContainerRef.current.contains(event.target as Node)
+      ) {
+        setIsFaqOpen(false);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("mousedown", handlePointerDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("mousedown", handlePointerDown);
+    };
+  }, [isFaqOpen]);
 
   if (!xray) {
     return (
@@ -330,7 +355,7 @@ export function CityXRayPanel({
   return (
     <section
       data-testid="city-xray-panel"
-      className="rounded-lg border border-[#1c2638] bg-[#0d131f] overflow-hidden space-y-4 p-4"
+      className="rounded-lg border border-[#1c2638] bg-[#0d131f] space-y-4 p-4"
     >
       <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[#1c2638] pb-3">
         <div>
@@ -366,14 +391,152 @@ export function CityXRayPanel({
             </div>
           )}
         </div>
-        <a
-          href={xray.event.url}
-          target="_blank"
-          rel="noreferrer"
-          className="text-[11px] px-2.5 py-1 rounded bg-[#142033] text-sky-300 border border-sky-800/60 hover:bg-[#1a2942]"
-        >
-          Polymarket Event
-        </a>
+        <div className="flex flex-col items-end justify-between gap-2 self-stretch">
+          <a
+            href={xray.event.url}
+            target="_blank"
+            rel="noreferrer"
+            className="text-[11px] px-2.5 py-1 rounded bg-[#142033] text-sky-300 border border-sky-800/60 hover:bg-[#1a2942]"
+          >
+            Polymarket Event
+          </a>
+          <div ref={faqContainerRef} className="relative">
+            <button
+              type="button"
+              data-testid="xray-orderbook-faq-btn"
+              aria-expanded={isFaqOpen}
+              aria-label="Как читать таблицу стакана и Fair Probability"
+              title="Шпаргалка: Fair Probability, Bid / Ask и ордера"
+              onClick={() => setIsFaqOpen((prev) => !prev)}
+              className={`w-6 h-6 inline-flex items-center justify-center rounded border font-mono-tabular text-[11px] font-bold transition-colors ${
+                isFaqOpen
+                  ? "bg-sky-900/60 text-sky-200 border-sky-500/70"
+                  : "bg-[#111927] text-slate-300 border-[#26344d] hover:text-sky-300 hover:border-sky-700/70"
+              }`}
+            >
+              ?
+            </button>
+
+            {isFaqOpen && (
+              <div
+                data-testid="xray-orderbook-faq-popover"
+                role="dialog"
+                aria-label="Шпаргалка по таблице стакана"
+                className="absolute right-0 top-full mt-2 z-30 w-[min(640px,calc(100vw-3rem))] rounded-lg border border-sky-800/70 bg-[#0a101b]/95 backdrop-blur-sm p-3 text-[11px] leading-relaxed text-slate-300 shadow-2xl shadow-black/80 space-y-2.5"
+              >
+                <div className="flex items-center justify-between gap-2 border-b border-[#1c2638] pb-2">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-flex h-4 w-4 items-center justify-center rounded bg-sky-950 text-[10px] font-bold text-sky-300 border border-sky-800/70">
+                      ?
+                    </span>
+                    <span className="font-semibold text-slate-100">
+                      Как читать таблицу стакана
+                    </span>
+                    <span className="text-[10px] text-slate-400">
+                      (все котировки и объёмы показаны со стороны YES)
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    data-testid="xray-orderbook-faq-close"
+                    aria-label="Закрыть шпаргалку"
+                    onClick={() => setIsFaqOpen(false)}
+                    className="px-1.5 py-0.5 rounded text-slate-400 hover:text-slate-100 hover:bg-[#142033]"
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                  <div className="rounded border border-[#182132] bg-[#0d1422] p-2.5 space-y-1">
+                    <div className="font-semibold text-sky-300">
+                      1. Fair Probability (%) = честная цена YES в центах
+                    </div>
+                    <p className="text-slate-300">
+                      Вероятность модели — это объективная цена исхода{" "}
+                      <span className="font-mono-tabular text-slate-100">YES</span>. Например,{" "}
+                      <span className="font-mono-tabular text-sky-300">48.2%</span> ≈{" "}
+                      <span className="font-mono-tabular text-slate-100">48¢</span> (потолок
+                      безубыточности). С фильтром{" "}
+                      <span className="font-mono-tabular text-emerald-300">min Edge ≥ +5¢</span>{" "}
+                      покупка <span className="font-mono-tabular">YES</span> интересна не дороже{" "}
+                      <span className="font-mono-tabular text-slate-100">43¢</span>.
+                    </p>
+                  </div>
+
+                  <div className="rounded border border-[#182132] bg-[#0d1422] p-2.5 space-y-1">
+                    <div className="font-semibold text-slate-100">
+                      2. Bid / Ask и Depth (Top-5) — очередь и витрина YES
+                    </div>
+                    <p className="text-slate-300">
+                      <span className="font-semibold text-emerald-400">Зелёный BID (слева)</span>{" "}
+                      — покупатели <span className="font-mono-tabular">YES</span>: цена и{" "}
+                      <span className="font-mono-tabular">$</span>-объём, куда можно продать{" "}
+                      <span className="font-mono-tabular">YES</span> сразу.{" "}
+                      <span className="font-semibold text-rose-400">Красный ASK (справа)</span>{" "}
+                      — продавцы <span className="font-mono-tabular">YES</span>: цена и объём, по
+                      которым можно купить <span className="font-mono-tabular">YES</span> сразу.
+                    </p>
+                  </div>
+
+                  <div className="rounded border border-[#182132] bg-[#0d1422] p-2.5 space-y-1">
+                    <div className="font-semibold text-slate-100">
+                      3. Куда смотреть и как ставит бот (Post-Only, 0% комиссия)
+                    </div>
+                    <p className="text-slate-300">
+                      Сравнивайте <span className="text-sky-300">Fair %</span> с{" "}
+                      <span className="font-mono-tabular">Bid / Ask</span>. Если{" "}
+                      <span className="text-sky-300">Fair</span> заметно{" "}
+                      <span className="text-emerald-300">выше</span> рынка (напр.{" "}
+                      <span className="font-mono-tabular">18%</span> против{" "}
+                      <span className="font-mono-tabular">9¢ / 10¢</span>) —{" "}
+                      <span className="font-mono-tabular">YES</span> дёшев, бот встаёт мейкером{" "}
+                      <span className="font-mono-tabular text-sky-300">BUY YES</span> чуть выше{" "}
+                      <span className="text-emerald-400">BID</span> (обычно{" "}
+                      <span className="font-mono-tabular">BID + 1¢</span>), не переплачивая{" "}
+                      <span className="text-rose-400">ASK</span>.
+                    </p>
+                  </div>
+
+                  <div className="rounded border border-[#182132] bg-[#0d1422] p-2.5 space-y-1">
+                    <div className="font-semibold text-slate-100">
+                      4. Как читать NO (зеркало через 100¢)
+                    </div>
+                    <p className="text-slate-300">
+                      <span className="font-mono-tabular text-sky-300">
+                        Fair NO = 100% − Fair YES
+                      </span>
+                      . Если <span className="font-mono-tabular">YES</span> перегрет (напр.{" "}
+                      <span className="font-mono-tabular">Fair 18%</span>, а рынок{" "}
+                      <span className="font-mono-tabular">32¢ / 36¢</span>), бот ставит{" "}
+                      <span className="font-mono-tabular text-sky-300">BUY NO</span> около{" "}
+                      <span className="font-mono-tabular text-slate-100">100¢ − красный ASK</span>{" "}
+                      (<span className="font-mono-tabular">~64¢</span> при честной{" "}
+                      <span className="font-mono-tabular">82¢</span>). Купить{" "}
+                      <span className="font-mono-tabular">NO</span> с рынка ={" "}
+                      <span className="font-mono-tabular">100¢ − зелёный BID</span> (объём в
+                      зелёном столбике слева).
+                    </p>
+                  </div>
+                </div>
+
+                <div className="rounded border border-[#182132] bg-[#0d1422] px-2.5 py-2 text-[10.5px] text-slate-300 flex flex-wrap gap-x-4 gap-y-1">
+                  <span>
+                    <span className="font-semibold text-emerald-400">Net Edge</span> — запас
+                    выгоды по <span className="font-mono-tabular">YES</span> (
+                    <span className="font-mono-tabular">Fair − цена мейкерской покупки</span>;
+                    зелёным подсвечен <span className="font-mono-tabular">≥ +5¢</span>).
+                  </span>
+                  <span>
+                    <span className="font-semibold text-slate-200">ZEROED</span> — бакет уже
+                    невозможен по фактическому <span className="font-mono-tabular">METAR</span>{" "}
+                    дня.
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
 
       <div className="overflow-x-auto">

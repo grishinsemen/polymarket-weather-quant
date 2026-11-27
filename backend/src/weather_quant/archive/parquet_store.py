@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
+import shutil
+import tempfile
+import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Literal, TypeVar
 from uuid import uuid4
@@ -96,6 +101,79 @@ class ArchiveHealth(BaseModel):
     total_files: int = 0
     total_bytes: int = 0
     kinds: dict[str, ArchiveKindStats] = Field(default_factory=dict)
+
+
+class PartitionCompactionResult(BaseModel):
+    """Per-partition outcome of lossless Parquet compaction."""
+
+    kind: ArchiveKind
+    partition_date: str
+    status: Literal[
+        "compacted",
+        "dry_run",
+        "skipped_active",
+        "skipped_recent",
+        "skipped_already_compact",
+        "skipped_empty",
+    ]
+    files_before: int = 0
+    files_after: int = 0
+    rows_before: int = 0
+    rows_after: int = 0
+    bytes_before: int = 0
+    bytes_after: int = 0
+    output_file: str | None = None
+    verified: bool = False
+
+
+class ArchiveCompactionReport(BaseModel):
+    """Aggregate report of lossless Parquet compaction with exact row & digest verification."""
+
+    base_dir: str
+    before_date_utc: str
+    dry_run: bool = True
+    backup_dir: str | None = None
+    partitions: list[PartitionCompactionResult] = Field(default_factory=list)
+    total_files_before: int = 0
+    total_files_after: int = 0
+    total_rows_before: int = 0
+    total_rows_after: int = 0
+    total_bytes_before: int = 0
+    total_bytes_after: int = 0
+    bytes_saved: int = 0
+
+
+def _table_content_digest(table: pa.Table) -> str:
+    """Compute a deterministic SHA-256 digest over schema + every cell of a sorted Arrow table."""
+    h = hashlib.sha256()
+    h.update(f"rows={table.num_rows};cols={','.join(table.column_names)};".encode("utf-8"))
+    for name in table.column_names:
+        col = table.column(name)
+        h.update(f"|col:{name}:".encode("utf-8"))
+        for val in col.to_pylist():
+            if isinstance(val, datetime):
+                s = _ensure_utc(val).isoformat()
+            else:
+                s = repr(val)
+            h.update(s.encode("utf-8"))
+            h.update(b"\x1f")
+    return h.hexdigest()
+
+
+def _move_or_unlink_with_retry(src: Path, dest: Path | None, retries: int = 4) -> None:
+    """Move *src* to *dest* (or unlink if *dest* is None), retrying briefly on Windows file locks."""
+    for attempt in range(retries):
+        try:
+            if dest is not None:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dest))
+            else:
+                src.unlink()
+            return
+        except PermissionError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(0.15 * (attempt + 1))
 
 
 def _ensure_utc(ts: datetime) -> datetime:
@@ -559,6 +637,280 @@ class ParquetArchiveStore:
     async def aget_health(self) -> ArchiveHealth:
         return await asyncio.to_thread(self.get_health)
 
+    def compact_completed_partitions(
+        self,
+        *,
+        before_date_utc: date | None = None,
+        kinds: Iterable[ArchiveKind] = ("orderbook", "metar", "ensemble"),
+        min_age_minutes: float = 30.0,
+        compression: str = "zstd",
+        compression_level: int = 3,
+        dry_run: bool = False,
+        backup_dir: Path | str | None = None,
+    ) -> ArchiveCompactionReport:
+        """Losslessly merge small per-day Parquet parts into one verified compressed file per day.
+
+        Safety guarantees:
+        - Strictly skips active/future partitions (``dt >= before_date_utc``) and any partition
+          whose newest file was modified within ``min_age_minutes``.
+        - Drops ZERO rows (preserves every timestamp and heartbeat snapshot verbatim).
+        - Re-reads the written temp file from disk and verifies exact schema, row count, and
+          cell-for-cell SHA-256 digest before atomically publishing and retiring originals.
+        """
+        cutoff_date = before_date_utc or datetime.now(timezone.utc).date()
+        cutoff_str = cutoff_date.isoformat()
+        now_epoch = time.time()
+        backup_root = Path(backup_dir) if backup_dir is not None else None
+
+        results: list[PartitionCompactionResult] = []
+        tot_files_before = 0
+        tot_files_after = 0
+        tot_rows_before = 0
+        tot_rows_after = 0
+        tot_bytes_before = 0
+        tot_bytes_after = 0
+
+        for kind in kinds:
+            kind_dir = self.base_dir / kind
+            if not kind_dir.exists():
+                continue
+            schema = KIND_SCHEMAS[kind]
+
+            for part_dir in sorted(kind_dir.glob("dt=*")):
+                if not part_dir.is_dir():
+                    continue
+                dt_str = part_dir.name.removeprefix("dt=")
+                files = sorted(part_dir.glob("*.parquet"))
+                if not files:
+                    results.append(
+                        PartitionCompactionResult(
+                            kind=kind,
+                            partition_date=dt_str,
+                            status="skipped_empty",
+                        )
+                    )
+                    continue
+
+                bytes_before = sum(f.stat().st_size for f in files)
+                rows_before = sum(pq.read_metadata(f).num_rows for f in files)
+                tot_files_before += len(files)
+                tot_rows_before += rows_before
+                tot_bytes_before += bytes_before
+
+                if dt_str >= cutoff_str:
+                    tot_files_after += len(files)
+                    tot_rows_after += rows_before
+                    tot_bytes_after += bytes_before
+                    results.append(
+                        PartitionCompactionResult(
+                            kind=kind,
+                            partition_date=dt_str,
+                            status="skipped_active",
+                            files_before=len(files),
+                            files_after=len(files),
+                            rows_before=rows_before,
+                            rows_after=rows_before,
+                            bytes_before=bytes_before,
+                            bytes_after=bytes_before,
+                        )
+                    )
+                    continue
+
+                if min_age_minutes > 0.0:
+                    newest_mtime = max(f.stat().st_mtime for f in files)
+                    if (now_epoch - newest_mtime) < min_age_minutes * 60.0:
+                        tot_files_after += len(files)
+                        tot_rows_after += rows_before
+                        tot_bytes_after += bytes_before
+                        results.append(
+                            PartitionCompactionResult(
+                                kind=kind,
+                                partition_date=dt_str,
+                                status="skipped_recent",
+                                files_before=len(files),
+                                files_after=len(files),
+                                rows_before=rows_before,
+                                rows_after=rows_before,
+                                bytes_before=bytes_before,
+                                bytes_after=bytes_before,
+                            )
+                        )
+                        continue
+
+                if len(files) == 1 and files[0].name.startswith("compact-"):
+                    tot_files_after += 1
+                    tot_rows_after += rows_before
+                    tot_bytes_after += bytes_before
+                    results.append(
+                        PartitionCompactionResult(
+                            kind=kind,
+                            partition_date=dt_str,
+                            status="skipped_already_compact",
+                            files_before=1,
+                            files_after=1,
+                            rows_before=rows_before,
+                            rows_after=rows_before,
+                            bytes_before=bytes_before,
+                            bytes_after=bytes_before,
+                            output_file=str(files[0]),
+                            verified=True,
+                        )
+                    )
+                    continue
+
+                tables: list[pa.Table] = []
+                for f in files:
+                    tbl = pq.read_table(f)
+                    if tbl.num_rows == 0:
+                        continue
+                    if not tbl.schema.equals(schema):
+                        tbl = tbl.cast(schema)
+                    tables.append(tbl)
+
+                if not tables:
+                    merged = pa.Table.from_pylist([], schema=schema)
+                else:
+                    # Preserve exact sorted-filename concatenation order so readers that
+                    # break ties by first-seen row (e.g. dedupe_by_station_fetch=True)
+                    # observe bit-for-bit identical streams before and after compaction.
+                    merged = pa.concat_tables(tables)
+
+                if merged.num_rows != rows_before:
+                    raise RuntimeError(
+                        f"Pre-write row count mismatch in {kind}/dt={dt_str}: "
+                        f"expected {rows_before}, got {merged.num_rows}"
+                    )
+
+                expected_digest = _table_content_digest(merged)
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+                final_name = f"compact-{dt_str}-{stamp}-{uuid4().hex[:6]}.parquet"
+
+                if dry_run:
+                    with tempfile.TemporaryDirectory(prefix="wq_compact_dry_") as tmp_dir:
+                        tmp_path = Path(tmp_dir) / f".{final_name}.tmp"
+                        pq.write_table(
+                            merged,
+                            tmp_path,
+                            compression=compression,
+                            compression_level=compression_level,
+                        )
+                        verify_tbl = pq.read_table(tmp_path)
+                        if verify_tbl.num_rows != rows_before:
+                            raise RuntimeError(
+                                f"Dry-run row verification failed in {kind}/dt={dt_str}"
+                            )
+                        if not verify_tbl.schema.equals(schema):
+                            raise RuntimeError(
+                                f"Dry-run schema verification failed in {kind}/dt={dt_str}"
+                            )
+                        if _table_content_digest(verify_tbl) != expected_digest:
+                            raise RuntimeError(
+                                f"Dry-run SHA-256 digest mismatch in {kind}/dt={dt_str}"
+                            )
+                        bytes_after = tmp_path.stat().st_size
+
+                    tot_files_after += 1
+                    tot_rows_after += rows_before
+                    tot_bytes_after += bytes_after
+                    results.append(
+                        PartitionCompactionResult(
+                            kind=kind,
+                            partition_date=dt_str,
+                            status="dry_run",
+                            files_before=len(files),
+                            files_after=1,
+                            rows_before=rows_before,
+                            rows_after=rows_before,
+                            bytes_before=bytes_before,
+                            bytes_after=bytes_after,
+                            output_file=str(part_dir / final_name),
+                            verified=True,
+                        )
+                    )
+                    continue
+
+                # Apply mode: write hidden .tmp (invisible to *.parquet globs), verify fully, swap atomically
+                tmp_path = part_dir / f".{final_name}.tmp"
+                final_path = part_dir / final_name
+                try:
+                    pq.write_table(
+                        merged,
+                        tmp_path,
+                        compression=compression,
+                        compression_level=compression_level,
+                    )
+                    verify_tbl = pq.read_table(tmp_path)
+                    if verify_tbl.num_rows != rows_before:
+                        raise RuntimeError(
+                            f"Post-write row verification failed in {kind}/dt={dt_str}: "
+                            f"expected {rows_before}, got {verify_tbl.num_rows}"
+                        )
+                    if not verify_tbl.schema.equals(schema):
+                        raise RuntimeError(
+                            f"Post-write schema verification failed in {kind}/dt={dt_str}"
+                        )
+                    if _table_content_digest(verify_tbl) != expected_digest:
+                        raise RuntimeError(
+                            f"Post-write SHA-256 digest mismatch in {kind}/dt={dt_str}"
+                        )
+                    bytes_after = tmp_path.stat().st_size
+                    os.replace(tmp_path, final_path)
+                except Exception:
+                    if tmp_path.exists():
+                        tmp_path.unlink(missing_ok=True)
+                    raise
+
+                # Retire original small parts (backing them up first if backup_dir is provided)
+                for src in files:
+                    dest = (backup_root / kind / f"dt={dt_str}" / src.name) if backup_root is not None else None
+                    _move_or_unlink_with_retry(src, dest)
+
+                # Final partition sanity check on disk
+                remaining_files = sorted(part_dir.glob("*.parquet"))
+                post_rows = sum(pq.read_metadata(p).num_rows for p in remaining_files)
+                if post_rows != rows_before:
+                    raise RuntimeError(
+                        f"Final partition verification mismatch in {kind}/dt={dt_str}: "
+                        f"expected {rows_before}, found {post_rows}"
+                    )
+
+                tot_files_after += len(remaining_files)
+                tot_rows_after += post_rows
+                tot_bytes_after += bytes_after
+                results.append(
+                    PartitionCompactionResult(
+                        kind=kind,
+                        partition_date=dt_str,
+                        status="compacted",
+                        files_before=len(files),
+                        files_after=len(remaining_files),
+                        rows_before=rows_before,
+                        rows_after=post_rows,
+                        bytes_before=bytes_before,
+                        bytes_after=bytes_after,
+                        output_file=str(final_path),
+                        verified=True,
+                    )
+                )
+
+        return ArchiveCompactionReport(
+            base_dir=str(self.base_dir),
+            before_date_utc=cutoff_str,
+            dry_run=dry_run,
+            backup_dir=str(backup_root) if backup_root is not None else None,
+            partitions=results,
+            total_files_before=tot_files_before,
+            total_files_after=tot_files_after,
+            total_rows_before=tot_rows_before,
+            total_rows_after=tot_rows_after,
+            total_bytes_before=tot_bytes_before,
+            total_bytes_after=tot_bytes_after,
+            bytes_saved=max(0, tot_bytes_before - tot_bytes_after),
+        )
+
+    async def acompact_completed_partitions(self, **kwargs: Any) -> ArchiveCompactionReport:
+        return await asyncio.to_thread(self.compact_completed_partitions, **kwargs)
+
     def _write_partitioned(
         self,
         kind: ArchiveKind,
@@ -582,7 +934,7 @@ class ParquetArchiveStore:
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
             file_path = part_dir / f"part-{stamp}-{uuid4().hex[:8]}.parquet"
             table = pa.Table.from_pylist(rows, schema=schema)
-            pq.write_table(table, file_path, compression="snappy")
+            pq.write_table(table, file_path, compression="zstd", compression_level=3)
             written.append(file_path)
         return written
 

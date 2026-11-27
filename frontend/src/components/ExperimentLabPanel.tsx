@@ -711,13 +711,7 @@ export function ExperimentLabPanel({
                         {run.trade_count}
                       </td>
                       <td className="px-2.5 py-2 text-right font-mono-tabular whitespace-nowrap">
-                        <span
-                          className={
-                            ddGateFail
-                              ? "px-1.5 py-0.5 rounded bg-rose-950/60 text-rose-300 border border-rose-800/70"
-                              : "text-rose-300"
-                          }
-                        >
+                        <span className={ddGateFail ? "text-rose-400 font-medium" : "text-rose-300"}>
                           -${run.max_drawdown_usd.toFixed(2)}
                         </span>
                       </td>
@@ -765,10 +759,8 @@ export function ExperimentLabPanel({
                                   ? diag.gates.reasons.join(", ")
                                   : "All Brain & Strategy gates passed"
                               }
-                              className={`font-mono-tabular text-[10px] px-1.5 py-0.5 rounded border font-semibold ${
-                                diag.gates.overall_pass
-                                  ? "bg-emerald-950/70 text-emerald-300 border-emerald-700/80"
-                                  : "bg-rose-950/70 text-rose-300 border-rose-800/80"
+                              className={`font-mono-tabular text-[10px] px-1 font-semibold ${
+                                diag.gates.overall_pass ? "text-emerald-400" : "text-rose-400"
                               }`}
                             >
                               {diag.gates.overall_pass ? "PASS" : "FAIL"}

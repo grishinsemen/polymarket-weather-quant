@@ -282,6 +282,64 @@ class Database:
             await self._conn.close()
             self._conn = None
 
+    async def prune_ephemeral_noise(
+        self,
+        *,
+        now_utc: datetime | None = None,
+        keep_skip_days: int = 7,
+        keep_prediction_days: int = 3,
+    ) -> dict[str, int]:
+        """Safely prune high-volume ephemeral SKIP audit rows and superseded old predictions.
+
+        NEVER deletes trading or meteorological history (orders, fills, positions, CLV,
+        METAR observations, weather events, experiment runs, model/strategy versions, or
+        the latest probability snapshot for any (event_id, model_version)).
+        """
+        from datetime import timedelta
+
+        ref = now_utc or datetime.now(timezone.utc)
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        else:
+            ref = ref.astimezone(timezone.utc)
+
+        skip_cutoff = (ref - timedelta(days=max(1, keep_skip_days))).isoformat()
+        pred_cutoff = (ref - timedelta(days=max(1, keep_prediction_days))).isoformat()
+
+        deleted_skips = 0
+        async with self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='strategy_audit_log'"
+        ) as cur:
+            has_audit = (await cur.fetchone()) is not None
+        if has_audit:
+            cur = await self.conn.execute(
+                "DELETE FROM strategy_audit_log WHERE decision = 'SKIP' AND created_at_utc < ?",
+                (skip_cutoff,),
+            )
+            deleted_skips = int(cur.rowcount or 0)
+
+        # Delete only superseded predictions strictly older than pred_cutoff, always keeping
+        # the latest computed_at_utc snapshot for every (event_id, model_version).
+        cur2 = await self.conn.execute(
+            """
+            DELETE FROM predictions
+            WHERE computed_at_utc < ?
+              AND (event_id, model_version, computed_at_utc) NOT IN (
+                  SELECT event_id, model_version, MAX(computed_at_utc)
+                  FROM predictions
+                  GROUP BY event_id, model_version
+              )
+            """,
+            (pred_cutoff,),
+        )
+        deleted_preds = int(cur2.rowcount or 0)
+        if deleted_skips > 0 or deleted_preds > 0:
+            await self.conn.commit()
+        return {
+            "deleted_skip_audit_rows": deleted_skips,
+            "deleted_superseded_predictions": deleted_preds,
+        }
+
     @property
     def conn(self) -> aiosqlite.Connection:
         if self._conn is None:

@@ -2004,4 +2004,53 @@ describe("WeatherQuantTerminal", () => {
     expect(within(rows[0]).getByText("EGLC")).toBeInTheDocument();
     expect(within(rows[0]).getByText("0.18°C")).toBeInTheDocument();
   });
+
+  it("toggles the plain-Russian orderbook and Fair Probability FAQ from the ? button in CityXRayPanel", () => {
+    render(
+      <WeatherQuantTerminal
+        snapshot={FIXTURE_SNAPSHOT}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="conservative-kelly-100-v1"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    const faqBtn = screen.getByTestId("xray-orderbook-faq-btn");
+    expect(faqBtn).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("xray-orderbook-faq-popover")).not.toBeInTheDocument();
+
+    fireEvent.click(faqBtn);
+    expect(faqBtn).toHaveAttribute("aria-expanded", "true");
+
+    const faqPanel = screen.getByTestId("xray-orderbook-faq-popover");
+    expect(faqPanel).toHaveClass("absolute");
+    expect(faqPanel).toHaveTextContent(/Fair Probability/i);
+    expect(faqPanel).toHaveTextContent(/Зелёный BID/i);
+    expect(faqPanel).toHaveTextContent(/Красный ASK/i);
+    expect(faqPanel).toHaveTextContent(/Fair NO = 100% − Fair YES/i);
+    expect(faqPanel).toHaveTextContent(/ZEROED/i);
+
+    // Clicking outside closes the floating popover
+    fireEvent.mouseDown(document.body);
+    expect(faqBtn).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("xray-orderbook-faq-popover")).not.toBeInTheDocument();
+
+    // Reopen and close via ✕ button
+    fireEvent.click(faqBtn);
+    expect(screen.getByTestId("xray-orderbook-faq-popover")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("xray-orderbook-faq-close"));
+    expect(faqBtn).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("xray-orderbook-faq-popover")).not.toBeInTheDocument();
+  });
 });

@@ -71,6 +71,8 @@ class AutonomousRuntime:
         self._archived_ensemble_keys: set[tuple[str, str]] = set()
         self._last_metar_by_station: dict[str, MetarObservation] = {}
         self._archived_metar_keys: set[tuple[str, str]] = set()
+        self._last_saved_prob_sig: dict[tuple[str, str], tuple[tuple[tuple[str, float, bool], ...], datetime]] = {}
+        self._last_maintenance_date_utc: str | None = None
         self._stale_feed_since_utc: datetime | None = None
         self._cycle_lock = asyncio.Lock()
 
@@ -443,7 +445,20 @@ class AutonomousRuntime:
                         exc,
                     )
                     continue
-                await save_event_probability_snapshot(db, prob_snap)
+                prob_sig = tuple(
+                    (b.bucket_id, round(float(b.fair_probability), 4), bool(b.is_impossible))
+                    for b in prob_snap.buckets
+                )
+                sig_key = (event.event_id, prob_snap.model_version)
+                prev_saved = self._last_saved_prob_sig.get(sig_key)
+                should_save = (
+                    prev_saved is None
+                    or prev_saved[0] != prob_sig
+                    or (now_utc - prev_saved[1]) >= timedelta(minutes=15)
+                )
+                if should_save:
+                    await save_event_probability_snapshot(db, prob_snap)
+                    self._last_saved_prob_sig[sig_key] = (prob_sig, now_utc)
                 probs_computed += 1
 
             # 3b. Settle expired live positions whose local settlement day has closed
@@ -496,6 +511,34 @@ class AutonomousRuntime:
                     for fill in res.fills:
                         ev = event_by_id.get(fill.event_id)
                         await bot.notify_fill(fill, event=ev)
+
+            # 5. Once-per-UTC-day lossless compaction of completed prior Parquet days & SQLite noise hygiene
+            today_str = now_utc.date().isoformat()
+            if db.db_path != ":memory:" and self._last_maintenance_date_utc != today_str:
+                self._last_maintenance_date_utc = today_str
+                try:
+                    report = await archive.acompact_completed_partitions(
+                        before_date_utc=now_utc.date(),
+                        min_age_minutes=60.0,
+                        dry_run=False,
+                    )
+                    compacted_cnt = sum(1 for p in report.partitions if p.status == "compacted")
+                    if compacted_cnt > 0:
+                        logger.info(
+                            "Losslessly compacted %d completed Parquet partition(s): %d -> %d files, saved %.2f MB (0 rows dropped)",
+                            compacted_cnt,
+                            report.total_files_before,
+                            report.total_files_after,
+                            report.bytes_saved / (1024 * 1024),
+                        )
+                except Exception:
+                    logger.warning("Daily completed-partition Parquet compaction skipped", exc_info=True)
+                try:
+                    pruned = await db.prune_ephemeral_noise(now_utc=now_utc)
+                    if pruned["deleted_skip_audit_rows"] or pruned["deleted_superseded_predictions"]:
+                        logger.info("SQLite ephemeral hygiene pruned: %s", pruned)
+                except Exception:
+                    logger.warning("Daily SQLite ephemeral hygiene skipped", exc_info=True)
 
             await radar.broadcast_state(await radar.get_state())
             return {
