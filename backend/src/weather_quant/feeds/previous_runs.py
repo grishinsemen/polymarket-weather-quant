@@ -104,48 +104,60 @@ class PreviousRunsArchiveFetcher:
         for idx, block in enumerate(blocks):
             if not isinstance(block, dict):
                 continue
-            model_name = str(
-                block.get("model")
-                or (self._models[idx] if idx < len(self._models) else "unknown")
-            )
             hourly = block.get("hourly")
             if not isinstance(hourly, dict):
                 continue
 
             raw_times = hourly.get("time") or []
-            temps = hourly.get(f"temperature_2m{suffix}") or []
-            winds = hourly.get(f"wind_speed_10m{suffix}") or []
-            wind_dirs = hourly.get(f"wind_direction_10m{suffix}") or []
-            clouds = hourly.get(f"cloud_cover{suffix}") or []
-            rhs = hourly.get(f"relative_humidity_2m{suffix}") or []
-            pressures = hourly.get(f"pressure_msl{suffix}") or []
-            pub_latency_h = MODEL_P95_PUB_LATENCY_HOURS.get(model_name, 6.0)
-
-            for pos, raw_ts in enumerate(raw_times):
-                if pos >= len(temps) or temps[pos] is None:
-                    continue
-                valid_utc = _parse_iso_utc(str(raw_ts))
-                # Previous-day run initialized at 00Z on (valid_date - previous_day) + p95 pub latency
-                init_date = valid_utc.date() - timedelta(days=self._previous_day)
-                init_utc = datetime(init_date.year, init_date.month, init_date.day, 0, 0, tzinfo=timezone.utc)
-                available_utc = init_utc + timedelta(hours=pub_latency_h)
-
-                points.append(
-                    HistoricalForecastPoint(
-                        station_icao=station.icao,
-                        model=model_name,
-                        valid_at_utc=valid_utc,
-                        available_at_utc=available_utc,
-                        temperature_2m_c=float(temps[pos]),
-                        wind_speed_10m=float(winds[pos]) if pos < len(winds) and winds[pos] is not None else None,
-                        wind_direction_10m=(
-                            float(wind_dirs[pos]) if pos < len(wind_dirs) and wind_dirs[pos] is not None else None
-                        ),
-                        cloud_cover=float(clouds[pos]) if pos < len(clouds) and clouds[pos] is not None else None,
-                        relative_humidity_2m=float(rhs[pos]) if pos < len(rhs) and rhs[pos] is not None else None,
-                        pressure_msl=float(pressures[pos]) if pos < len(pressures) and pressures[pos] is not None else None,
-                    )
+            base_temp_key = f"temperature_2m{suffix}"
+            # Open-Meteo returns model-suffixed keys (e.g. temperature_2m_previous_day1_ecmwf_ifs025)
+            # when multiple models are requested in one dict block, and unsuffixed keys for a single model.
+            model_series: list[tuple[str, str]] = []
+            if base_temp_key in hourly:
+                model_name = str(
+                    block.get("model")
+                    or (self._models[idx] if idx < len(self._models) else "unknown")
                 )
+                model_series.append((model_name, ""))
+            else:
+                for m_name in self._models:
+                    if f"{base_temp_key}_{m_name}" in hourly:
+                        model_series.append((m_name, f"_{m_name}"))
+
+            for model_name, model_suffix in model_series:
+                temps = hourly.get(f"temperature_2m{suffix}{model_suffix}") or []
+                winds = hourly.get(f"wind_speed_10m{suffix}{model_suffix}") or []
+                wind_dirs = hourly.get(f"wind_direction_10m{suffix}{model_suffix}") or []
+                clouds = hourly.get(f"cloud_cover{suffix}{model_suffix}") or []
+                rhs = hourly.get(f"relative_humidity_2m{suffix}{model_suffix}") or []
+                pressures = hourly.get(f"pressure_msl{suffix}{model_suffix}") or []
+                pub_latency_h = MODEL_P95_PUB_LATENCY_HOURS.get(model_name, 6.0)
+
+                for pos, raw_ts in enumerate(raw_times):
+                    if pos >= len(temps) or temps[pos] is None:
+                        continue
+                    valid_utc = _parse_iso_utc(str(raw_ts))
+                    # Previous-day run initialized at 00Z on (valid_date - previous_day) + p95 pub latency
+                    init_date = valid_utc.date() - timedelta(days=self._previous_day)
+                    init_utc = datetime(init_date.year, init_date.month, init_date.day, 0, 0, tzinfo=timezone.utc)
+                    available_utc = init_utc + timedelta(hours=pub_latency_h)
+
+                    points.append(
+                        HistoricalForecastPoint(
+                            station_icao=station.icao,
+                            model=model_name,
+                            valid_at_utc=valid_utc,
+                            available_at_utc=available_utc,
+                            temperature_2m_c=float(temps[pos]),
+                            wind_speed_10m=float(winds[pos]) if pos < len(winds) and winds[pos] is not None else None,
+                            wind_direction_10m=(
+                                float(wind_dirs[pos]) if pos < len(wind_dirs) and wind_dirs[pos] is not None else None
+                            ),
+                            cloud_cover=float(clouds[pos]) if pos < len(clouds) and clouds[pos] is not None else None,
+                            relative_humidity_2m=float(rhs[pos]) if pos < len(rhs) and rhs[pos] is not None else None,
+                            pressure_msl=float(pressures[pos]) if pos < len(pressures) and pressures[pos] is not None else None,
+                        )
+                    )
         return points
 
     async def fetch_historical_routine_metars(

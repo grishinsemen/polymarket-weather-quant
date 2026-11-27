@@ -1442,7 +1442,7 @@ describe("WeatherQuantTerminal", () => {
     expect(within(rows[0]).getByText("exp-high-brier-neg-clv")).toBeInTheDocument();
   });
 
-  it("renders Log-Loss/Sharpe sorting, Exit Mode Comparison, Model Calibration Audit, and Russian target cheat sheet", () => {
+  it("renders Log-Loss/ΔLogLoss sorting, expandable two-contour details, Exit Mode Comparison, Model Calibration Audit, and Russian target cheat sheet", () => {
     const onCompareExitModes = vi.fn(async () => {});
     const onRunCalibrationAudit = vi.fn(async () => {});
 
@@ -1454,18 +1454,197 @@ describe("WeatherQuantTerminal", () => {
           run_id: "exp-legacy-null",
           log_loss: null,
           sharpe_ratio: null,
+          diagnostics: null,
         },
         {
           ...FIXTURE_SNAPSHOT.experiment_runs[1],
           run_id: "exp-sharp-low-ll",
           log_loss: 1.62,
           sharpe_ratio: 1.85,
+          diagnostics: {
+            schema_version: 1,
+            primary_brain_slice: "premarket",
+            is_ml_model: true,
+            train_end_utc: "2026-11-10T00:00:00Z",
+            premarket: {
+              label: "premarket",
+              sample_count: 14,
+              market_sample_count: 14,
+              oos_sample_count: 14,
+              in_sample_excluded_count: 0,
+              model_brier: 0.141,
+              model_log_loss: 1.62,
+              model_rps: 0.0412,
+              model_tail_brier: 0.019,
+              model_tail_ece: 0.024,
+              tail_bucket_count: 84,
+              market_brier: 0.188,
+              market_log_loss: 1.71,
+              market_rps: 0.0521,
+              delta_log_loss: 0.09,
+              brier_skill_score: 0.25,
+              delta_rps: 0.0109,
+              gate_beats_market: true,
+            },
+            decision_entry: {
+              label: "decision_entry",
+              sample_count: 19,
+              market_sample_count: 19,
+              oos_sample_count: 19,
+              in_sample_excluded_count: 0,
+              model_brier: 0.138,
+              model_log_loss: 1.58,
+              model_rps: 0.039,
+              model_tail_brier: 0.018,
+              model_tail_ece: 0.021,
+              tail_bucket_count: 60,
+              market_brier: 0.181,
+              market_log_loss: 1.65,
+              market_rps: 0.048,
+              delta_log_loss: 0.07,
+              brier_skill_score: 0.237,
+              delta_rps: 0.009,
+              gate_beats_market: true,
+            },
+            ml_covered_premarket: {
+              label: "ml_covered_premarket",
+              sample_count: 8,
+              market_sample_count: 8,
+              oos_sample_count: 8,
+              in_sample_excluded_count: 0,
+              model_brier: 0.129,
+              model_log_loss: 1.54,
+              model_rps: 0.037,
+              model_tail_brier: 0.016,
+              model_tail_ece: 0.019,
+              tail_bucket_count: 44,
+              market_brier: 0.185,
+              market_log_loss: 1.68,
+              market_rps: 0.05,
+              delta_log_loss: 0.14,
+              brier_skill_score: 0.303,
+              delta_rps: 0.013,
+              gate_beats_market: true,
+            },
+            ml_covered_decision_entry: null,
+            strategy: {
+              markouts: [
+                {
+                  horizon_minutes: 5,
+                  label: "5m",
+                  sample_count: 18,
+                  mean_clv: 0.012,
+                  volume_weighted_clv: 0.014,
+                },
+                {
+                  horizon_minutes: 30,
+                  label: "30m",
+                  sample_count: 17,
+                  mean_clv: 0.026,
+                  volume_weighted_clv: 0.029,
+                },
+              ],
+              primary_clv_30m: 0.029,
+              volume_weighted_clv: 0.031,
+              realized_log_growth: 0.074,
+              max_drawdown_pct: 1.4,
+              sortino_ratio: 2.41,
+              calmar_ratio: 5.46,
+              calendar_days: 7,
+              low_sample_warning: true,
+              top3_pnl_share_pct: 42.0,
+              profitable_stations: 5,
+              total_traded_stations: 6,
+              best_station: { station_icao: "LFPB", trade_count: 4, net_pnl_usd: 3.1 },
+              worst_station: { station_icao: "RKSI", trade_count: 2, net_pnl_usd: -0.6 },
+            },
+            gates: {
+              brain_beats_market: true,
+              max_dd_ok: true,
+              markout_ok: true,
+              fill_rate_ok: true,
+              overall_pass: true,
+              reasons: [],
+            },
+          },
         },
         {
           ...FIXTURE_SNAPSHOT.experiment_runs[0],
           run_id: "exp-weak-high-ll",
           log_loss: 2.34,
           sharpe_ratio: 0.42,
+          diagnostics: {
+            schema_version: 1,
+            primary_brain_slice: "premarket",
+            is_ml_model: false,
+            train_end_utc: null,
+            premarket: {
+              label: "premarket",
+              sample_count: 14,
+              market_sample_count: 14,
+              oos_sample_count: 0,
+              in_sample_excluded_count: 0,
+              model_brier: 0.24,
+              model_log_loss: 2.34,
+              model_rps: 0.071,
+              model_tail_brier: 0.04,
+              model_tail_ece: 0.06,
+              tail_bucket_count: 84,
+              market_brier: 0.19,
+              market_log_loss: 2.1,
+              market_rps: 0.055,
+              delta_log_loss: -0.24,
+              brier_skill_score: -0.263,
+              delta_rps: -0.016,
+              gate_beats_market: false,
+            },
+            decision_entry: {
+              label: "decision_entry",
+              sample_count: 10,
+              market_sample_count: 10,
+              oos_sample_count: 0,
+              in_sample_excluded_count: 0,
+              model_brier: 0.22,
+              model_log_loss: 2.2,
+              model_rps: 0.065,
+              model_tail_brier: 0.038,
+              model_tail_ece: 0.05,
+              tail_bucket_count: 50,
+              market_brier: 0.19,
+              market_log_loss: 2.05,
+              market_rps: 0.052,
+              delta_log_loss: -0.15,
+              brier_skill_score: -0.158,
+              delta_rps: -0.013,
+              gate_beats_market: false,
+            },
+            ml_covered_premarket: null,
+            ml_covered_decision_entry: null,
+            strategy: {
+              markouts: [],
+              primary_clv_30m: -0.035,
+              volume_weighted_clv: -0.035,
+              realized_log_growth: -0.02,
+              max_drawdown_pct: 24.5,
+              sortino_ratio: -0.4,
+              calmar_ratio: -0.1,
+              calendar_days: 3,
+              low_sample_warning: true,
+              top3_pnl_share_pct: 88.0,
+              profitable_stations: 2,
+              total_traded_stations: 6,
+              best_station: null,
+              worst_station: null,
+            },
+            gates: {
+              brain_beats_market: false,
+              max_dd_ok: false,
+              markout_ok: false,
+              fill_rate_ok: true,
+              overall_pass: false,
+              reasons: ["BRAIN_LOSES_TO_MARKET", "MAX_DD_EXCEEDS_20PCT", "ADVERSE_MARKOUT"],
+            },
+          },
         },
       ],
     };
@@ -1596,12 +1775,26 @@ describe("WeatherQuantTerminal", () => {
     expect(within(rows[0]).getByText("1.620")).toBeInTheDocument();
     expect(within(rows[2]).getByText("exp-legacy-null")).toBeInTheDocument();
 
-    // Sharpe sort (descending first, missing nulls pushed to bottom)
-    fireEvent.click(screen.getByTestId("sort-runs-sharpe"));
+    // ΔLogLoss vs Market sort (descending first, missing nulls pushed to bottom) + PASS/FAIL gates
+    fireEvent.click(screen.getByTestId("sort-runs-delta-ll"));
     rows = screen.getAllByTestId("experiment-run-row");
     expect(within(rows[0]).getByText("exp-sharp-low-ll")).toBeInTheDocument();
-    expect(within(rows[0]).getByText("+1.85")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("+0.090")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("BSS +25.0%")).toBeInTheDocument();
+    expect(screen.getByTestId("gate-badge-exp-sharp-low-ll")).toHaveTextContent("PASS");
+    expect(screen.getByTestId("gate-badge-exp-weak-high-ll")).toHaveTextContent("FAIL");
     expect(within(rows[2]).getByText("exp-legacy-null")).toBeInTheDocument();
+
+    // Expand two rows simultaneously via chevron buttons to compare Contour 1 & Contour 2 side by side
+    fireEvent.click(screen.getByTestId("expand-run-exp-sharp-low-ll"));
+    fireEvent.click(screen.getByTestId("expand-run-exp-legacy-null"));
+    const sharpDetails = screen.getByTestId("experiment-run-details-exp-sharp-low-ll");
+    expect(within(sharpDetails).getByText("ML-Covered Premarket")).toBeInTheDocument();
+    expect(within(sharpDetails).getByText("+1.85")).toBeInTheDocument();
+    expect(within(sharpDetails).getByText("+2.90¢")).toBeInTheDocument();
+    expect(within(sharpDetails).getByText("42%")).toBeInTheDocument();
+    const legacyDetails = screen.getByTestId("experiment-run-details-exp-legacy-null");
+    expect(within(legacyDetails).getByText(/Legacy run/i)).toBeInTheDocument();
 
     // Exit Mode Comparison card + BUY NO toggle
     const exitCard = screen.getByTestId("exit-mode-comparison-card");
@@ -1710,5 +1903,98 @@ describe("WeatherQuantTerminal", () => {
     const yesOrderRow = screen.getByTestId("unified-order-row-ord-evt-rksi-5");
     expect(yesOrderRow).toHaveTextContent("ORDER BUY YES (14sh @ 25¢)");
     expect(within(yesOrderRow).getByText(/ORDER BUY YES/).className).toContain("text-sky-300");
+  });
+
+  it("ranks calibration stations by S-D predictability tiers and supports interactive column sorting", () => {
+    const mkMetrics = (brier: number, logLoss: number, mae: number, cov: number) => ({
+      sample_count: 10,
+      brier_score: brier,
+      log_loss: logLoss,
+      coverage_p10_p90: cov,
+      tail_brier_score: 0.02,
+      tail_bucket_count: 40,
+      mean_bias_c: 0.1,
+      mae_c: mae,
+      rmse_c: mae * 1.2,
+    });
+
+    render(
+      <WeatherQuantTerminal
+        snapshot={FIXTURE_SNAPSHOT}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="experiments"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="kelly-multi-strict-v2"
+        calibrationReport={{
+          generated_at_utc: "2026-11-27T11:00:00Z",
+          tail_price_threshold: 0.1,
+          overall_raw: mkMetrics(0.78, 1.95, 1.01, 0.65),
+          overall_calibrated: mkMetrics(0.77, 1.75, 0.97, 0.77),
+          stations: [
+            {
+              station_icao: "SBGR",
+              city: "Sao Paulo",
+              sample_count: 3,
+              learned_bias_c: 0.05,
+              learned_spread_scale: 1.2,
+              raw: mkMetrics(1.05, 3.4, 2.5, 0.33),
+              calibrated: mkMetrics(1.02, 3.2, 2.3, 0.33),
+            },
+            {
+              station_icao: "EGLC",
+              city: "London",
+              sample_count: 3,
+              learned_bias_c: -0.08,
+              learned_spread_scale: 1.0,
+              raw: mkMetrics(0.4, 0.75, 0.3, 1.0),
+              calibrated: mkMetrics(0.33, 0.62, 0.18, 1.0),
+            },
+            {
+              station_icao: "KMIA",
+              city: "Miami",
+              sample_count: 3,
+              learned_bias_c: -0.5,
+              learned_spread_scale: 1.1,
+              raw: mkMetrics(0.72, 1.5, 0.7, 0.8),
+              calibrated: mkMetrics(0.68, 1.41, 0.57, 1.0),
+            },
+          ],
+        }}
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    const calCard = screen.getByTestId("model-calibration-card");
+    fireEvent.click(within(calCard).getByText("Per-station breakdown ▾"));
+
+    // Default sort: best predictability tier first (EGLC S -> KMIA A -> SBGR D)
+    let rows = within(calCard).getAllByTestId("calibration-station-row");
+    expect(within(rows[0]).getByText("EGLC")).toBeInTheDocument();
+    expect(screen.getByTestId("station-tier-EGLC")).toHaveTextContent("S");
+    expect(within(rows[1]).getByText("KMIA")).toBeInTheDocument();
+    expect(screen.getByTestId("station-tier-KMIA")).toHaveTextContent("A");
+    expect(within(rows[2]).getByText("SBGR")).toBeInTheDocument();
+    expect(screen.getByTestId("station-tier-SBGR")).toHaveTextContent("D");
+
+    // Clicking Tier toggles to descending (D worst first -> S best last)
+    fireEvent.click(screen.getByTestId("sort-cal-tier"));
+    rows = within(calCard).getAllByTestId("calibration-station-row");
+    expect(within(rows[0]).getByText("SBGR")).toBeInTheDocument();
+    expect(within(rows[2]).getByText("EGLC")).toBeInTheDocument();
+
+    // Clicking MAE sorts ascending (lowest MAE 0.18°C first)
+    fireEvent.click(screen.getByTestId("sort-cal-mae"));
+    rows = within(calCard).getAllByTestId("calibration-station-row");
+    expect(within(rows[0]).getByText("EGLC")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("0.18°C")).toBeInTheDocument();
   });
 });

@@ -157,6 +157,39 @@ async def test_previous_runs_fetcher_applies_p95_pub_latency_and_reads_pressure(
 
 
 @pytest.mark.asyncio
+async def test_previous_runs_fetcher_parses_multi_model_suffixed_keys() -> None:
+    station = get_station("KLGA")
+    assert station is not None
+    payload = {
+        "hourly": {
+            "time": ["2026-11-26T14:00"],
+            "temperature_2m_previous_day1_ecmwf_ifs025": [10.2],
+            "temperature_2m_previous_day1_gfs_seamless": [9.8],
+            "temperature_2m_previous_day1_icon_seamless": [12.0],
+            "pressure_msl_previous_day1_ecmwf_ifs025": [1015.0],
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        fetcher = PreviousRunsArchiveFetcher(
+            client=client,
+            models=("ecmwf_ifs025", "gfs_seamless", "icon_seamless"),
+            previous_day=1,
+        )
+        pts = await fetcher.fetch_historical_forecasts(station, date(2026, 11, 26), date(2026, 11, 26))
+
+    by_model = {p.model: p for p in pts}
+    assert set(by_model) == {"ecmwf_ifs025", "gfs_seamless", "icon_seamless"}
+    assert by_model["ecmwf_ifs025"].temperature_2m_c == pytest.approx(10.2)
+    assert by_model["gfs_seamless"].temperature_2m_c == pytest.approx(9.8)
+    assert by_model["icon_seamless"].temperature_2m_c == pytest.approx(12.0)
+    assert by_model["ecmwf_ifs025"].pressure_msl == pytest.approx(1015.0)
+
+
+@pytest.mark.asyncio
 async def test_clients_work_with_mock_transport() -> None:
     eddm = get_station("EDDM")
     kmia = get_station("KMIA")
