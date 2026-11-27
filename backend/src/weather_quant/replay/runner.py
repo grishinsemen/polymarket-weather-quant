@@ -47,6 +47,14 @@ from weather_quant.probability.engine import (
     round_half_away,
     to_event_unit,
 )
+from weather_quant.replay.metrics import (
+    ForecastEvalObservation,
+    ReplayDiagnostics,
+    compute_brain_slice_metrics,
+    compute_strategy_contour_metrics,
+    evaluate_replay_gates,
+    extract_market_probs,
+)
 from weather_quant.storage.database import Database
 from weather_quant.strategy.engine import (
     R_TRADE_EDGE_REALIZED,
@@ -571,6 +579,17 @@ async def _execute_replay_isolated(
         metars_by_station: dict[str, list[MetarObservation]] = {}
         latest_probs: dict[str, EventProbabilitySnapshot] = {}
         last_prob_input_stamp: dict[str, tuple[datetime | None, int]] = {}
+        premarket_eval: dict[str, ForecastEvalObservation] = {}
+        earliest_eval: dict[str, ForecastEvalObservation] = {}
+        premarket_model_only: dict[str, ForecastEvalObservation] = {}
+        decision_entry_evals: list[ForecastEvalObservation] = []
+        decision_order_evals: list[ForecastEvalObservation] = []
+        event_tz_by_id: dict[str, Any] = {}
+        for ev in events_sorted:
+            try:
+                event_tz_by_id[ev.event_id] = ZoneInfo(ev.station.timezone)
+            except Exception:
+                event_tz_by_id[ev.event_id] = timezone.utc
 
         equity_curve: list[ReplayEquityPoint] = [
             ReplayEquityPoint(
@@ -708,8 +727,78 @@ async def _execute_replay_isolated(
                 event_prob = latest_probs.get(event.event_id)
                 event_books = latest_books.get(event.event_id, {})
                 if event_prob is not None and event_books:
+                    if tick_time < close_by_event[event.event_id]:
+                        ev_tz = event_tz_by_id[event.event_id]
+                        local_day_metars = sum(
+                            1
+                            for m in station_metars
+                            if m.is_routine
+                            and not m.raw_report.strip().upper().startswith("SPECI")
+                            and _ensure_utc(m.observed_at_utc).astimezone(ev_tz).date() == event.local_date
+                        )
+                        if local_day_metars == 0 and event.event_id not in premarket_model_only:
+                            premarket_model_only[event.event_id] = ForecastEvalObservation(
+                                event=event,
+                                prob_snapshot=event_prob,
+                                books=dict(event_books),
+                                captured_at_utc=tick_time,
+                                metar_count_local_day=0,
+                            )
+                        need_pre = local_day_metars == 0 and event.event_id not in premarket_eval
+                        need_earliest = event.event_id not in earliest_eval
+                        if (need_pre or need_earliest) and extract_market_probs(event, event_books) is not None:
+                            obs = ForecastEvalObservation(
+                                event=event,
+                                prob_snapshot=event_prob,
+                                books=dict(event_books),
+                                captured_at_utc=tick_time,
+                                metar_count_local_day=local_day_metars,
+                            )
+                            if need_pre:
+                                premarket_eval[event.event_id] = obs
+                            if need_earliest:
+                                earliest_eval[event.event_id] = obs
                     latest_routine = station_metars[-1] if station_metars else None
-                    await engine.tick_event(event, event_prob, event_books, latest_routine)
+                    tick_res = await engine.tick_event(event, event_prob, event_books, latest_routine)
+                    buy_fills_now = [f for f in tick_res.fills if f.side == "BUY"]
+                    if buy_fills_now:
+                        ev_tz = event_tz_by_id[event.event_id]
+                        local_day_metars = sum(
+                            1
+                            for m in station_metars
+                            if m.is_routine
+                            and not m.raw_report.strip().upper().startswith("SPECI")
+                            and _ensure_utc(m.observed_at_utc).astimezone(ev_tz).date() == event.local_date
+                        )
+                        book_copy = dict(event_books)
+                        for _ in buy_fills_now:
+                            decision_entry_evals.append(
+                                ForecastEvalObservation(
+                                    event=event,
+                                    prob_snapshot=event_prob,
+                                    books=book_copy,
+                                    captured_at_utc=tick_time,
+                                    metar_count_local_day=local_day_metars,
+                                )
+                            )
+                    elif any(o.side == "BUY" for o in tick_res.placed):
+                        ev_tz = event_tz_by_id[event.event_id]
+                        local_day_metars = sum(
+                            1
+                            for m in station_metars
+                            if m.is_routine
+                            and not m.raw_report.strip().upper().startswith("SPECI")
+                            and _ensure_utc(m.observed_at_utc).astimezone(ev_tz).date() == event.local_date
+                        )
+                        decision_order_evals.append(
+                            ForecastEvalObservation(
+                                event=event,
+                                prob_snapshot=event_prob,
+                                books=dict(event_books),
+                                captured_at_utc=tick_time,
+                                metar_count_local_day=local_day_metars,
+                            )
+                        )
 
             if metar_arrived or newly_expired:
                 await _settle_expired_events(store, events_sorted, metars_sorted, tick_time)
@@ -819,14 +908,157 @@ async def _execute_replay_isolated(
         fill_rate = round(len(filled_order_ids) / denom_orders, 6) if denom_orders > 0 else 0.0
 
         avg_clv = round(sum(c.clv for c in clvs) / len(clvs), 6) if clvs else 0.0
-        brier_score = _compute_brier_score(events_sorted, latest_probs, metars_sorted, end_utc)
-        log_loss = _compute_log_loss(events_sorted, latest_probs, metars_sorted, end_utc)
+        legacy_brier = _compute_brier_score(events_sorted, latest_probs, metars_sorted, end_utc)
+        legacy_log_loss = _compute_log_loss(events_sorted, latest_probs, metars_sorted, end_utc)
 
         net_pnl = round(final_portfolio.equity_usd - strategy_rec.reference_bankroll, 6)
         net_return_pct = (
             round((net_pnl / strategy_rec.reference_bankroll) * 100.0, 4)
             if strategy_rec.reference_bankroll > 0
             else 0.0
+        )
+
+        # Resolve winning Bucket indices strictly for fully covered & settled local days
+        # (excludes truncated first-day partial archives and still-open current-day events)
+        winning_idx_by_event: dict[str, int] = {}
+        for event in events_sorted:
+            close_utc = close_by_event[event.event_id]
+            if end_utc < close_utc:
+                continue
+            ev_tz = event_tz_by_id[event.event_id]
+            local_day_start_utc = datetime(
+                event.local_date.year,
+                event.local_date.month,
+                event.local_date.day,
+                0,
+                0,
+                tzinfo=ev_tz,
+            ).astimezone(timezone.utc)
+            if start_utc > local_day_start_utc + timedelta(hours=2):
+                continue
+            win_idx = _resolve_winning_bucket_index(event, metars_sorted, end_utc)
+            if win_idx is not None:
+                winning_idx_by_event[event.event_id] = win_idx
+
+        # Honest Premarket slice (0 local-day METARs preferred, else earliest pre-close snapshot)
+        premarket_obs_list: list[ForecastEvalObservation] = []
+        for event in events_sorted:
+            obs = (
+                premarket_eval.get(event.event_id)
+                or earliest_eval.get(event.event_id)
+                or premarket_model_only.get(event.event_id)
+            )
+            if obs is not None:
+                premarket_obs_list.append(obs)
+
+        decision_obs_list = decision_entry_evals if decision_entry_evals else decision_order_evals
+
+        is_ml_model = (
+            mos_provider is not None
+            or "mos" in model_rec.model_type.lower()
+            or "mos" in model_rec.model_version.lower()
+        )
+        covered_stations: set[str] | None = None
+        if is_ml_model:
+            if mos_model is not None and getattr(mos_model, "covered_stations", None):
+                covered_stations = {str(s).strip().upper() for s in mos_model.covered_stations}
+            elif isinstance((model_rec.config_json or {}).get("covered_stations"), list):
+                covered_stations = {
+                    str(s).strip().upper()
+                    for s in model_rec.config_json["covered_stations"]
+                }
+
+        premarket_metrics = compute_brain_slice_metrics(
+            label="premarket",
+            observations=premarket_obs_list,
+            winning_idx_by_event=winning_idx_by_event,
+            train_end_utc=model_rec.train_end_utc,
+        )
+        decision_metrics = compute_brain_slice_metrics(
+            label="decision_entry",
+            observations=decision_obs_list,
+            winning_idx_by_event=winning_idx_by_event,
+            train_end_utc=model_rec.train_end_utc,
+        )
+
+        ml_cov_premarket = (
+            compute_brain_slice_metrics(
+                label="ml_covered_premarket",
+                observations=premarket_obs_list,
+                winning_idx_by_event=winning_idx_by_event,
+                train_end_utc=model_rec.train_end_utc,
+                allowed_stations=covered_stations,
+            )
+            if covered_stations
+            else None
+        )
+        ml_cov_decision = (
+            compute_brain_slice_metrics(
+                label="ml_covered_decision_entry",
+                observations=decision_obs_list,
+                winning_idx_by_event=winning_idx_by_event,
+                train_end_utc=model_rec.train_end_utc,
+                allowed_stations=covered_stations,
+            )
+            if covered_stations
+            else None
+        )
+
+        primary_slice_name: Literal["premarket", "decision_entry"] = (
+            "premarket"
+            if (premarket_metrics.market_sample_count > 0 or decision_metrics.market_sample_count == 0)
+            else "decision_entry"
+        )
+        primary_brain = (
+            premarket_metrics if primary_slice_name == "premarket" else decision_metrics
+        )
+
+        # Headline Brier & Log-Loss reflect honest Premarket (or Decision) forecast rather than post-METAR end-of-day
+        brier_score = (
+            premarket_metrics.model_brier
+            if premarket_metrics.model_brier is not None
+            else (
+                decision_metrics.model_brier
+                if decision_metrics.model_brier is not None
+                else legacy_brier
+            )
+        )
+        log_loss = (
+            premarket_metrics.model_log_loss
+            if premarket_metrics.model_log_loss is not None
+            else (
+                decision_metrics.model_log_loss
+                if decision_metrics.model_log_loss is not None
+                else legacy_log_loss
+            )
+        )
+
+        strategy_metrics = compute_strategy_contour_metrics(
+            clvs=clvs,
+            fills=fills_chron,
+            positions=all_positions,
+            equity_points=[(pt.timestamp_utc, pt.equity_usd) for pt in equity_curve],
+            initial_bankroll=strategy_rec.reference_bankroll,
+            final_equity=final_portfolio.equity_usd,
+            max_drawdown_usd=max_drawdown,
+            net_return_pct=net_return_pct,
+        )
+        gates = evaluate_replay_gates(
+            primary_brain=primary_brain,
+            strategy=strategy_metrics,
+            fill_rate=fill_rate,
+            trade_count=len(fills_chron),
+        )
+        diagnostics = ReplayDiagnostics(
+            primary_brain_slice=primary_slice_name,
+            is_ml_model=is_ml_model,
+            train_end_utc=model_rec.train_end_utc,
+            premarket=premarket_metrics,
+            decision_entry=decision_metrics,
+            ml_covered_premarket=ml_cov_premarket,
+            ml_covered_decision_entry=ml_cov_decision,
+            strategy=strategy_metrics,
+            gates=gates,
         )
 
         summary = ExperimentRunSummary(
@@ -846,6 +1078,7 @@ async def _execute_replay_isolated(
             net_return_pct=net_return_pct,
             is_promoted=False,
             created_at_utc=end_utc,
+            diagnostics=diagnostics.model_dump(mode="json"),
         )
 
         return ExperimentReplayResult(
@@ -868,13 +1101,19 @@ def _run_replay_sync(kwargs: dict[str, Any]) -> ExperimentReplayResult:
 
 async def save_experiment_run(db: Database, summary: ExperimentRunSummary) -> None:
     """Persist an ExperimentRunSummary in the main SQLite experiment_runs table."""
+    diag_json = (
+        json.dumps(summary.diagnostics, separators=(",", ":"))
+        if summary.diagnostics is not None
+        else None
+    )
     await db.conn.execute(
         """
         INSERT INTO experiment_runs (
             run_id, model_version, strategy_version, dataset_start_utc, dataset_end_utc,
             brier_score, log_loss, sharpe_ratio, avg_clv, fill_rate, trade_count,
-            max_drawdown_usd, net_pnl_usd, net_return_pct, is_promoted, created_at_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            max_drawdown_usd, net_pnl_usd, net_return_pct, is_promoted, created_at_utc,
+            diagnostics_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(run_id) DO UPDATE SET
             brier_score = excluded.brier_score,
             log_loss = excluded.log_loss,
@@ -885,7 +1124,8 @@ async def save_experiment_run(db: Database, summary: ExperimentRunSummary) -> No
             max_drawdown_usd = excluded.max_drawdown_usd,
             net_pnl_usd = excluded.net_pnl_usd,
             net_return_pct = excluded.net_return_pct,
-            created_at_utc = excluded.created_at_utc
+            created_at_utc = excluded.created_at_utc,
+            diagnostics_json = excluded.diagnostics_json
         """,
         (
             summary.run_id,
@@ -904,6 +1144,7 @@ async def save_experiment_run(db: Database, summary: ExperimentRunSummary) -> No
             summary.net_return_pct,
             int(summary.is_promoted),
             _ensure_utc(summary.created_at_utc).isoformat(),
+            diag_json,
         ),
     )
     await db.conn.commit()
@@ -940,6 +1181,16 @@ async def list_experiment_runs(
         except (KeyError, IndexError):
             return None
 
+    def _opt_json(row: Any, key: str) -> dict[str, Any] | None:
+        try:
+            raw = row[key]
+            if not raw:
+                return None
+            parsed = json.loads(str(raw))
+            return parsed if isinstance(parsed, dict) else None
+        except (KeyError, IndexError, json.JSONDecodeError):
+            return None
+
     return [
         ExperimentRunSummary(
             run_id=str(r["run_id"]),
@@ -958,6 +1209,7 @@ async def list_experiment_runs(
             net_return_pct=float(r["net_return_pct"]),
             is_promoted=bool(r["is_promoted"]),
             created_at_utc=_ensure_utc(datetime.fromisoformat(str(r["created_at_utc"]))),
+            diagnostics=_opt_json(r, "diagnostics_json"),
         )
         for r in rows
     ]

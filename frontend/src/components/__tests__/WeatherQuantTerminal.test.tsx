@@ -1775,6 +1775,13 @@ describe("WeatherQuantTerminal", () => {
     expect(within(rows[0]).getByText("1.620")).toBeInTheDocument();
     expect(within(rows[2]).getByText("exp-legacy-null")).toBeInTheDocument();
 
+    // Sharpe sort (descending first, missing nulls pushed to bottom)
+    fireEvent.click(screen.getByTestId("sort-runs-sharpe"));
+    rows = screen.getAllByTestId("experiment-run-row");
+    expect(within(rows[0]).getByText("exp-sharp-low-ll")).toBeInTheDocument();
+    expect(within(rows[0]).getByText("+1.85")).toBeInTheDocument();
+    expect(within(rows[2]).getByText("exp-legacy-null")).toBeInTheDocument();
+
     // ΔLogLoss vs Market sort (descending first, missing nulls pushed to bottom) + PASS/FAIL gates
     fireEvent.click(screen.getByTestId("sort-runs-delta-ll"));
     rows = screen.getAllByTestId("experiment-run-row");

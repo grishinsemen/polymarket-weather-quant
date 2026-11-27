@@ -206,6 +206,80 @@ export interface ScreenerRow {
   open_positions_count: number;
 }
 
+export interface BrainSliceMetrics {
+  label: string;
+  sample_count: number;
+  market_sample_count: number;
+  oos_sample_count: number;
+  in_sample_excluded_count: number;
+  model_brier: number | null;
+  model_log_loss: number | null;
+  model_rps: number | null;
+  model_tail_brier: number | null;
+  model_tail_ece: number | null;
+  tail_bucket_count: number;
+  market_brier: number | null;
+  market_log_loss: number | null;
+  market_rps: number | null;
+  delta_log_loss: number | null;
+  brier_skill_score: number | null;
+  delta_rps: number | null;
+  gate_beats_market: boolean | null;
+}
+
+export interface MarkoutHorizonSummary {
+  horizon_minutes: number;
+  label: string;
+  sample_count: number;
+  mean_clv: number | null;
+  volume_weighted_clv: number | null;
+}
+
+export interface StationPnlSummary {
+  station_icao: string;
+  trade_count: number;
+  net_pnl_usd: number;
+}
+
+export interface GateEvaluation {
+  brain_beats_market: boolean | null;
+  max_dd_ok: boolean;
+  markout_ok: boolean | null;
+  fill_rate_ok: boolean;
+  overall_pass: boolean;
+  reasons: string[];
+}
+
+export interface StrategyContourMetrics {
+  markouts: MarkoutHorizonSummary[];
+  primary_clv_30m: number | null;
+  volume_weighted_clv: number | null;
+  realized_log_growth: number | null;
+  max_drawdown_pct: number;
+  sortino_ratio: number | null;
+  calmar_ratio: number | null;
+  calendar_days: number;
+  low_sample_warning: boolean;
+  top3_pnl_share_pct: number | null;
+  profitable_stations: number;
+  total_traded_stations: number;
+  best_station: StationPnlSummary | null;
+  worst_station: StationPnlSummary | null;
+}
+
+export interface ReplayDiagnostics {
+  schema_version: number;
+  primary_brain_slice: "premarket" | "decision_entry";
+  is_ml_model: boolean;
+  train_end_utc: string | null;
+  premarket: BrainSliceMetrics;
+  decision_entry: BrainSliceMetrics;
+  ml_covered_premarket: BrainSliceMetrics | null;
+  ml_covered_decision_entry: BrainSliceMetrics | null;
+  strategy: StrategyContourMetrics;
+  gates: GateEvaluation;
+}
+
 export interface ExperimentRunSummary {
   run_id: string;
   model_version: string;
@@ -223,6 +297,7 @@ export interface ExperimentRunSummary {
   net_return_pct: number;
   is_promoted: boolean;
   created_at_utc: string;
+  diagnostics?: ReplayDiagnostics | null;
 }
 
 export interface ExitModeMetrics {

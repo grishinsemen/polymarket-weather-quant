@@ -336,3 +336,4 @@ class ExperimentRunSummary(BaseModel):
     net_return_pct: float
     is_promoted: bool = False
     created_at_utc: datetime
+    diagnostics: dict[str, Any] | None = None

@@ -263,6 +263,7 @@ class Database:
             ("clv_snapshots", "outcome_side", "TEXT NOT NULL DEFAULT 'YES'"),
             ("experiment_runs", "log_loss", "REAL"),
             ("experiment_runs", "sharpe_ratio", "REAL"),
+            ("experiment_runs", "diagnostics_json", "TEXT"),
         )
         existing_cols_cache: dict[str, set[str]] = {}
         for table, column, ddl in migrations:

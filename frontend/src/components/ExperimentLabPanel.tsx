@@ -78,8 +78,9 @@ type RunSortKey =
   | "log_loss"
   | "delta_log_loss"
   | "avg_clv"
-  | "net_pnl_usd"
-  | "max_drawdown_usd";
+  | "max_drawdown_usd"
+  | "sharpe_ratio"
+  | "net_pnl_usd";
 
 interface ExperimentLabPanelProps {
   runs: ExperimentRunSummary[];
@@ -569,7 +570,8 @@ export function ExperimentLabPanel({
                     CLV 30m{arrow("avg_clv")}
                   </button>
                 </th>
-                <th className="px-2.5 py-2 font-medium text-right whitespace-nowrap">Fills</th>
+                <th className="px-2.5 py-2 font-medium text-right whitespace-nowrap">Fill Rate</th>
+                <th className="px-2.5 py-2 font-medium text-right whitespace-nowrap">Trades</th>
                 <th className="px-2.5 py-2 font-medium text-right whitespace-nowrap">
                   <button
                     type="button"
@@ -579,7 +581,19 @@ export function ExperimentLabPanel({
                       sortKey === "max_drawdown_usd" ? "text-sky-300 font-semibold" : ""
                     }`}
                   >
-                    Max DD{arrow("max_drawdown_usd")}
+                    Max Drawdown{arrow("max_drawdown_usd")}
+                  </button>
+                </th>
+                <th className="px-2.5 py-2 font-medium text-right whitespace-nowrap">
+                  <button
+                    type="button"
+                    data-testid="sort-runs-sharpe"
+                    onClick={() => handleSort("sharpe_ratio")}
+                    className={`hover:text-sky-300 transition-colors ${
+                      sortKey === "sharpe_ratio" ? "text-sky-300 font-semibold" : ""
+                    }`}
+                  >
+                    Sharpe{arrow("sharpe_ratio")}
                   </button>
                 </th>
                 <th className="px-2.5 py-2 font-medium text-right whitespace-nowrap">
@@ -691,8 +705,10 @@ export function ExperimentLabPanel({
                         {(headlineClv * 100).toFixed(1)}¢
                       </td>
                       <td className="px-2.5 py-2 text-right font-mono-tabular text-slate-200 whitespace-nowrap">
-                        {(run.fill_rate * 100).toFixed(0)}%{" "}
-                        <span className="text-slate-400">({run.trade_count})</span>
+                        {(run.fill_rate * 100).toFixed(0)}%
+                      </td>
+                      <td className="px-2.5 py-2 text-right font-mono-tabular text-slate-200 whitespace-nowrap">
+                        {run.trade_count}
                       </td>
                       <td className="px-2.5 py-2 text-right font-mono-tabular whitespace-nowrap">
                         <span
@@ -704,6 +720,21 @@ export function ExperimentLabPanel({
                         >
                           -${run.max_drawdown_usd.toFixed(2)}
                         </span>
+                      </td>
+                      <td
+                        className={`px-2.5 py-2 text-right font-mono-tabular whitespace-nowrap ${
+                          run.sharpe_ratio === null || run.sharpe_ratio === undefined
+                            ? "text-slate-500"
+                            : run.sharpe_ratio >= 1.0
+                              ? "text-emerald-400"
+                              : run.sharpe_ratio >= 0
+                                ? "text-slate-200"
+                                : "text-rose-400"
+                        }`}
+                      >
+                        {run.sharpe_ratio !== null && run.sharpe_ratio !== undefined
+                          ? `${run.sharpe_ratio >= 0 ? "+" : ""}${run.sharpe_ratio.toFixed(2)}`
+                          : "—"}
                       </td>
                       <td className="px-2.5 py-2 text-right font-mono-tabular whitespace-nowrap">
                         <div className="leading-tight">
@@ -767,7 +798,7 @@ export function ExperimentLabPanel({
                         data-testid={`experiment-run-details-${run.run_id}`}
                         className="border-b border-[#1c2638] bg-[#090f1a]"
                       >
-                        <td colSpan={12} className="p-3.5">
+                        <td colSpan={14} className="p-3.5">
                           {diag ? (
                             <div className="grid grid-cols-1 xl:grid-cols-2 gap-3.5">
                               {/* CONTOUR 1: MODEL ("BRAIN") vs POLYMARKET */}
@@ -1021,7 +1052,7 @@ export function ExperimentLabPanel({
                                         : "—"}
                                     </div>
                                   </div>
-                                  <div>
+                                  <div title="Top-3 winning positions as % of total net PnL (>100% means remaining positions were net negative)">
                                     <div className="text-[9px] uppercase text-slate-500">
                                       Top-3 PnL Share
                                     </div>
