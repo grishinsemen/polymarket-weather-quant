@@ -113,4 +113,59 @@ class ExternalMosFeedHub:
             return ensemble
         merged_meta = dict(ensemble.metadata or {})
         merged_meta.update(anchors)
+        by_date = dict(merged_meta.get("mos_anchors_by_date") or {})
+        by_date[local_date.isoformat()] = dict(anchors)
+        merged_meta["mos_anchors_by_date"] = by_date
         return ensemble.model_copy(update={"metadata": merged_meta})
+
+    async def enrich_ensemble_for_dates(
+        self,
+        ensemble: EnsembleSnapshot,
+        station: Station,
+        local_dates: list[date],
+        *,
+        primary_date: date | None = None,
+    ) -> EnsembleSnapshot:
+        """Enrich *ensemble* with $0 MOS anchors for all active *local_dates* of *station*.
+
+        Stores per-date anchor dicts under ``metadata["mos_anchors_by_date"][YYYY-MM-DD]``
+        and promotes *primary_date* anchors to top-level keys so a single archived
+        EnsembleSnapshot per station fetch preserves MOS anchors for every active event date.
+        """
+        if not self.enabled or not local_dates:
+            return ensemble
+        unique_dates = sorted(set(local_dates))
+        merged_meta = dict(ensemble.metadata or {})
+        by_date: dict[str, dict[str, float]] = dict(merged_meta.get("mos_anchors_by_date") or {})
+        any_added = False
+        for d in unique_dates:
+            anchors = await self.get_anchors(station, d)
+            if anchors:
+                by_date[d.isoformat()] = dict(anchors)
+                any_added = True
+        if not any_added and not by_date:
+            return ensemble
+        merged_meta["mos_anchors_by_date"] = by_date
+        target_date = primary_date or unique_dates[0]
+        primary_anchors = by_date.get(target_date.isoformat())
+        if primary_anchors:
+            merged_meta.update(primary_anchors)
+        return ensemble.model_copy(update={"metadata": merged_meta})
+
+
+def apply_date_mos_anchors(ensemble: EnsembleSnapshot, local_date: date) -> EnsembleSnapshot:
+    """Project date-specific ``mos_anchors_by_date`` onto top-level ``ensemble.metadata``."""
+    meta = ensemble.metadata or {}
+    by_date = meta.get("mos_anchors_by_date")
+    if not isinstance(by_date, dict):
+        return ensemble
+    anchors = by_date.get(local_date.isoformat())
+    if not isinstance(anchors, dict) or not anchors:
+        return ensemble
+    merged = {
+        k: v
+        for k, v in meta.items()
+        if not k.startswith(("mosmix_", "nws_point_", "nbm_"))
+    }
+    merged.update(anchors)
+    return ensemble.model_copy(update={"metadata": merged})

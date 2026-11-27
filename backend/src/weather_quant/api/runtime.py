@@ -17,7 +17,7 @@ from weather_quant.archive.parquet_store import ParquetArchiveStore
 from weather_quant.clob.orderbook_ws import ClobOrderBookStream
 from weather_quant.domain.clock import Clock, SystemClock, ensure_utc
 from weather_quant.domain.models import EnsembleSnapshot, MetarObservation, WeatherEvent
-from weather_quant.feeds.hub import ExternalMosFeedHub
+from weather_quant.feeds.hub import ExternalMosFeedHub, apply_date_mos_anchors
 from weather_quant.ml.quantile_mos import load_mos_provider_for_version
 from weather_quant.probability.engine import (
     DailyBiasObservation,
@@ -71,6 +71,7 @@ class AutonomousRuntime:
         self._archived_ensemble_keys: set[tuple[str, str]] = set()
         self._last_metar_by_station: dict[str, MetarObservation] = {}
         self._archived_metar_keys: set[tuple[str, str]] = set()
+        self._metar_keys_warmed_from_archive: bool = False
         self._last_saved_prob_sig: dict[tuple[str, str], tuple[tuple[tuple[str, float, bool], ...], datetime]] = {}
         self._last_maintenance_date_utc: str | None = None
         self._stale_feed_since_utc: datetime | None = None
@@ -145,20 +146,54 @@ class AutonomousRuntime:
             engine.executor.strict_maker_fills = engine.params.strict_maker_fills
         return engine
 
+    async def _warm_metar_keys(
+        self,
+        archive: ParquetArchiveStore,
+        now_utc: datetime,
+    ) -> None:
+        if self._metar_keys_warmed_from_archive:
+            return
+        self._metar_keys_warmed_from_archive = True
+        try:
+            recent = await archive.aread_metar_observations(
+                start_utc=now_utc - timedelta(days=7),
+            )
+            for obs in recent:
+                if obs.is_routine:
+                    self._archived_metar_keys.add(
+                        (obs.station_icao.strip().upper(), ensure_utc(obs.observed_at_utc).isoformat())
+                    )
+        except Exception:
+            logger.debug("Skipping archive METAR warmup", exc_info=True)
+
     async def _archive_new_metars(
         self,
+        db: Database,
         latest_metars: dict[str, MetarObservation],
         archive: ParquetArchiveStore,
         bot: Any,
+        now_utc: datetime,
     ) -> None:
+        """Archive ALL unarchived Routine METARs from SQLite into Parquet and send shift alerts."""
+        await self._warm_metar_keys(archive, now_utc)
+        recent_routine = await db.list_routine_metars_since(now_utc - timedelta(hours=48))
+        candidates = list(recent_routine)
+        if not candidates:
+            candidates = list(latest_metars.values())
+
         fresh: list[MetarObservation] = []
-        for icao, obs in latest_metars.items():
-            if not obs.is_routine:
+        for obs in candidates:
+            if not obs.is_routine or obs.raw_report.strip().upper().startswith("SPECI"):
                 continue
-            key = (icao, obs.observed_at_utc.isoformat())
+            icao = obs.station_icao.strip().upper()
+            key = (icao, ensure_utc(obs.observed_at_utc).isoformat())
             if key not in self._archived_metar_keys:
                 self._archived_metar_keys.add(key)
                 fresh.append(obs)
+
+        for icao, obs in latest_metars.items():
+            if not obs.is_routine:
+                continue
             prev_obs = self._last_metar_by_station.get(icao)
             if prev_obs is not None and abs(obs.temp_c - prev_obs.temp_c) >= self.metar_shift_threshold_c:
                 if bot is not None:
@@ -201,8 +236,12 @@ class AutonomousRuntime:
         fetcher: EnsembleFetcherPort,
         archive: ParquetArchiveStore,
         now_utc: Any,
+        *,
+        mos_hub: ExternalMosFeedHub | None = None,
+        station_active_dates: list[Any] | None = None,
     ) -> EnsembleSnapshot | None:
         icao = event.station.icao.upper()
+        target_dates = station_active_dates or [event.local_date]
         cached = self._ensemble_cache.get(icao)
         if cached is not None:
             age = ensure_utc(now_utc) - ensure_utc(cached.fetched_at_utc)
@@ -214,18 +253,27 @@ class AutonomousRuntime:
                     if cached.event_id == event.event_id
                     else cached.model_copy(update={"event_id": event.event_id})
                 )
+                if mos_hub is not None:
+                    event_snap = await mos_hub.enrich_ensemble_for_dates(
+                        event_snap,
+                        event.station,
+                        target_dates,
+                        primary_date=event.local_date,
+                    )
+                    self._ensemble_cache[icao] = event_snap
                 arch_key = (icao, ensure_utc(event_snap.fetched_at_utc).isoformat())
                 if arch_key not in self._archived_ensemble_keys:
                     self._archived_ensemble_keys.add(arch_key)
                     await archive.awrite_ensemble_snapshots([event_snap])
-                return event_snap
+                return apply_date_mos_anchors(event_snap, event.local_date)
 
         if self._ensemble_cooldown_until is not None and ensure_utc(now_utc) < self._ensemble_cooldown_until:
-            return (
+            fallback = (
                 cached.model_copy(update={"event_id": event.event_id})
                 if cached is not None and cached.event_id != event.event_id
                 else cached
             )
+            return apply_date_mos_anchors(fallback, event.local_date) if fallback is not None else None
 
         try:
             snap = await fetcher.fetch_ensemble(
@@ -233,12 +281,19 @@ class AutonomousRuntime:
                 event_id=event.event_id,
                 local_date=None,
             )
+            if mos_hub is not None:
+                snap = await mos_hub.enrich_ensemble_for_dates(
+                    snap,
+                    event.station,
+                    target_dates,
+                    primary_date=event.local_date,
+                )
             self._ensemble_cache[icao] = snap
             self._archived_ensemble_keys.add(
                 (icao, ensure_utc(snap.fetched_at_utc).isoformat())
             )
             await archive.awrite_ensemble_snapshots([snap])
-            return snap
+            return apply_date_mos_anchors(snap, event.local_date)
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 429:
                 self._ensemble_cooldown_until = ensure_utc(now_utc) + timedelta(seconds=180)
@@ -273,7 +328,7 @@ class AutonomousRuntime:
 
             archive = self._get_archive_store()
             bot = getattr(self.app.state, "telegram_bot", None)
-            await self._archive_new_metars(latest_metars, archive, bot)
+            await self._archive_new_metars(db, latest_metars, archive, bot, now_utc)
 
             # 2. Register events on CLOB stream, refresh cold/stale books via REST fallback, and push live_tick early
             strategy_engine = await self._get_strategy_engine()
@@ -406,13 +461,24 @@ class AutonomousRuntime:
                         seen_global_keys.add(gk)
                         global_bias_pool.append(b_obs)
 
+            active_dates_by_icao: dict[str, list[Any]] = {}
+            for ev in events:
+                if settlement_close_utc(ev) > now_utc:
+                    active_dates_by_icao.setdefault(ev.station.icao.upper(), []).append(ev.local_date)
+
             for event in events:
                 if settlement_close_utc(event) <= now_utc:
                     continue
-                ensemble = await self._ensure_event_ensemble(event, fetcher, archive, now_utc)
+                ensemble = await self._ensure_event_ensemble(
+                    event,
+                    fetcher,
+                    archive,
+                    now_utc,
+                    mos_hub=mos_hub,
+                    station_active_dates=active_dates_by_icao.get(event.station.icao.upper()),
+                )
                 if ensemble is None:
                     continue
-                ensemble = await mos_hub.enrich_ensemble(ensemble, event.station, event.local_date)
                 intraday_metars = event_metars_cache.get(event.station.icao.upper(), [])
                 recent_bias_obs = station_bias_by_event.get(event.event_id, [])
                 try:

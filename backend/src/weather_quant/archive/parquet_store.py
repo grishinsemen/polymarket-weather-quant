@@ -40,6 +40,7 @@ ORDERBOOK_SCHEMA = pa.schema(
         ("best_ask", pa.float64()),
         ("midpoint", pa.float64()),
         ("spread", pa.float64()),
+        ("tick_size", pa.float64()),
         ("ingested_at_utc", pa.timestamp("us", tz="UTC")),
         ("is_stale", pa.bool_()),
     ]
@@ -193,6 +194,7 @@ def _orderbook_to_row(snap: OrderBookSnapshot) -> dict[str, Any]:
         "best_ask": snap.best_ask,
         "midpoint": snap.midpoint,
         "spread": snap.spread,
+        "tick_size": snap.tick_size,
         "ingested_at_utc": _ensure_utc(snap.ingested_at_utc),
         "is_stale": snap.is_stale,
     }
@@ -209,6 +211,7 @@ def _row_to_orderbook(row: dict[str, Any]) -> OrderBookSnapshot:
         best_ask=row["best_ask"],
         midpoint=row["midpoint"],
         spread=row["spread"],
+        tick_size=row.get("tick_size"),
         ingested_at_utc=_ensure_utc(row["ingested_at_utc"]),
         is_stale=bool(row["is_stale"]),
     )
@@ -764,7 +767,15 @@ class ParquetArchiveStore:
                     if tbl.num_rows == 0:
                         continue
                     if not tbl.schema.equals(schema):
-                        tbl = tbl.cast(schema)
+                        # Forward-compatible schema evolution: fill missing nullable columns (e.g. tick_size) with nulls
+                        existing_names = set(tbl.column_names)
+                        cols = [
+                            tbl.column(field.name)
+                            if field.name in existing_names
+                            else pa.nulls(tbl.num_rows, type=field.type)
+                            for field in schema
+                        ]
+                        tbl = pa.Table.from_arrays(cols, schema=schema)
                     tables.append(tbl)
 
                 if not tables:

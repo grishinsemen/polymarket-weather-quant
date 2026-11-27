@@ -614,6 +614,34 @@ class Database:
                     result[icao] = self._row_to_metar(row)
             return result
 
+    async def list_routine_metars_since(
+        self,
+        since_utc: datetime | None = None,
+    ) -> list[MetarObservation]:
+        """List all Routine METAR observations (optionally since *since_utc*) in chronological order."""
+        if since_utc is not None:
+            cutoff = (
+                since_utc.replace(tzinfo=timezone.utc)
+                if since_utc.tzinfo is None
+                else since_utc.astimezone(timezone.utc)
+            ).isoformat()
+            sql = (
+                "SELECT * FROM metar_observations "
+                "WHERE is_routine = 1 AND (observed_at_utc >= ? OR ingested_at_utc >= ?) "
+                "ORDER BY observed_at_utc ASC, id ASC"
+            )
+            params: tuple[Any, ...] = (cutoff, cutoff)
+        else:
+            sql = (
+                "SELECT * FROM metar_observations "
+                "WHERE is_routine = 1 "
+                "ORDER BY observed_at_utc ASC, id ASC"
+            )
+            params = ()
+        async with self.conn.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+            return [self._row_to_metar(row) for row in rows]
+
     @staticmethod
     def _row_to_model_version(row: aiosqlite.Row) -> ModelVersionRecord:
         return ModelVersionRecord(

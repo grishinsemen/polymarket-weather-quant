@@ -34,6 +34,7 @@ from weather_quant.domain.models import (
     StrategyVersionRecord,
     WeatherEvent,
 )
+from weather_quant.feeds.hub import apply_date_mos_anchors
 from weather_quant.ml.quantile_mos import (
     MosProbabilityProvider,
     QuantileMosModel,
@@ -44,6 +45,7 @@ from weather_quant.probability.engine import (
     EnsembleProbabilityEngine,
     bucket_distance,
     bucket_effective_bounds,
+    build_daily_bias_observations_from_history,
     round_half_away,
     to_event_unit,
 )
@@ -453,6 +455,35 @@ async def settle_expired_events(
 _settle_expired_events = settle_expired_events
 
 
+def _ensemble_covers_local_date(ens: EnsembleSnapshot, event: WeatherEvent, ev_tz: Any) -> bool:
+    if not ens.hourly_timestamps_utc:
+        return True
+    return any(
+        _ensure_utc(ts).astimezone(ev_tz).date() == event.local_date
+        for ts in ens.hourly_timestamps_utc
+    )
+
+
+def _select_freshest_ensemble(
+    event: WeatherEvent,
+    by_event: EnsembleSnapshot | None,
+    by_station: EnsembleSnapshot | None,
+    ev_tz: Any,
+) -> EnsembleSnapshot | None:
+    """Pick the freshest available ensemble covering *event.local_date* and project its date MOS anchors."""
+    candidates: list[EnsembleSnapshot] = []
+    if by_event is not None:
+        candidates.append(by_event)
+    if by_station is not None and by_station is not by_event:
+        candidates.append(by_station)
+    if not candidates:
+        return None
+    covering = [c for c in candidates if _ensemble_covers_local_date(c, event, ev_tz)]
+    pool = covering if covering else candidates
+    chosen = max(pool, key=lambda c: _ensure_utc(c.ingested_at_utc))
+    return apply_date_mos_anchors(chosen, event.local_date)
+
+
 async def _execute_replay_isolated(
     *,
     events: list[WeatherEvent],
@@ -466,7 +497,9 @@ async def _execute_replay_isolated(
     decision_times: list[datetime] | None,
     strict_temporal: bool,
     mos_model: QuantileMosModel | None,
-    recent_bias_by_station: Mapping[str, Sequence[DailyBiasObservation]],
+    recent_bias_by_station: Mapping[str, Sequence[DailyBiasObservation]] | None,
+    prior_ensembles: Sequence[EnsembleSnapshot] = (),
+    prior_metars: Sequence[MetarObservation] = (),
     progress_cb: ReplayProgressCallback | None = None,
 ) -> ExperimentReplayResult:
     start_utc = _ensure_utc(dataset_start_utc)
@@ -577,6 +610,16 @@ async def _execute_replay_isolated(
         latest_ensembles: dict[str, EnsembleSnapshot] = {}
         latest_ensembles_by_station: dict[str, EnsembleSnapshot] = {}
         metars_by_station: dict[str, list[MetarObservation]] = {}
+        ens_history_by_station: dict[str, list[EnsembleSnapshot]] = {}
+        metar_history_by_station: dict[str, list[MetarObservation]] = {}
+        for pe in prior_ensembles:
+            ens_history_by_station.setdefault(pe.station_icao.strip().upper(), []).append(pe)
+        for pm in prior_metars:
+            metar_history_by_station.setdefault(pm.station_icao.strip().upper(), []).append(pm)
+        rolling_bias_cache: dict[tuple[str, Any, Any], list[DailyBiasObservation]] = {}
+        station_by_icao: dict[str, Any] = {
+            ev.station.icao.strip().upper(): ev.station for ev in events_sorted
+        }
         latest_probs: dict[str, EventProbabilitySnapshot] = {}
         last_prob_input_stamp: dict[str, tuple[datetime | None, int]] = {}
         premarket_eval: dict[str, ForecastEvalObservation] = {}
@@ -637,6 +680,7 @@ async def _execute_replay_isolated(
                 latest_ensembles[e.event_id] = e
                 icao_up = e.station_icao.upper()
                 latest_ensembles_by_station[icao_up] = e
+                ens_history_by_station.setdefault(icao_up, []).append(e)
                 dirty_events.add(e.event_id)
                 for ev_id in events_by_icao.get(icao_up, ()):
                     dirty_events.add(ev_id)
@@ -647,8 +691,10 @@ async def _execute_replay_isolated(
                 assert_before_decision(m.ingested_at_utc, tick_time, label="metar_ingested")
                 if strict_temporal:
                     assert_before_decision(m.observed_at_utc, tick_time, label="metar_observed")
-                metars_by_station.setdefault(m.station_icao.upper(), []).append(m)
-                for ev_id in events_by_icao.get(m.station_icao.upper(), ()):
+                icao_m = m.station_icao.upper()
+                metars_by_station.setdefault(icao_m, []).append(m)
+                metar_history_by_station.setdefault(icao_m, []).append(m)
+                for ev_id in events_by_icao.get(icao_m, ()):
                     dirty_events.add(ev_id)
                 metar_arrived = True
                 metar_idx += 1
@@ -665,25 +711,72 @@ async def _execute_replay_isolated(
             for event in events_sorted:
                 if event.event_id not in dirty_events:
                     continue
-                ens = latest_ensembles.get(event.event_id) or latest_ensembles_by_station.get(
-                    event.station.icao.upper()
+                ev_tz = event_tz_by_id[event.event_id]
+                icao_ev = event.station.icao.upper()
+                ens = _select_freshest_ensemble(
+                    event,
+                    latest_ensembles.get(event.event_id),
+                    latest_ensembles_by_station.get(icao_ev),
+                    ev_tz,
                 )
                 if ens is None:
                     continue
 
                 station_metars = [
                     m
-                    for m in metars_by_station.get(event.station.icao.upper(), [])
+                    for m in metars_by_station.get(icao_ev, [])
                     if _ensure_utc(m.observed_at_utc) < tick_time
                 ]
-                prob_key = (_ensure_utc(ens.ingested_at_utc), len(station_metars))
+                tick_local_day = tick_time.astimezone(ev_tz).date()
+                prob_key = (_ensure_utc(ens.ingested_at_utc), len(station_metars), tick_local_day)
                 if last_prob_input_stamp.get(event.event_id) != prob_key:
-                    bias_obs = recent_bias_by_station.get(event.station.icao.upper(), ())
-                    global_bias_obs = [
-                        obs
-                        for obs_list in recent_bias_by_station.values()
-                        for obs in obs_list
-                    ]
+                    if recent_bias_by_station is not None:
+                        bias_obs: Sequence[DailyBiasObservation] = recent_bias_by_station.get(icao_ev, ())
+                        global_bias_obs = [
+                            obs
+                            for obs_list in recent_bias_by_station.values()
+                            for obs in obs_list
+                        ]
+                    else:
+                        cache_key = (icao_ev, event.local_date, tick_local_day)
+                        if cache_key not in rolling_bias_cache:
+                            rolling_bias_cache[cache_key] = build_daily_bias_observations_from_history(
+                                station=event.station,
+                                polarity=event.polarity,
+                                remark_tenths_enabled=event.remark_tenths_enabled,
+                                ensembles=ens_history_by_station.get(icao_ev, ()),
+                                metars=metar_history_by_station.get(icao_ev, ()),
+                                before_local_date=event.local_date,
+                                window_days=base_prob_engine.bias_window_days,
+                                decision_time_utc=tick_time,
+                            )
+                        bias_obs = rolling_bias_cache[cache_key]
+                        # Hierarchical cross-station pool strictly prior to tick_time
+                        global_bias_obs = []
+                        seen_gk: set[tuple[str, Any]] = set()
+                        for other_icao, other_station in station_by_icao.items():
+                            try:
+                                o_tz = ZoneInfo(other_station.timezone)
+                            except Exception:
+                                o_tz = timezone.utc
+                            o_day = tick_time.astimezone(o_tz).date()
+                            ok = (other_icao, event.local_date, o_day)
+                            if ok not in rolling_bias_cache:
+                                rolling_bias_cache[ok] = build_daily_bias_observations_from_history(
+                                    station=other_station,
+                                    polarity=event.polarity,
+                                    remark_tenths_enabled=event.remark_tenths_enabled,
+                                    ensembles=ens_history_by_station.get(other_icao, ()),
+                                    metars=metar_history_by_station.get(other_icao, ()),
+                                    before_local_date=event.local_date,
+                                    window_days=base_prob_engine.bias_window_days,
+                                    decision_time_utc=tick_time,
+                                )
+                            for b_item in rolling_bias_cache[ok]:
+                                gk = (other_icao, b_item.local_date)
+                                if gk not in seen_gk:
+                                    seen_gk.add(gk)
+                                    global_bias_obs.append(b_item)
                     try:
                         if mos_provider is not None and mos_provider.is_station_covered(event.station.icao):
                             snap = mos_provider.compute_probabilities(
@@ -1326,6 +1419,8 @@ async def run_experiment_replay(
         list[OrderBookSnapshot],
         list[EnsembleSnapshot],
         list[MetarObservation],
+        list[EnsembleSnapshot],
+        list[MetarObservation],
         datetime,
         datetime,
     ]:
@@ -1342,9 +1437,9 @@ async def run_experiment_replay(
             start_utc=dataset_start_utc,
             end_utc=dataset_end_utc,
         )
+        icaos = {e.station.icao.upper() for e in event_list} if event_ids else set()
         if event_ids:
             all_books = [b for b in all_books if b.event_id in event_ids]
-            icaos = {e.station.icao.upper() for e in event_list}
             all_ensembles = [
                 e for e in all_ensembles if e.event_id in event_ids or e.station_icao.upper() in icaos
             ]
@@ -1365,7 +1460,29 @@ async def run_experiment_replay(
             if dataset_end_utc is not None
             else (max(all_stamps) + timedelta(seconds=1) if all_stamps else resolved_start)
         )
-        return all_books, all_ensembles, all_metars, resolved_start, resolved_end
+
+        # Load strictly prior (< resolved_start) archive history for walk-forward EMOS Station Bias
+        prior_ens: list[EnsembleSnapshot] = []
+        prior_met: list[MetarObservation] = []
+        if recent_bias_by_station is None:
+            bias_days = int((model_rec.config_json or {}).get("bias_window_days", (model_rec.config_json or {}).get("bias_days", 45)))
+            prior_start = resolved_start - timedelta(days=max(1, bias_days) + 2)
+            prior_end = resolved_start - timedelta(microseconds=1)
+            prior_ens = archive_store.read_latest_ensemble_snapshots(
+                start_utc=prior_start,
+                end_utc=prior_end,
+                dedupe_by="station_day",
+                keep="earliest",
+            )
+            prior_met = archive_store.read_metar_observations(
+                start_utc=prior_start,
+                end_utc=prior_end,
+            )
+            if icaos:
+                prior_ens = [e for e in prior_ens if e.station_icao.upper() in icaos]
+                prior_met = [m for m in prior_met if m.station_icao.upper() in icaos]
+
+        return all_books, all_ensembles, all_metars, prior_ens, prior_met, resolved_start, resolved_end
 
     if progress_cb is not None:
         progress_cb(
@@ -1378,7 +1495,7 @@ async def run_experiment_replay(
             }
         )
 
-    books, ensembles, metars, start_utc, end_utc = await asyncio.to_thread(_load_archive)
+    books, ensembles, metars, prior_ensembles, prior_metars, start_utc, end_utc = await asyncio.to_thread(_load_archive)
 
     result = await asyncio.to_thread(
         _run_replay_sync,
@@ -1394,7 +1511,9 @@ async def run_experiment_replay(
             "decision_times": list(decision_times) if decision_times is not None else None,
             "strict_temporal": strict_temporal,
             "mos_model": mos_model,
-            "recent_bias_by_station": recent_bias_by_station or {},
+            "recent_bias_by_station": recent_bias_by_station,
+            "prior_ensembles": prior_ensembles,
+            "prior_metars": prior_metars,
             "progress_cb": progress_cb,
         },
     )
@@ -1448,6 +1567,8 @@ async def compare_exit_modes(
         list[OrderBookSnapshot],
         list[EnsembleSnapshot],
         list[MetarObservation],
+        list[EnsembleSnapshot],
+        list[MetarObservation],
         datetime,
         datetime,
     ]:
@@ -1464,9 +1585,9 @@ async def compare_exit_modes(
             start_utc=dataset_start_utc,
             end_utc=dataset_end_utc,
         )
+        icaos = {e.station.icao.upper() for e in event_list} if event_ids else set()
         if event_ids:
             all_books = [b for b in all_books if b.event_id in event_ids]
-            icaos = {e.station.icao.upper() for e in event_list}
             all_ensembles = [
                 e for e in all_ensembles if e.event_id in event_ids or e.station_icao.upper() in icaos
             ]
@@ -1487,9 +1608,29 @@ async def compare_exit_modes(
             if dataset_end_utc is not None
             else (max(all_stamps) + timedelta(seconds=1) if all_stamps else resolved_start)
         )
-        return all_books, all_ensembles, all_metars, resolved_start, resolved_end
+        prior_ens: list[EnsembleSnapshot] = []
+        prior_met: list[MetarObservation] = []
+        if recent_bias_by_station is None:
+            bias_days = int((model_rec.config_json or {}).get("bias_window_days", (model_rec.config_json or {}).get("bias_days", 45)))
+            prior_start = resolved_start - timedelta(days=max(1, bias_days) + 2)
+            prior_end = resolved_start - timedelta(microseconds=1)
+            prior_ens = archive_store.read_latest_ensemble_snapshots(
+                start_utc=prior_start,
+                end_utc=prior_end,
+                dedupe_by="station_day",
+                keep="earliest",
+            )
+            prior_met = archive_store.read_metar_observations(
+                start_utc=prior_start,
+                end_utc=prior_end,
+            )
+            if icaos:
+                prior_ens = [e for e in prior_ens if e.station_icao.upper() in icaos]
+                prior_met = [m for m in prior_met if m.station_icao.upper() in icaos]
 
-    books, ensembles, metars, start_utc, end_utc = await asyncio.to_thread(_load_archive)
+        return all_books, all_ensembles, all_metars, prior_ens, prior_met, resolved_start, resolved_end
+
+    books, ensembles, metars, prior_ensembles, prior_metars, start_utc, end_utc = await asyncio.to_thread(_load_archive)
 
     base_cfg = dict(base_strategy.config_json or {})
     hold_cfg = {
@@ -1531,7 +1672,9 @@ async def compare_exit_modes(
         "decision_times": list(decision_times) if decision_times is not None else None,
         "strict_temporal": strict_temporal,
         "mos_model": mos_model,
-        "recent_bias_by_station": recent_bias_by_station or {},
+        "recent_bias_by_station": recent_bias_by_station,
+        "prior_ensembles": prior_ensembles,
+        "prior_metars": prior_metars,
         "progress_cb": None,
     }
 
