@@ -218,6 +218,7 @@ R_CHEAP_TAIL = "TAIL_PRICE_BELOW_MIN"
 R_NO_PRICE_BOUNDS = "NO_PRICE_OUT_OF_RANGE"
 R_TRADE_EDGE_REALIZED = "TRADE_EDGE_REALIZED"
 R_CRASH_CANCEL = "ADVERSE_SELECTION_CRASH_CANCEL"
+R_MARKET_MOVED_AWAY_CANCEL = "MARKET_MOVED_AWAY_CANCEL"
 R_BLACKOUT_METAR = "BLACKOUT_METAR_RELEASE"
 R_BLACKOUT_NWP = "BLACKOUT_NWP_RELEASE"
 R_SPECI_CANCEL = "SPECI_ADVERSE_SELECTION_CANCEL"
@@ -276,6 +277,7 @@ class StrategyParams(BaseModel):
     enable_blackout_windows: bool = False
     max_anomaly_divergence: float | None = None
     strict_maker_fills: bool = False
+    max_resting_buy_drift: float | None = 0.25
 
     @classmethod
     def from_manifest(cls, manifest: StrategyVersionRecord) -> "StrategyParams":
@@ -1613,12 +1615,7 @@ class StrategyEngine:
                 reasons = [R_PAUSED]
             elif is_zeroed and order.outcome_side == "YES":
                 reasons = [R_EDGE_LOST_CANCEL]
-            elif book is not None and prob is not None and not self._is_stale(book, now):
-                if order.outcome_side == "NO":
-                    eff_fair = 1.0 if prob.is_impossible else (1.0 - prob.fair_probability)
-                else:
-                    eff_fair = 0.0 if prob.is_impossible else prob.fair_probability
-                edge = calculate_net_edge(eff_fair, order.limit_price, side="BUY", is_maker=True, event=event)
+            elif book is not None and not self._is_stale(book, now):
                 # Adverse-selection crash guard: if ask collapsed to <= 2c on a resting >= 6c BUY,
                 # the market likely already priced in a live METAR breach ahead of our METAR poll.
                 is_crash_ask = (
@@ -1626,10 +1623,25 @@ class StrategyEngine:
                     and order.limit_price >= 0.06 - _EPS
                     and book.best_ask <= 0.02 + _EPS
                 )
+                is_market_moved_away = (
+                    self.params.max_resting_buy_drift is not None
+                    and self.params.max_resting_buy_drift > 0.0
+                    and book.best_bid is not None
+                    and (book.best_bid - order.limit_price)
+                    >= self.params.max_resting_buy_drift - _EPS
+                )
                 if is_crash_ask:
                     reasons = [R_CRASH_CANCEL]
-                elif edge < self.manifest.min_edge - _EPS:
-                    reasons = [R_EDGE_LOST_CANCEL]
+                elif is_market_moved_away:
+                    reasons = [R_MARKET_MOVED_AWAY_CANCEL]
+                elif prob is not None:
+                    if order.outcome_side == "NO":
+                        eff_fair = 1.0 if prob.is_impossible else (1.0 - prob.fair_probability)
+                    else:
+                        eff_fair = 0.0 if prob.is_impossible else prob.fair_probability
+                    edge = calculate_net_edge(eff_fair, order.limit_price, side="BUY", is_maker=True, event=event)
+                    if edge < self.manifest.min_edge - _EPS:
+                        reasons = [R_EDGE_LOST_CANCEL]
             if reasons:
                 await executor.cancel_order(order.order_id)
                 result.cancelled.append(order.order_id)
@@ -1643,6 +1655,7 @@ class StrategyEngine:
                         "order_id": order.order_id,
                         "outcome_side": order.outcome_side,
                         "limit_price": order.limit_price,
+                        "best_bid": book.best_bid if book is not None else None,
                         "best_ask": book.best_ask if book is not None else None,
                     },
                 )

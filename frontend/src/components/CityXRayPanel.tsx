@@ -76,6 +76,18 @@ function formatTargetDate(isoDate: string): string {
   return `${monthName} ${day}`;
 }
 
+function resolveOrderOutcomeSide(
+  explicitSide?: OutcomeSide,
+  tokenId?: string,
+  noTokenId?: string | null,
+): OutcomeSide {
+  if (explicitSide === "NO") return "NO";
+  if (tokenId && ((noTokenId && tokenId === noTokenId) || tokenId.endsWith(":NO"))) {
+    return "NO";
+  }
+  return "YES";
+}
+
 function positionKey(
   stationIcao: string,
   targetDate: string,
@@ -128,17 +140,6 @@ function collectPortfolioOrdersAndPositions(
       cityXray.event.buckets.map((b) => [b.bucket_id, b.no_token_id ?? null]),
     );
 
-    const resolveOutcomeSide = (
-      bucketId: string,
-      tokenId?: string,
-      explicitSide?: OutcomeSide,
-    ): OutcomeSide => {
-      if (explicitSide === "NO") return "NO";
-      const noTok = noTokenByBucket.get(bucketId);
-      if (tokenId && ((noTok && tokenId === noTok) || tokenId.endsWith(":NO"))) return "NO";
-      return "YES";
-    };
-
     for (const o of cityXray.orders) {
       if ((o.status === "OPEN" || o.status === "PARTIAL") && !seenOrderIds.has(o.order_id)) {
         seenOrderIds.add(o.order_id);
@@ -150,7 +151,11 @@ function collectPortfolioOrdersAndPositions(
           eventId: eid,
           bucketId: o.bucket_id,
           bucketLabel: bucketLabelMap.get(o.bucket_id) ?? o.bucket_id,
-          outcomeSide: resolveOutcomeSide(o.bucket_id, o.token_id, o.outcome_side),
+          outcomeSide: resolveOrderOutcomeSide(
+            o.outcome_side,
+            o.token_id,
+            noTokenByBucket.get(o.bucket_id),
+          ),
         });
       }
     }
@@ -170,10 +175,10 @@ function collectPortfolioOrdersAndPositions(
           eventId: eid,
           bucketId: b.bucket_id,
           bucketLabel: b.label,
-          outcomeSide: resolveOutcomeSide(
-            b.bucket_id,
-            b.resting_order.token_id,
+          outcomeSide: resolveOrderOutcomeSide(
             b.resting_order.outcome_side,
+            b.resting_order.token_id,
+            noTokenByBucket.get(b.bucket_id),
           ),
         });
       }
@@ -258,6 +263,10 @@ export function CityXRayPanel({
 
   const { orders: unifiedOrders, positions: unifiedPositions } =
     collectPortfolioOrdersAndPositions(xray, allXrays, screenerOrder);
+
+  const noTokenBySelectedBucket = new Map(
+    xray.event.buckets.map((b) => [b.bucket_id, b.no_token_id ?? null]),
+  );
 
   // Single source of truth for selected event's Locked $ and Bucket POS badges,
   // filtered strictly by (eventId, stationIcao, targetDate, bucketId, outcomeSide).
@@ -384,6 +393,21 @@ export function CityXRayPanel({
               const fairPctWidth = (b.fair_probability / maxProb) * 100;
               const bidDepthWidth = (b.bid_depth_usd / maxDepth) * 100;
               const askDepthWidth = (b.ask_depth_usd / maxDepth) * 100;
+              const orderOutcome = b.resting_order
+                ? resolveOrderOutcomeSide(
+                    b.resting_order.outcome_side,
+                    b.resting_order.token_id,
+                    noTokenBySelectedBucket.get(b.bucket_id),
+                  )
+                : null;
+              const isNoOrder = orderOutcome === "NO";
+              const noOrderEdge =
+                isNoOrder &&
+                b.resting_order?.expected_edge !== null &&
+                b.resting_order?.expected_edge !== undefined &&
+                b.resting_order.expected_edge > 0
+                  ? b.resting_order.expected_edge
+                  : null;
               return (
                 <tr
                   key={b.bucket_id}
@@ -442,13 +466,21 @@ export function CityXRayPanel({
                   </td>
 
                   <td className="px-2.5 py-1.5 text-right font-mono-tabular whitespace-nowrap">
-                    <span
-                      className={
-                        b.net_edge >= 0.05 ? "text-emerald-400 font-semibold" : "text-slate-400"
-                      }
-                    >
-                      {b.net_edge > 0 ? `+${(b.net_edge * 100).toFixed(1)}¢` : "—"}
-                    </span>
+                    {b.net_edge > 0 ? (
+                      <span
+                        className={
+                          b.net_edge >= 0.05 ? "text-emerald-400 font-semibold" : "text-slate-400"
+                        }
+                      >
+                        {`+${(b.net_edge * 100).toFixed(1)}¢`}
+                      </span>
+                    ) : noOrderEdge !== null ? (
+                      <span className="text-amber-400 font-semibold">
+                        {`NO +${(noOrderEdge * 100).toFixed(1)}¢`}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400">—</span>
+                    )}
                   </td>
 
                   <td className="px-2.5 py-1.5 text-right whitespace-nowrap">
@@ -458,9 +490,16 @@ export function CityXRayPanel({
                           ZEROED
                         </span>
                       )}
-                      {b.resting_order && (
-                        <span className="inline-block whitespace-nowrap px-1.5 py-0.5 rounded bg-sky-950/80 text-sky-300 border border-sky-700">
-                          {b.resting_order.side} {fmtPrice(b.resting_order.limit_price)}
+                      {b.resting_order && orderOutcome && (
+                        <span
+                          data-testid={`bucket-order-badge-${b.bucket_id}`}
+                          className={`inline-block whitespace-nowrap px-1.5 py-0.5 rounded border ${
+                            isNoOrder
+                              ? "bg-amber-950/80 text-amber-300 border-amber-700"
+                              : "bg-sky-950/80 text-sky-300 border-sky-700"
+                          }`}
+                        >
+                          {b.resting_order.side} {orderOutcome} {fmtPrice(b.resting_order.limit_price)}
                         </span>
                       )}
                       {(() => {
@@ -609,10 +648,19 @@ export function CityXRayPanel({
             return (
               <div className="space-y-1.5 max-h-56 overflow-y-auto pr-1 text-xs font-mono-tabular">
                 {visibleOrders.map(
-                  ({ order: o, stationIcao, city, targetDate, eventId, bucketLabel }) => {
+                  ({
+                    order: o,
+                    stationIcao,
+                    city,
+                    targetDate,
+                    eventId,
+                    bucketLabel,
+                    outcomeSide,
+                  }) => {
                     const isSelectedCity = eventId === xray.event.event_id;
                     const phaseLabel = o.phase === "INTRADAY_REPRICING" ? "INTRADAY" : "PREMARKET";
                     const dateLabel = formatTargetDate(targetDate);
+                    const isNoOrder = outcomeSide === "NO";
                     return (
                       <button
                         key={o.order_id}
@@ -621,16 +669,18 @@ export function CityXRayPanel({
                         onClick={() => onSelectEvent?.(eventId)}
                         className={`w-full text-left flex items-center justify-between gap-2 px-2.5 py-1.5 rounded bg-[#0f1726] border transition-colors ${
                           isSelectedCity
-                            ? "border-sky-700/70 bg-[#121e33]"
+                            ? isNoOrder
+                              ? "border-amber-600/70 bg-[#1f1a10]"
+                              : "border-sky-700/70 bg-[#121e33]"
                             : "border-[#1c2638] hover:border-slate-600"
                         }`}
                       >
-                        <span className="text-sky-300 truncate">
+                        <span className={`${isNoOrder ? "text-amber-300" : "text-sky-300"} truncate`}>
                           <span className="font-semibold">{stationIcao}</span>{" "}
                           <span className="text-slate-400">
                             {city} · {dateLabel}
                           </span>{" "}
-                          • {bucketLabel} • ORDER {o.side} ({Number(o.size_shares.toFixed(2))}sh @{" "}
+                          • {bucketLabel} • ORDER {o.side} {outcomeSide} ({Number(o.size_shares.toFixed(2))}sh @{" "}
                           {fmtPrice(o.limit_price)})
                         </span>
                         <span className="flex items-center gap-3 shrink-0">

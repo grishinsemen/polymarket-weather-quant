@@ -1630,4 +1630,87 @@ describe("WeatherQuantTerminal", () => {
     expect(within(sheet).getByText("Avg CLV")).toBeInTheDocument();
     expect(within(sheet).getByText("Sharpe Ratio")).toBeInTheDocument();
   });
+
+  it("distinguishes BUY YES and BUY NO resting orders in bucket table and unified panel", () => {
+    const mixedBuckets = make11Buckets("evt-rksi", 11).map((b, idx) => {
+      if (idx === 3) {
+        return {
+          ...b,
+          best_bid: null,
+          best_ask: 0.42,
+          net_edge: 0.0,
+          resting_order: {
+            order_id: "ord-rksi-no-3",
+            event_id: "evt-rksi",
+            station_icao: "RKSI",
+            bucket_id: b.bucket_id,
+            token_id: "tok-rksi-no-3",
+            side: "BUY" as const,
+            outcome_side: "NO" as const,
+            limit_price: 0.56,
+            size_shares: 8.28,
+            size_usd: 4.64,
+            post_only: true,
+            phase: "INTRADAY_REPRICING" as const,
+            status: "OPEN" as const,
+            expected_edge: 0.374,
+            model_version: "ensemble-3layer-v1",
+            strategy_version: "kelly-multi-strict-v2",
+            created_at_utc: "2026-11-26T23:37:00Z",
+            updated_at_utc: "2026-11-26T23:37:00Z",
+          },
+        };
+      }
+      return b;
+    });
+
+    const mixedSnapshot: TerminalSnapshotResponse = {
+      ...FIXTURE_SNAPSHOT,
+      xrays: {
+        ...FIXTURE_SNAPSHOT.xrays,
+        "evt-rksi": {
+          ...FIXTURE_SNAPSHOT.xrays["evt-rksi"],
+          buckets: mixedBuckets,
+        },
+      },
+    };
+
+    render(
+      <WeatherQuantTerminal
+        snapshot={mixedSnapshot}
+        wsStatus="connected"
+        selectedEventId="evt-rksi"
+        activeTab="terminal"
+        selectedModelVersion="ensemble-3layer-v1"
+        selectedStrategyVersion="kelly-multi-strict-v2"
+        onSelectEvent={vi.fn()}
+        onSelectTab={vi.fn()}
+        onFilterModelVersion={vi.fn()}
+        onFilterStrategyVersion={vi.fn()}
+        onTogglePause={vi.fn(async () => {})}
+        onSync={vi.fn(async () => {})}
+        onSeedDemo={vi.fn(async () => {})}
+        onRunReplay={vi.fn(async () => {})}
+        onPromoteRun={vi.fn(async () => {})}
+      />,
+    );
+
+    const noBucketBadge = screen.getByTestId("bucket-order-badge-evt-rksi-b3");
+    expect(noBucketBadge).toHaveTextContent("BUY NO 56¢");
+    expect(noBucketBadge).toHaveClass("text-amber-300");
+
+    const yesBucketBadge = screen.getByTestId("bucket-order-badge-evt-rksi-b5");
+    expect(yesBucketBadge).toHaveTextContent("BUY YES 25¢");
+    expect(yesBucketBadge).toHaveClass("text-sky-300");
+
+    expect(screen.getByText("NO +37.4¢")).toHaveClass("text-amber-400");
+
+    const noOrderRow = screen.getByTestId("unified-order-row-ord-rksi-no-3");
+    expect(noOrderRow).toHaveTextContent("ORDER BUY NO (8.28sh @ 56¢)");
+    expect(within(noOrderRow).getByText(/ORDER BUY NO/).className).toContain("text-amber-300");
+
+    const yesOrderRow = screen.getByTestId("unified-order-row-ord-evt-rksi-5");
+    expect(yesOrderRow).toHaveTextContent("ORDER BUY YES (14sh @ 25¢)");
+    expect(within(yesOrderRow).getByText(/ORDER BUY YES/).className).toContain("text-sky-300");
+  });
 });

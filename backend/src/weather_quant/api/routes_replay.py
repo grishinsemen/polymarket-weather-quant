@@ -113,6 +113,7 @@ _REASON_EXPLANATIONS: dict[str, str] = {
     "NO_PRICE_OUT_OF_RANGE": "Skipped BUY NO because passive limit price fell outside configured [min_buy_no_price, max_buy_no_price] bounds.",
     "TRADE_EDGE_REALIZED": "Logged expected entry Edge vs actual realized Edge upon exit or settlement.",
     "ADVERSE_SELECTION_CRASH_CANCEL": "Cancelled resting BUY before fill simulation because opposing ask crashed to <= 2c (probable live METAR breach).",
+    "MARKET_MOVED_AWAY_CANCEL": "Cancelled resting Maker BUY because market best bid moved >= 25c above our limit price (frees locked cash).",
     "POST_ONLY_WOULD_CROSS": "Post-Only Maker Order rejected because limit price would cross opposing spread.",
 }
 

@@ -462,8 +462,9 @@ class TelegramRadarBot:
                 ev = events_by_id.get(pos.event_id)
                 city = _resolve_city(pos.station_icao, ev)
                 header = f"{pos.station_icao} ({city})"
+                side_prefix = "NO " if pos.outcome_side == "NO" else ""
                 grouped.setdefault(header, []).append(
-                    f"  POS {pos.bucket_label}: {pos.shares:.2f}sh @ {pos.avg_entry_price:.2f} "
+                    f"  POS {side_prefix}{pos.bucket_label}: {pos.shares:.2f}sh @ {pos.avg_entry_price:.2f} "
                     f"(mark {pos.mark_price:.2f}, uPnL {_format_signed_usd(pos.unrealized_pnl_usd)})"
                 )
             for order in orders:
@@ -471,7 +472,7 @@ class TelegramRadarBot:
                 city = _resolve_city(order.station_icao, ev)
                 header = f"{order.station_icao} ({city})"
                 grouped.setdefault(header, []).append(
-                    f"  ORD {order.side} {order.bucket_id}: {order.size_shares:.2f}sh @ {order.limit_price:.2f} "
+                    f"  ORD {order.side} {order.outcome_side} {order.bucket_id}: {order.size_shares:.2f}sh @ {order.limit_price:.2f} "
                     f"(${order.size_usd:.2f}, {order.phase}, {order.status})"
                 )
 

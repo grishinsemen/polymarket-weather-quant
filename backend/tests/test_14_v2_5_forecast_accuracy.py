@@ -237,3 +237,200 @@ def test_compute_equity_sharpe_requires_seven_days_before_annualizing() -> None:
     ]
     long_sharpe = compute_equity_sharpe(seven_day_curve)
     assert long_sharpe > short_sharpe
+
+
+@pytest.mark.asyncio
+async def test_market_moved_away_cancels_stale_resting_buy_yes_and_no() -> None:
+    """Resting BUY YES/NO orders left >= 25c behind market best_bid must auto-cancel to free cash."""
+    from weather_quant.domain.clock import VirtualClock
+    from weather_quant.domain.models import (
+        Bucket,
+        BucketFairProbability,
+        EventProbabilitySnapshot,
+        OrderBookSnapshot,
+        OrderLevel,
+        Polarity,
+        Station,
+        WeatherEvent,
+    )
+    from weather_quant.strategy.engine import R_MARKET_MOVED_AWAY_CANCEL, StrategyEngine, StrategyStore
+    from weather_quant.strategy.paper_executor import PaperExecutor
+
+    clock = VirtualClock(datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc))
+    db = Database(":memory:")
+    await db.initialize()
+    try:
+        store = StrategyStore(db)
+        await store.ensure_schema()
+        mv = await db.get_active_model_version()
+        strat = next(s for s in await db.list_strategy_versions() if s.strategy_version == "kelly-multi-strict-v2")
+        executor = PaperExecutor(db=db, clock=clock, store=store, strict_maker_fills=True)
+        engine = StrategyEngine(db=db, executor=executor, clock=clock, manifest=strat, store=store)
+
+        st = Station(
+            icao="KORD",
+            name="Chicago O'Hare",
+            city="Chicago",
+            country="US",
+            lat=41.9742,
+            lon=-87.9073,
+            elevation_m=205.0,
+            timezone="America/Chicago",
+        )
+        evt_yes = WeatherEvent(
+            event_id="evt-kord-moved-yes",
+            slug="highest-temp-chicago-nov-26",
+            title="Highest temperature in Chicago on November 26?",
+            url="https://polymarket.com/event/highest-temp-chicago-nov-26",
+            station=st,
+            local_date=date(2026, 11, 26),
+            polarity=Polarity.HIGHEST,
+            remark_tenths_enabled=True,
+            unit="F",
+            buckets=[
+                Bucket(bucket_id="b-y0", market_id="m-y0", label="44-45°F", token_id="tok-y0", no_token_id="tok-n0", lower_bound=44, upper_bound=45, unit="F", outcome_index=0),
+                Bucket(bucket_id="b-y1", market_id="m-y1", label="46-47°F", token_id="tok-y1", no_token_id="tok-n1", lower_bound=46, upper_bound=47, unit="F", outcome_index=1),
+            ],
+            fees_enabled=False,
+            neg_risk=True,
+            active=True,
+            discovered_at_utc=clock.now() - timedelta(hours=4),
+        )
+        evt_no = WeatherEvent(
+            event_id="evt-kord-moved-no",
+            slug="highest-temp-chicago-nov-27",
+            title="Highest temperature in Chicago on November 27?",
+            url="https://polymarket.com/event/highest-temp-chicago-nov-27",
+            station=st,
+            local_date=date(2026, 11, 27),
+            polarity=Polarity.HIGHEST,
+            remark_tenths_enabled=True,
+            unit="F",
+            buckets=[
+                Bucket(bucket_id="b-n0", market_id="m-n0", label="44-45°F", token_id="tok-ny0", no_token_id="tok-nn0", lower_bound=44, upper_bound=45, unit="F", outcome_index=0),
+                Bucket(bucket_id="b-n1", market_id="m-n1", label="46-47°F", token_id="tok-ny1", no_token_id="tok-nn1", lower_bound=46, upper_bound=47, unit="F", outcome_index=1),
+            ],
+            fees_enabled=False,
+            neg_risk=True,
+            active=True,
+            discovered_at_utc=clock.now() - timedelta(hours=4),
+        )
+        t0 = clock.now()
+        probs_yes = EventProbabilitySnapshot(
+            event_id=evt_yes.event_id,
+            station_icao="KORD",
+            model_version=mv.model_version,
+            computed_at_utc=t0 - timedelta(minutes=1),
+            buckets=[
+                BucketFairProbability(
+                    event_id=evt_yes.event_id, bucket_id="b-y0", label="44-45°F",
+                    fair_probability=0.70, raw_ensemble_probability=0.70, bias_adjusted_probability=0.70,
+                    model_version=mv.model_version,
+                ),
+                BucketFairProbability(
+                    event_id=evt_yes.event_id, bucket_id="b-y1", label="46-47°F",
+                    fair_probability=0.30, raw_ensemble_probability=0.30, bias_adjusted_probability=0.30,
+                    model_version=mv.model_version,
+                ),
+            ],
+        )
+        probs_no = EventProbabilitySnapshot(
+            event_id=evt_no.event_id,
+            station_icao="KORD",
+            model_version=mv.model_version,
+            computed_at_utc=t0 - timedelta(minutes=1),
+            buckets=[
+                BucketFairProbability(
+                    event_id=evt_no.event_id, bucket_id="b-n0", label="44-45°F",
+                    fair_probability=0.88, raw_ensemble_probability=0.88, bias_adjusted_probability=0.88,
+                    model_version=mv.model_version,
+                ),
+                BucketFairProbability(
+                    event_id=evt_no.event_id, bucket_id="b-n1", label="46-47°F",
+                    fair_probability=0.12, raw_ensemble_probability=0.12, bias_adjusted_probability=0.12,
+                    model_version=mv.model_version,
+                ),
+            ],
+        )
+        books_yes_t0 = {
+            "b-y0": OrderBookSnapshot(
+                event_id=evt_yes.event_id, bucket_id="b-y0", token_id="tok-y0",
+                bids=[OrderLevel(price=0.30, size=50.0)], asks=[OrderLevel(price=0.36, size=50.0)],
+                best_bid=0.30, best_ask=0.36, midpoint=0.33, spread=0.06, ingested_at_utc=t0,
+            ),
+            "b-y1": OrderBookSnapshot(
+                event_id=evt_yes.event_id, bucket_id="b-y1", token_id="tok-y1",
+                bids=[OrderLevel(price=0.28, size=50.0)], asks=[OrderLevel(price=0.32, size=50.0)],
+                best_bid=0.28, best_ask=0.32, midpoint=0.30, spread=0.04, ingested_at_utc=t0,
+            ),
+        }
+        books_no_t0 = {
+            "b-n0": OrderBookSnapshot(
+                event_id=evt_no.event_id, bucket_id="b-n0", token_id="tok-ny0",
+                bids=[OrderLevel(price=0.85, size=50.0)], asks=[OrderLevel(price=0.90, size=50.0)],
+                best_bid=0.85, best_ask=0.90, midpoint=0.875, spread=0.05, ingested_at_utc=t0,
+            ),
+            "b-n1": OrderBookSnapshot(
+                event_id=evt_no.event_id, bucket_id="b-n1", token_id="tok-ny1",
+                bids=[OrderLevel(price=0.50, size=50.0)], asks=[OrderLevel(price=0.57, size=50.0)],
+                best_bid=0.50, best_ask=0.57, midpoint=0.535, spread=0.07, ingested_at_utc=t0,
+            ),
+        }
+        res_open_y = await engine.tick_event(evt_yes, probs_yes, books_yes_t0)
+        res_open_n = await engine.tick_event(evt_no, probs_no, books_no_t0)
+        assert len(res_open_y.placed) == 1 and res_open_y.placed[0].outcome_side == "YES"
+        assert len(res_open_n.placed) == 1 and res_open_n.placed[0].outcome_side == "NO"
+
+        # Market stays within 10c -> both orders keep resting
+        clock.advance(timedelta(minutes=2))
+        t1 = clock.now()
+        books_yes_near = {
+            **books_yes_t0,
+            "b-y0": OrderBookSnapshot(
+                event_id=evt_yes.event_id, bucket_id="b-y0", token_id="tok-y0",
+                bids=[OrderLevel(price=0.40, size=50.0)], asks=[OrderLevel(price=0.46, size=50.0)],
+                best_bid=0.40, best_ask=0.46, midpoint=0.43, spread=0.06, ingested_at_utc=t1,
+            ),
+            "b-y1": books_yes_t0["b-y1"].model_copy(update={"ingested_at_utc": t1}),
+        }
+        books_no_near = {
+            "b-n0": books_no_t0["b-n0"].model_copy(update={"ingested_at_utc": t1}),
+            "b-n1": OrderBookSnapshot(
+                event_id=evt_no.event_id, bucket_id="b-n1", token_id="tok-ny1",
+                bids=[OrderLevel(price=0.44, size=50.0)], asks=[OrderLevel(price=0.50, size=50.0)],
+                best_bid=0.44, best_ask=0.50, midpoint=0.47, spread=0.06, ingested_at_utc=t1,
+            ),
+        }
+        res_near_y = await engine.tick_event(evt_yes, probs_yes.model_copy(update={"computed_at_utc": t1 - timedelta(seconds=10)}), books_yes_near)
+        res_near_n = await engine.tick_event(evt_no, probs_no.model_copy(update={"computed_at_utc": t1 - timedelta(seconds=10)}), books_no_near)
+        assert res_near_y.cancelled == []
+        assert res_near_n.cancelled == []
+
+        # Market moves >= 25c above resting bids -> BOTH YES and NO auto-cancel and free cash
+        clock.advance(timedelta(minutes=2))
+        t2 = clock.now()
+        books_yes_far = {
+            "b-y0": OrderBookSnapshot(
+                event_id=evt_yes.event_id, bucket_id="b-y0", token_id="tok-y0",
+                bids=[OrderLevel(price=0.68, size=50.0)], asks=[OrderLevel(price=0.72, size=50.0)],
+                best_bid=0.68, best_ask=0.72, midpoint=0.70, spread=0.04, ingested_at_utc=t2,
+            ),
+            "b-y1": books_yes_t0["b-y1"].model_copy(update={"ingested_at_utc": t2}),
+        }
+        books_no_far = {
+            "b-n0": books_no_t0["b-n0"].model_copy(update={"ingested_at_utc": t2}),
+            "b-n1": OrderBookSnapshot(
+                event_id=evt_no.event_id, bucket_id="b-n1", token_id="tok-ny1",
+                bids=[OrderLevel(price=0.05, size=50.0)], asks=[OrderLevel(price=0.08, size=50.0)],
+                best_bid=0.05, best_ask=0.08, midpoint=0.065, spread=0.03, ingested_at_utc=t2,
+            ),
+        }
+        res_far_y = await engine.tick_event(evt_yes, probs_yes.model_copy(update={"computed_at_utc": t2 - timedelta(seconds=10)}), books_yes_far)
+        res_far_n = await engine.tick_event(evt_no, probs_no.model_copy(update={"computed_at_utc": t2 - timedelta(seconds=10)}), books_no_far)
+        assert len(res_far_y.cancelled) == 1
+        assert len(res_far_n.cancelled) == 1
+        assert await store.list_resting_orders() == []
+        audits = await store.list_audit()
+        assert sum(1 for a in audits if R_MARKET_MOVED_AWAY_CANCEL in a.reason_codes) == 2
+    finally:
+        await db.close()
