@@ -602,3 +602,50 @@ async def test_replay_excludes_truncated_first_day_and_unsettled_current_day(tmp
         assert diag.premarket.market_sample_count == 1
     finally:
         await db.close()
+
+
+def test_active_tail_ece_excludes_dead_mass_and_computes_discrete_pit() -> None:
+    t0 = datetime(2026, 11, 25, 22, 0, tzinfo=timezone.utc)
+    ev = _make_event("evt-tail-pit", "LFPB", date(2026, 11, 26))
+
+    # 8 dead/impossible buckets (<1% or impossible) + 2 active low-tail buckets (0.04, 0.10) + 1 high-tail bucket (0.86)
+    probs = [0.0, 0.0, 0.001, 0.001, 0.04, 0.86, 0.10, 0.001, 0.001, 0.0, 0.0]
+    impossibles = [True, True, False, False, False, False, False, False, False, True, True]
+
+    snap = EventProbabilitySnapshot(
+        event_id=ev.event_id,
+        station_icao="LFPB",
+        model_version="m-tail",
+        computed_at_utc=t0,
+        buckets=[
+            BucketFairProbability(
+                event_id=ev.event_id,
+                bucket_id=b.bucket_id,
+                label=b.label,
+                fair_probability=p,
+                is_impossible=imp,
+                model_version="m-tail",
+            )
+            for b, p, imp in zip(ev.buckets, probs, impossibles)
+        ],
+        probability_sum=sum(probs),
+    )
+    obs = [ForecastEvalObservation(ev, snap, {}, t0)]
+
+    # Winner is index 6 (the 10% bucket, NOT the 86% bucket) -> large genuine tail error
+    res = compute_brain_slice_metrics(
+        label="premarket",
+        observations=obs,
+        winning_idx_by_event={ev.event_id: 6},
+    )
+    # Only the 3 active tail buckets (0.04 in 1-5%, 0.10 in 5-15%, 0.86 in 85-99%) are counted
+    assert res.tail_bucket_count == 3
+    assert [b.label for b in res.tail_bins] == ["1-5%", "5-15%", "85-99%"]
+    # Exact errors: |0.04-0|=0.04, |0.10-1|=0.90, |0.86-0|=0.86 -> mean = 0.60
+    assert res.model_tail_ece == pytest.approx(0.60, abs=1e-4)
+
+    # Discrete PIT: winner is index 6 -> cdf_lo ~ 0.90, cdf_hi ~ 1.00 -> pit_mean ~ 0.95
+    assert len(res.pit_histogram) == 10
+    assert sum(res.pit_histogram) == pytest.approx(1.0, abs=1e-2)
+    assert res.pit_mean is not None and res.pit_mean > 0.90
+    assert res.pit_std == pytest.approx(0.0, abs=1e-4)

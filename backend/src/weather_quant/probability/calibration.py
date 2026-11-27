@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from datetime import date, datetime, timedelta, timezone
-from typing import Sequence
+from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -26,6 +26,7 @@ from weather_quant.domain.models import (
     WeatherEvent,
 )
 from weather_quant.probability.engine import (
+    DEFAULT_MODEL_VERSION,
     DailyBiasObservation,
     EnsembleProbabilityEngine,
     bucket_distance,
@@ -113,6 +114,7 @@ class CalibrationEvaluationReport(BaseModel):
     """Full per-station and aggregate calibration report."""
 
     generated_at_utc: datetime
+    model_version: str = DEFAULT_MODEL_VERSION
     tail_price_threshold: float = 0.10
     overall_raw: CalibrationMetricsSummary
     overall_calibrated: CalibrationMetricsSummary
@@ -224,12 +226,12 @@ def compute_interval_coverage(
     return hits / len(actuals)
 
 
-def _extract_day_extremes_c(
+def _extract_day_window(
     ensemble: EnsembleSnapshot,
     station: Station,
     local_date: date,
     polarity: Polarity,
-) -> list[float]:
+) -> tuple[list[int], list[list[float]], list[float]]:
     tz = ZoneInfo(station.timezone)
     day_indices = [
         idx
@@ -237,16 +239,18 @@ def _extract_day_extremes_c(
         if (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(tz).date() == local_date
     ]
     if not day_indices:
-        return []
-    return [
-        (
-            max(float(traj[i]) for i in day_indices)
-            if polarity == Polarity.HIGHEST
-            else min(float(traj[i]) for i in day_indices)
-        )
+        return [], [], []
+    max_idx = max(day_indices)
+    day_trajectories = [
+        [float(traj[idx]) for idx in day_indices]
         for traj in ensemble.member_temps_c
-        if len(traj) > max(day_indices)
+        if len(traj) > max_idx
     ]
+    raw_extremes_c = [
+        max(traj) if polarity == Polarity.HIGHEST else min(traj)
+        for traj in day_trajectories
+    ]
+    return day_indices, day_trajectories, raw_extremes_c
 
 
 def _summarize_records(records: list[dict[str, float | int | list[float]]], tail_threshold: float) -> CalibrationMetricsSummary:
@@ -284,13 +288,15 @@ def evaluate_calibration_walk_forward(
     samples: Sequence[CalibrationDaySample],
     *,
     engine: EnsembleProbabilityEngine | None = None,
+    mos_provider: Any | None = None,
+    model_version: str = DEFAULT_MODEL_VERSION,
     tail_price_threshold: float = 0.10,
 ) -> CalibrationEvaluationReport:
     """Run strictly chronological walk-forward calibration evaluation per station and overall.
 
     For each day ``t``, EMOS bias & dispersion calibration uses strictly prior days ``< t``
     (zero future leakage). Compares uncalibrated Layer 1 (``scale=1.0, bias=0.0``) against
-    calibrated Layer 2 (EMOS station bias + spread calibration).
+    the calibrated model (configured EMOS / Student-t / optional MOS provider).
     """
     cal_engine = engine or EnsembleProbabilityEngine()
     raw_engine = EnsembleProbabilityEngine(
@@ -327,7 +333,7 @@ def evaluate_calibration_walk_forward(
 
         for item in day_items:
             icao = item.station.icao.strip().upper()
-            raw_extremes_c = _extract_day_extremes_c(
+            day_indices, day_trajectories, raw_extremes_c = _extract_day_window(
                 item.ensemble, item.station, item.local_date, item.polarity
             )
             if not raw_extremes_c:
@@ -335,7 +341,6 @@ def evaluate_calibration_walk_forward(
 
             raw_arr = np.asarray(raw_extremes_c, dtype=np.float64)
             raw_mean = float(np.mean(raw_arr))
-            raw_std = float(np.std(raw_arr))
             center = round_half_away(raw_mean)
             buckets = build_synthetic_degree_buckets(center, event_id=f"cal-{icao}-{item.local_date.isoformat()}")
             station_tz = ZoneInfo(item.station.timezone)
@@ -383,29 +388,55 @@ def evaluate_calibration_walk_forward(
             }
             station_raw_records[icao].append(raw_rec)
 
-            # Calibrated Layer 2 evaluation (hierarchical walk-forward: strictly prior days only)
+            # Calibrated evaluation (hierarchical walk-forward: strictly prior days only + configured model)
             history_bias = station_history[icao]
-            bias_c, scale = cal_engine.compute_station_bias(
-                recent_bias_obs=history_bias,
-                event_local_date=item.local_date,
-                decision_time=decision_time,
-                raw_extremes_c=raw_extremes_c,
-                strict_temporal=False,
-                global_bias_obs=global_history,
-            )
-            station_last_params[icao] = (bias_c, scale)
-            cal_snap = cal_engine.compute_probabilities(
+            layer2 = cal_engine.evaluate_premarket_layer2(
                 station=item.station,
                 event=event,
                 ensemble=item.ensemble,
+                day_indices=day_indices,
+                day_trajectories=day_trajectories,
+                raw_extremes_c=raw_extremes_c,
+                decision_time=decision_time,
                 recent_bias_obs=history_bias,
-                intraday_metars=[],
-                clock=clock,
                 global_bias_obs=global_history,
+                strict_temporal=False,
             )
-            cal_arr = raw_mean + bias_c + scale * (raw_arr - raw_mean)
-            pit_val = float(np.mean(cal_arr <= item.actual_extreme_c))
-            cal_probs = [b.fair_probability for b in cal_snap.buckets]
+            station_last_params[icao] = (layer2.bias_c, layer2.scale)
+
+            cal_probs = layer2.bias_probs
+            p10_c = layer2.p10_c
+            p50_c = layer2.p50_c
+            p90_c = layer2.p90_c
+            pit_val = layer2.pit(item.actual_extreme_c)
+
+            if mos_provider is not None and mos_provider.is_station_covered(icao) and mos_provider.mos_model is not None:
+                from weather_quant.ml.dataset_builder import extract_features_from_ensemble
+
+                cal_snap = mos_provider.compute_probabilities(
+                    station=item.station,
+                    event=event,
+                    ensemble=item.ensemble,
+                    recent_bias_obs=history_bias,
+                    intraday_metars=[],
+                    clock=clock,
+                    strict_temporal=False,
+                )
+                cal_probs = [b.fair_probability for b in cal_snap.buckets]
+                features = extract_features_from_ensemble(
+                    station=item.station,
+                    local_date=event.local_date,
+                    polarity=event.polarity,
+                    ensemble=item.ensemble,
+                    decision_time_utc=decision_time,
+                    recent_bias_obs=history_bias,
+                    prior_observations=(),
+                )
+                q_pred = mos_provider.mos_model.predict_quantiles([features])[0]
+                mos_arr = np.asarray(mos_provider.mos_model.quantiles_to_extremes(q_pred), dtype=np.float64)
+                p10_c, p50_c, p90_c = (float(v) for v in np.percentile(mos_arr, (10, 50, 90)))
+                pit_val = float(np.mean(mos_arr <= item.actual_extreme_c))
+
             day_brier = sum(
                 (p - (1.0 if k == true_idx else 0.0)) ** 2 for k, p in enumerate(cal_probs)
             )
@@ -413,9 +444,9 @@ def evaluate_calibration_walk_forward(
                 "probs": cal_probs,
                 "true_idx": true_idx,
                 "actual_c": item.actual_extreme_c,
-                "p10_c": float(np.percentile(cal_arr, 10)),
-                "p50_c": float(np.percentile(cal_arr, 50)),
-                "p90_c": float(np.percentile(cal_arr, 90)),
+                "p10_c": p10_c,
+                "p50_c": p50_c,
+                "p90_c": p90_c,
                 "station_icao": icao,
                 "local_date": item.local_date,
                 "pit": pit_val,
@@ -428,9 +459,11 @@ def evaluate_calibration_walk_forward(
                     icao,
                     DailyBiasObservation(
                         local_date=item.local_date,
-                        forecast_extreme_c=raw_mean,
+                        forecast_extreme_c=layer2.forecast_ref_c,
                         observed_extreme_c=item.actual_extreme_c,
-                        forecast_std_c=raw_std if raw_std > 1e-6 else None,
+                        forecast_std_c=(
+                            layer2.forecast_ref_std_c if layer2.forecast_ref_std_c > 1e-6 else None
+                        ),
                         observed_at_utc=item.observed_at_utc,
                         is_routine=True,
                     ),
@@ -466,6 +499,7 @@ def evaluate_calibration_walk_forward(
 
     return CalibrationEvaluationReport(
         generated_at_utc=datetime.now(timezone.utc),
+        model_version=model_version,
         tail_price_threshold=tail_price_threshold,
         overall_raw=_summarize_records(all_raw_records, tail_price_threshold),
         overall_calibrated=_summarize_records(all_cal_records, tail_price_threshold),
@@ -659,3 +693,31 @@ async def load_local_calibration_samples(
                 )
             )
     return samples
+
+
+async def load_calibration_target(
+    db: Database,
+    model_version: str | None = None,
+) -> tuple[str, EnsembleProbabilityEngine, Any | None]:
+    """Resolve active (or requested) ModelVersionRecord into a probability engine and optional MOS provider."""
+    if model_version:
+        versions = await db.list_model_versions()
+        model_rec = next((m for m in versions if m.model_version == model_version), None)
+        if model_rec is None:
+            raise ValueError(f"Unknown model_version: {model_version!r}")
+    else:
+        try:
+            model_rec = await db.get_active_model_version()
+        except RuntimeError:
+            return DEFAULT_MODEL_VERSION, EnsembleProbabilityEngine(), None
+
+    base_engine = EnsembleProbabilityEngine.from_model_config(model_rec.config_json)
+    mos_provider: Any | None = None
+    if "mos" in model_rec.model_type.lower() or "mos" in model_rec.model_version.lower():
+        from weather_quant.ml.quantile_mos import load_mos_provider_for_version
+
+        mos_provider = await load_mos_provider_for_version(db, model_rec.model_version)
+        if mos_provider is not None:
+            mos_provider.baseline_engine = base_engine
+
+    return model_rec.model_version, base_engine, mos_provider

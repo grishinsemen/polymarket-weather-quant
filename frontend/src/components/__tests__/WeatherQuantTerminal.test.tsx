@@ -1699,6 +1699,7 @@ describe("WeatherQuantTerminal", () => {
         }}
         calibrationReport={{
           generated_at_utc: "2026-11-26T18:00:00Z",
+          model_version: "emos-student-t-v2",
           tail_price_threshold: 0.1,
           overall_raw: {
             sample_count: 18,
@@ -1814,6 +1815,9 @@ describe("WeatherQuantTerminal", () => {
 
     // Model Calibration Audit card + expandable stations
     const calCard = screen.getByTestId("model-calibration-card");
+    expect(within(calCard).getByTestId("calibration-audited-model")).toHaveTextContent(
+      "emos-student-t-v2",
+    );
     expect(within(calCard).getByText("Raw (Layer 1)")).toBeInTheDocument();
     expect(within(calCard).getByText("Calibrated (EMOS)")).toBeInTheDocument();
     expect(within(calCard).getByText("77.8%")).toBeInTheDocument();

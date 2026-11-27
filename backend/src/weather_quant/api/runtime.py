@@ -109,8 +109,16 @@ class AutonomousRuntime:
             self.app.state.ensemble_fetcher = fetcher
         return fetcher
 
-    def _get_probability_engine(self) -> EnsembleProbabilityEngine:
+    def _get_probability_engine(self, model_rec: Any | None = None) -> EnsembleProbabilityEngine:
         engine = getattr(self.app.state, "probability_engine", None)
+        if model_rec is not None:
+            mv_key = str(getattr(model_rec, "model_version", ""))
+            cached_mv = getattr(self.app.state, "_probability_engine_mv", None)
+            if not isinstance(engine, EnsembleProbabilityEngine) or cached_mv != mv_key:
+                engine = EnsembleProbabilityEngine.from_model_config(getattr(model_rec, "config_json", None))
+                self.app.state.probability_engine = engine
+                self.app.state._probability_engine_mv = mv_key
+            return engine
         if not isinstance(engine, EnsembleProbabilityEngine):
             engine = EnsembleProbabilityEngine()
             self.app.state.probability_engine = engine
@@ -405,7 +413,8 @@ class AutonomousRuntime:
 
             # 3. Ensembles + Fair Probability (MOS when active & covered, else 3-layer baseline)
             await self._warm_ensemble_cache(archive, now_utc)
-            active_mv = (await db.get_active_model_version()).model_version
+            active_model_rec = await db.get_active_model_version()
+            active_mv = active_model_rec.model_version
             mos_provider = await load_mos_provider_for_version(
                 db,
                 active_mv,
@@ -415,7 +424,7 @@ class AutonomousRuntime:
                 self.app.state.mos_provider = mos_provider
 
             fetcher = self._get_ensemble_fetcher()
-            prob_engine = self._get_probability_engine()
+            prob_engine = self._get_probability_engine(active_model_rec)
             probs_computed = 0
             if (
                 self._hist_ensembles_loaded_at is None

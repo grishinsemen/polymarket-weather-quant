@@ -281,13 +281,7 @@ def _deterministic_run_id(
 
 
 def _build_prob_engine(model_rec: ModelVersionRecord) -> EnsembleProbabilityEngine:
-    cfg = model_rec.config_json or {}
-    return EnsembleProbabilityEngine(
-        smoothing_alpha=float(cfg.get("smoothing_alpha", 0.001)),
-        bias_window_days=int(cfg.get("bias_window_days", cfg.get("bias_days", 45))),
-        intraday_decay_hours=float(cfg.get("intraday_decay_hours", 6.0)),
-        obs_noise_c=float(cfg.get("obs_noise_c", 0.4)),
-    )
+    return EnsembleProbabilityEngine.from_model_config(model_rec.config_json)
 
 
 def _resolve_winning_bucket_index(

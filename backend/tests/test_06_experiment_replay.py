@@ -715,12 +715,46 @@ async def test_compare_exit_modes_hold_to_expiry_vs_dynamic_early_exit_and_api(t
         )
         assert cal_resp.status_code == 200
         cal_report = cal_resp.json()["report"]
+        assert cal_report["model_version"] == "ensemble-3layer-v1"
         assert "overall_raw" in cal_report
         assert "overall_calibrated" in cal_report
         assert "brier_score" in cal_report["overall_calibrated"]
         assert "log_loss" in cal_report["overall_calibrated"]
         assert "coverage_p10_p90" in cal_report["overall_calibrated"]
         assert isinstance(cal_report["stations"], list)
+
+        # Activate a Student-t EMOS model and verify Calibration Audit automatically follows the active model
+        import json
+        import sqlite3
+
+        with sqlite3.connect(db_path) as raw_conn:
+            raw_conn.execute("UPDATE model_versions SET is_active = 0")
+            raw_conn.execute(
+                """
+                INSERT INTO model_versions (
+                    model_version, model_type, description, feature_schema_hash,
+                    config_json, is_active, created_at_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "emos-student-t-test",
+                    "emos_student_t",
+                    "Student-t calibration audit test model",
+                    "emos-t7-test",
+                    json.dumps({"distribution_mode": "student_t_cdf", "student_t_df": 7.0}),
+                    1,
+                    datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc).isoformat(),
+                ),
+            )
+            raw_conn.commit()
+
+        cal_resp_v2 = client.post(
+            "/api/replay/calibration-audit",
+            json={"lookback_days": 30, "tail_price_threshold": 0.10, "min_metars_per_day": 1},
+        )
+        assert cal_resp_v2.status_code == 200
+        cal_report_v2 = cal_resp_v2.json()["report"]
+        assert cal_report_v2["model_version"] == "emos-student-t-test"
 
 
 @pytest.mark.asyncio

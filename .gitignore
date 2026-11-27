@@ -26,6 +26,8 @@ data/*.sqlite*
 data/*.parquet
 data/**/*.parquet
 data/models/
+data/ml/*.json
+data/ml/raw_365d/
 logs/
 
 # OS / IDE

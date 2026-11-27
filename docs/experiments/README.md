@@ -18,6 +18,9 @@
 | Дата | Ветка / Коммит | Model Version | Strategy Version | Окно данных | Brier | Mean CLV | Trades | Max DD | Net PnL | Решение |
 |---|---|---|---|---|---|---|---|---|---|---|
 | 2026-11-26 | `main` (baseline) | `ensemble-3layer-v1` | `conservative-kelly-100-v1` | _Baseline (живой сбор Parquet)_ | — | — | — | — | — | Baseline |
+| 2026-11-27 | `emos-student-t-v2` | `emos-student-t-v2` | `kelly-multi-strict-v2` | `2026-11-25..27` (`30` OOS премаркет) | `0.673` | `-6.1¢` (`30m`) | `43` | `-$57.73` (`57.7%`) | `-$48.81` | Candidate (Premarket LL `1.792→1.353`) |
+
+> **Напоминание на 2026-11-29 (см. `.scratch/mos-anchor-ablation/issues/01-ablate-mos-anchor-weights.md`):** после накопления закрытых событий 28–29.11 с `mos_anchors_by_date` прогнать на одном окне абляцию `emos-student-t-v2` с `mos_anchor_weight = 0.0` vs `fixed 0.30` vs `dynamic E_TTT` и сравнить `Premarket ΔLogLoss` / `RPS` / `Tail ECE`.
 
 ---
 

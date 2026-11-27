@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import TYPE_CHECKING, Any, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+import numpy as np
 from pydantic import BaseModel
+from scipy import special, stats
 
 from weather_quant.domain.clock import Clock, SystemClock, TemporalIntegrityError, assert_before_decision
 from weather_quant.domain.models import (
@@ -22,6 +25,16 @@ from weather_quant.domain.models import (
     WeatherEvent,
 )
 from weather_quant.probability.censored_max import simulate_censored_extreme
+from weather_quant.probability.student_t_emos import (
+    DEFAULT_REGIONAL_DEBIASED_HET_VAR,
+    DEFAULT_REGIONAL_NWP_WEIGHTS,
+    compute_ewma_station_bias,
+    compute_ewma_t_mle_scale,
+    compute_weighted_nwp_mean_and_var,
+    load_warmstart_bias_cache,
+    map_student_t_cdf_to_probabilities,
+    region_polarity_key,
+)
 
 if TYPE_CHECKING:
     from weather_quant.storage.database import Database
@@ -31,6 +44,40 @@ DEFAULT_SPREAD_INFLATION = 1.50
 DEFAULT_BIAS_SHRINKAGE_DAYS = 6.0
 DEFAULT_SCALE_SHRINKAGE_DAYS = 6.0
 Z_P90 = 1.2815515655446004
+
+
+@dataclass(frozen=True)
+class PremarketLayer2State:
+    """Calibrated Layer 2 premarket state shared by live inference and calibration audits."""
+
+    raw_mean_c: float
+    raw_std_c: float
+    forecast_ref_c: float
+    forecast_ref_std_c: float
+    bias_c: float
+    scale: float
+    mu_c: float
+    sigma_c: float
+    p10_c: float
+    p50_c: float
+    p90_c: float
+    student_t_nu: float | None
+    student_t_scale: float | None
+    bias_probs: list[float]
+    bias_trajectories: list[list[float]]
+    bias_extremes_c: list[float]
+
+    def pit(self, actual_extreme_c: float) -> float:
+        """Compute Probability Integral Transform P(Y <= actual_extreme_c) under the Layer 2 distribution."""
+        if self.student_t_nu is not None and self.student_t_scale is not None:
+            return float(
+                special.stdtr(
+                    self.student_t_nu,
+                    (actual_extreme_c - self.mu_c) / max(1e-6, self.student_t_scale),
+                )
+            )
+        arr = np.asarray(self.bias_extremes_c, dtype=np.float64)
+        return float(np.mean(arr <= actual_extreme_c))
 
 
 class DailyBiasObservation(BaseModel):
@@ -273,6 +320,14 @@ class EnsembleProbabilityEngine:
         default_spread_inflation: float = DEFAULT_SPREAD_INFLATION,
         use_censored_max: bool = False,
         mos_anchor_weight: float = 0.30,
+        distribution_mode: Literal["histogram", "student_t_cdf"] = "histogram",
+        student_t_df: float = 7.0,
+        bias_half_life_days: float | None = None,
+        scale_half_life_days: float | None = None,
+        use_regional_nwp_weights: bool = False,
+        regional_nwp_weights: Mapping[str, Sequence[float]] | None = None,
+        regional_het_var: Mapping[str, Sequence[float]] | None = None,
+        warmstart_bias_path: str | None = None,
     ) -> None:
         self.smoothing_alpha = smoothing_alpha
         self.bias_window_days = bias_window_days
@@ -281,6 +336,96 @@ class EnsembleProbabilityEngine:
         self.default_spread_inflation = max(1.0, float(default_spread_inflation))
         self.use_censored_max = use_censored_max
         self.mos_anchor_weight = max(0.0, min(0.6, float(mos_anchor_weight)))
+        self.distribution_mode: Literal["histogram", "student_t_cdf"] = (
+            "student_t_cdf" if distribution_mode == "student_t_cdf" else "histogram"
+        )
+        self.student_t_df = max(2.5, float(student_t_df))
+        self.bias_half_life_days = float(bias_half_life_days) if bias_half_life_days is not None else None
+        self.scale_half_life_days = float(scale_half_life_days) if scale_half_life_days is not None else None
+        self.use_regional_nwp_weights = bool(use_regional_nwp_weights)
+        self.regional_nwp_weights: dict[str, tuple[float, float, float]] = (
+            {
+                str(k): (float(v[0]), float(v[1]), float(v[2]))
+                for k, v in regional_nwp_weights.items()
+                if len(v) >= 3
+            }
+            if regional_nwp_weights is not None
+            else dict(DEFAULT_REGIONAL_NWP_WEIGHTS)
+        )
+        self.regional_het_var: dict[str, tuple[float, float]] = (
+            {
+                str(k): (float(v[0]), float(v[1]))
+                for k, v in regional_het_var.items()
+                if len(v) >= 2
+            }
+            if regional_het_var is not None
+            else dict(DEFAULT_REGIONAL_DEBIASED_HET_VAR)
+        )
+        self.warmstart_bias_path = str(warmstart_bias_path) if warmstart_bias_path else None
+
+    @classmethod
+    def from_model_config(cls, config_json: Mapping[str, Any] | None) -> "EnsembleProbabilityEngine":
+        """Construct an EnsembleProbabilityEngine from a ModelVersionRecord.config_json dict."""
+        cfg = config_json or {}
+        dist_mode_raw = str(cfg.get("distribution_mode", "histogram"))
+        dist_mode: Literal["histogram", "student_t_cdf"] = (
+            "student_t_cdf" if dist_mode_raw == "student_t_cdf" else "histogram"
+        )
+        return cls(
+            smoothing_alpha=float(cfg.get("smoothing_alpha", 0.001)),
+            bias_window_days=int(cfg.get("bias_window_days", cfg.get("bias_days", 45))),
+            intraday_decay_hours=float(cfg.get("intraday_decay_hours", 6.0)),
+            obs_noise_c=float(cfg.get("obs_noise_c", 0.4)),
+            default_spread_inflation=float(cfg.get("default_spread_inflation", DEFAULT_SPREAD_INFLATION)),
+            use_censored_max=bool(cfg.get("use_censored_max", False)),
+            mos_anchor_weight=float(cfg.get("mos_anchor_weight", 0.30)),
+            distribution_mode=dist_mode,
+            student_t_df=float(cfg.get("student_t_df", 7.0)),
+            bias_half_life_days=(
+                float(cfg["bias_half_life_days"]) if cfg.get("bias_half_life_days") is not None else None
+            ),
+            scale_half_life_days=(
+                float(cfg["scale_half_life_days"]) if cfg.get("scale_half_life_days") is not None else None
+            ),
+            use_regional_nwp_weights=bool(cfg.get("use_regional_nwp_weights", False)),
+            regional_nwp_weights=cfg.get("regional_nwp_weights"),
+            regional_het_var=cfg.get("regional_het_var"),
+            warmstart_bias_path=cfg.get("warmstart_bias_path"),
+        )
+
+    def _merge_warmstart_bias(
+        self,
+        *,
+        station_icao: str,
+        polarity: Polarity,
+        recent_bias_obs: Sequence[DailyBiasObservation],
+        global_bias_obs: Sequence[DailyBiasObservation],
+    ) -> tuple[list[DailyBiasObservation], list[DailyBiasObservation]]:
+        """Merge strictly pre-OOS warm-start DailyBiasObservations with live history (live takes precedence)."""
+        if not self.warmstart_bias_path:
+            return list(recent_bias_obs), list(global_bias_obs)
+        cache = load_warmstart_bias_cache(self.warmstart_bias_path)
+        if not cache:
+            return list(recent_bias_obs), list(global_bias_obs)
+
+        key = f"{station_icao.strip().upper()}_{polarity.value}"
+        live_station = list(recent_bias_obs)
+        live_dates = {o.local_date for o in live_station}
+        for raw_item in cache.get(key, ()):
+            obs = DailyBiasObservation.model_validate(raw_item)
+            if obs.local_date not in live_dates:
+                live_station.append(obs)
+                live_dates.add(obs.local_date)
+
+        # Global pool for the same polarity
+        pol_suffix = f"_{polarity.value}"
+        merged_global = list(global_bias_obs)
+        for cache_key, items in cache.items():
+            if not cache_key.endswith(pol_suffix):
+                continue
+            for raw_item in items:
+                merged_global.append(DailyBiasObservation.model_validate(raw_item))
+        return live_station, merged_global
 
     def _compute_global_prior(
         self,
@@ -583,42 +728,68 @@ class EnsembleProbabilityEngine:
         ensemble: EnsembleSnapshot,
         polarity: Polarity,
         emos_mean_c: float,
+        emos_std_c: float | None = None,
     ) -> float:
-        """Blend bounded external $0 MOS anchors (MOSMIX/NBM/NWS) into Layer 2 mean offset."""
+        """Blend bounded external $0 MOS anchors (MOSMIX/NBM/NWS) weighted by inverse variance (E_TTT)."""
         if self.mos_anchor_weight <= 0.0 or not isinstance(ensemble.metadata, dict):
             return 0.0
         meta = ensemble.metadata
         suffix = "high_c" if polarity == Polarity.HIGHEST else "low_c"
-        candidate_keys = (
-            f"mosmix_{suffix}",
-            f"nbm_{suffix}",
-            f"nws_point_{suffix}",
-        )
-        anchors: list[float] = []
-        for k in candidate_keys:
-            v = meta.get(k)
-            if v is not None:
-                try:
-                    val = float(v)
-                    if math.isfinite(val):
-                        anchors.append(val)
-                except (TypeError, ValueError):
+        prefixes = ("mosmix", "nbm", "nws_point")
+
+        entries: list[tuple[float, float | None]] = []
+        for pref in prefixes:
+            raw_v = meta.get(f"{pref}_{suffix}")
+            if raw_v is None and polarity == Polarity.HIGHEST:
+                raw_v = meta.get(f"{pref}_extreme_c")
+            if raw_v is None:
+                continue
+            try:
+                val = float(raw_v)
+                if not math.isfinite(val):
                     continue
-        if not anchors and polarity == Polarity.HIGHEST:
-            for k in ("mosmix_extreme_c", "nbm_extreme_c", "nws_point_extreme_c"):
-                v = meta.get(k)
-                if v is not None:
-                    try:
-                        val = float(v)
-                        if math.isfinite(val):
-                            anchors.append(val)
-                    except (TypeError, ValueError):
-                        continue
-        if not anchors:
+            except (TypeError, ValueError):
+                continue
+
+            unc_val: float | None = None
+            raw_unc = meta.get(f"{pref}_uncertainty_c")
+            if raw_unc is not None:
+                try:
+                    u = float(raw_unc)
+                    if math.isfinite(u) and u > 0.1:
+                        unc_val = u
+                except (TypeError, ValueError):
+                    unc_val = None
+            entries.append((val, unc_val))
+
+        if not entries:
             return 0.0
-        anchor_mean = sum(anchors) / len(anchors)
+
+        has_uncertainty = any(u is not None for _, u in entries)
+        if not has_uncertainty:
+            anchor_mean = sum(v for v, _ in entries) / len(entries)
+            eff_weight = self.mos_anchor_weight
+        else:
+            eff_emos_std = max(0.35, float(emos_std_c)) if emos_std_c is not None else 1.0
+            emos_var = eff_emos_std * eff_emos_std
+            base_w = max(0.05, min(0.55, self.mos_anchor_weight))
+            fallback_mos_var = emos_var * ((1.0 - base_w) / base_w)
+
+            prec_sum = 0.0
+            weighted_val_sum = 0.0
+            for val, unc in entries:
+                # Inflate reported E_TTT by 1.4x to account for shared NWP forecast error correlation
+                var_k = ((max(0.35, unc) * 1.4) ** 2) if unc is not None else fallback_mos_var
+                prec_k = 1.0 / max(0.05, var_k)
+                prec_sum += prec_k
+                weighted_val_sum += prec_k * val
+
+            anchor_mean = weighted_val_sum / prec_sum
+            bayes_w = prec_sum / (prec_sum + (1.0 / emos_var))
+            eff_weight = max(0.10, min(0.45, bayes_w))
+
         raw_delta = max(-2.5, min(2.5, anchor_mean - emos_mean_c))
-        return self.mos_anchor_weight * raw_delta
+        return eff_weight * raw_delta
 
     def calibrate_day_trajectories(
         self,
@@ -759,6 +930,177 @@ class EnsembleProbabilityEngine:
         )
         return intraday_probs, impossible_mask
 
+    def evaluate_premarket_layer2(
+        self,
+        *,
+        station: Station,
+        event: WeatherEvent,
+        ensemble: EnsembleSnapshot,
+        day_indices: Sequence[int],
+        day_trajectories: Sequence[Sequence[float]],
+        raw_extremes_c: Sequence[float],
+        decision_time: datetime,
+        recent_bias_obs: Sequence[DailyBiasObservation] = (),
+        global_bias_obs: Sequence[DailyBiasObservation] = (),
+        strict_temporal: bool = False,
+    ) -> PremarketLayer2State:
+        """Compute Layer 2 calibrated distribution state shared across inference and walk-forward audits."""
+        eff_recent_bias, eff_global_bias = self._merge_warmstart_bias(
+            station_icao=station.icao,
+            polarity=event.polarity,
+            recent_bias_obs=recent_bias_obs,
+            global_bias_obs=global_bias_obs,
+        )
+        no_impossible = [False] * len(event.buckets)
+        raw_mean_c = sum(raw_extremes_c) / len(raw_extremes_c)
+        raw_std_c = math.sqrt(
+            sum((x - raw_mean_c) ** 2 for x in raw_extremes_c) / max(1, len(raw_extremes_c))
+        )
+
+        if self.distribution_mode == "student_t_cdf":
+            rp_key = region_polarity_key(station, event.polarity)
+            nwp_w = self.regional_nwp_weights.get(rp_key, (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0))
+            if self.use_regional_nwp_weights:
+                w_mean_c, im_var_c, raw_mean_c = compute_weighted_nwp_mean_and_var(
+                    ensemble=ensemble,
+                    day_indices=day_indices,
+                    polarity=event.polarity,
+                    raw_extremes_c=raw_extremes_c,
+                    weights=nwp_w,
+                )
+            else:
+                w_mean_c = raw_mean_c
+                im_var_c = raw_std_c * raw_std_c
+
+            c0, c1 = self.regional_het_var.get(rp_key, (1.0, 0.2))
+            het_std_c = max(0.35, math.sqrt(max(0.05, c0 + c1 * im_var_c)))
+
+            bias_hl = self.bias_half_life_days if self.bias_half_life_days is not None else 14.0
+            scale_hl = self.scale_half_life_days if self.scale_half_life_days is not None else 21.0
+            bias_c = compute_ewma_station_bias(
+                recent_bias_obs=eff_recent_bias,
+                global_bias_obs=eff_global_bias,
+                event_local_date=event.local_date,
+                decision_time=decision_time,
+                window_days=self.bias_window_days,
+                half_life_days=bias_hl,
+                strict_temporal=strict_temporal,
+            )
+            sigma_mult = compute_ewma_t_mle_scale(
+                recent_bias_obs=eff_recent_bias,
+                global_bias_obs=eff_global_bias,
+                station_bias_c=bias_c,
+                het_std_fallback_c=het_std_c,
+                event_local_date=event.local_date,
+                decision_time=decision_time,
+                nu=self.student_t_df,
+                window_days=self.bias_window_days,
+                half_life_days=scale_hl,
+                strict_temporal=strict_temporal,
+            )
+            sigma_c = max(0.35, het_std_c * sigma_mult)
+            anchor_shift_c = self._compute_external_mos_anchor_shift(
+                ensemble=ensemble,
+                polarity=event.polarity,
+                emos_mean_c=w_mean_c + bias_c,
+                emos_std_c=sigma_c,
+            )
+            mu_c = w_mean_c + bias_c + anchor_shift_c
+
+            bounds_c = [
+                bucket_effective_bounds_c(b, remark_tenths_enabled=event.remark_tenths_enabled)
+                for b in event.buckets
+            ]
+            bias_probs = map_student_t_cdf_to_probabilities(
+                mu_c=mu_c,
+                sigma_c=sigma_c,
+                nu=self.student_t_df,
+                bounds_c=bounds_c,
+                impossible_mask=no_impossible,
+            )
+            traj_scale = max(0.5, min(3.0, sigma_c / max(raw_std_c, 0.35)))
+            bias_trajectories = self.calibrate_day_trajectories(
+                day_trajectories,
+                bias_c=(mu_c - raw_mean_c),
+                scale=traj_scale,
+            )
+            bias_extremes_c = [
+                max(traj) if event.polarity == Polarity.HIGHEST else min(traj)
+                for traj in bias_trajectories
+            ]
+            nu = self.student_t_df
+            scale_t = sigma_c * math.sqrt((nu - 2.0) / nu) if nu > 2.0 else sigma_c
+            t_q90 = float(stats.t.ppf(0.90, nu))
+            return PremarketLayer2State(
+                raw_mean_c=raw_mean_c,
+                raw_std_c=raw_std_c,
+                forecast_ref_c=w_mean_c,
+                forecast_ref_std_c=het_std_c,
+                bias_c=bias_c,
+                scale=sigma_mult,
+                mu_c=mu_c,
+                sigma_c=sigma_c,
+                p10_c=mu_c - scale_t * t_q90,
+                p50_c=mu_c,
+                p90_c=mu_c + scale_t * t_q90,
+                student_t_nu=nu,
+                student_t_scale=scale_t,
+                bias_probs=bias_probs,
+                bias_trajectories=bias_trajectories,
+                bias_extremes_c=bias_extremes_c,
+            )
+
+        bias_c, scale = self._compute_station_bias(
+            recent_bias_obs=eff_recent_bias,
+            event_local_date=event.local_date,
+            decision_time=decision_time,
+            raw_extremes_c=raw_extremes_c,
+            strict_temporal=strict_temporal,
+            global_bias_obs=eff_global_bias,
+        )
+        anchor_shift_c = self._compute_external_mos_anchor_shift(
+            ensemble=ensemble,
+            polarity=event.polarity,
+            emos_mean_c=raw_mean_c + bias_c,
+            emos_std_c=max(0.35, raw_std_c * scale),
+        )
+        bias_trajectories = self.calibrate_day_trajectories(
+            day_trajectories,
+            bias_c=bias_c + anchor_shift_c,
+            scale=scale,
+        )
+        bias_extremes_c = [
+            max(traj) if event.polarity == Polarity.HIGHEST else min(traj)
+            for traj in bias_trajectories
+        ]
+        bias_probs = map_extremes_c_to_probabilities(
+            bias_extremes_c,
+            event.buckets,
+            no_impossible,
+            remark_tenths_enabled=event.remark_tenths_enabled,
+            smoothing_alpha=self.smoothing_alpha,
+        )
+        cal_arr = np.asarray(bias_extremes_c, dtype=np.float64)
+        p10_c, p50_c, p90_c = (float(v) for v in np.percentile(cal_arr, (10, 50, 90)))
+        return PremarketLayer2State(
+            raw_mean_c=raw_mean_c,
+            raw_std_c=raw_std_c,
+            forecast_ref_c=raw_mean_c,
+            forecast_ref_std_c=raw_std_c,
+            bias_c=bias_c,
+            scale=scale,
+            mu_c=raw_mean_c + bias_c + anchor_shift_c,
+            sigma_c=max(0.35, raw_std_c * scale),
+            p10_c=p10_c,
+            p50_c=p50_c,
+            p90_c=p90_c,
+            student_t_nu=None,
+            student_t_scale=None,
+            bias_probs=bias_probs,
+            bias_trajectories=bias_trajectories,
+            bias_extremes_c=bias_extremes_c,
+        )
+
     def compute_probabilities(
         self,
         station: Station,
@@ -823,48 +1165,59 @@ class EnsembleProbabilityEngine:
         )
 
         # Layer 2: Hierarchical rolling Station Bias mean offset, dispersion scaling & external $0 MOS anchor
-        bias_c, scale = self._compute_station_bias(
-            recent_bias_obs=recent_bias_obs,
-            event_local_date=event.local_date,
-            decision_time=decision_time,
-            raw_extremes_c=raw_extremes_c,
-            strict_temporal=strict_temporal,
-            global_bias_obs=global_bias_obs,
-        )
-        anchor_shift_c = self._compute_external_mos_anchor_shift(
-            ensemble=ensemble,
-            polarity=event.polarity,
-            emos_mean_c=(sum(raw_extremes_c) / len(raw_extremes_c)) + bias_c,
-        )
-        bias_trajectories = self.calibrate_day_trajectories(
-            day_trajectories,
-            bias_c=bias_c + anchor_shift_c,
-            scale=scale,
-        )
-        bias_extremes_c = [
-            max(traj) if event.polarity == Polarity.HIGHEST else min(traj)
-            for traj in bias_trajectories
-        ]
-        bias_probs = map_extremes_c_to_probabilities(
-            bias_extremes_c,
-            event.buckets,
-            no_impossible,
-            remark_tenths_enabled=event.remark_tenths_enabled,
-            smoothing_alpha=self.smoothing_alpha,
-        )
-
-        # Layer 3: Intraday Routine METAR conditioning
-        intraday_probs, impossible_mask = self._apply_intraday_layer(
+        layer2 = self.evaluate_premarket_layer2(
             station=station,
             event=event,
-            day_timestamps=day_timestamps,
-            bias_trajectories=bias_trajectories,
-            bias_extremes_c=bias_extremes_c,
-            intraday_metars=intraday_metars,
-            station_tz=station_tz,
+            ensemble=ensemble,
+            day_indices=day_indices,
+            day_trajectories=day_trajectories,
+            raw_extremes_c=raw_extremes_c,
             decision_time=decision_time,
+            recent_bias_obs=recent_bias_obs,
+            global_bias_obs=global_bias_obs,
             strict_temporal=strict_temporal,
         )
+        bias_probs = layer2.bias_probs
+        bias_trajectories = layer2.bias_trajectories
+        bias_extremes_c = layer2.bias_extremes_c
+
+        # Layer 3: Intraday Routine METAR conditioning (preserve exact Student-t CDF on Premarket)
+        if self.distribution_mode == "student_t_cdf":
+            valid_intraday = self._filter_valid_intraday_metars(
+                intraday_metars=intraday_metars,
+                station_icao=station.icao,
+                local_date=event.local_date,
+                station_tz=station_tz,
+                decision_time=decision_time,
+                strict_temporal=strict_temporal,
+            )
+            if not valid_intraday:
+                intraday_probs = list(bias_probs)
+                impossible_mask = no_impossible
+            else:
+                intraday_probs, impossible_mask = self._apply_intraday_layer(
+                    station=station,
+                    event=event,
+                    day_timestamps=day_timestamps,
+                    bias_trajectories=bias_trajectories,
+                    bias_extremes_c=bias_extremes_c,
+                    intraday_metars=valid_intraday,
+                    station_tz=station_tz,
+                    decision_time=decision_time,
+                    strict_temporal=strict_temporal,
+                )
+        else:
+            intraday_probs, impossible_mask = self._apply_intraday_layer(
+                station=station,
+                event=event,
+                day_timestamps=day_timestamps,
+                bias_trajectories=bias_trajectories,
+                bias_extremes_c=bias_extremes_c,
+                intraday_metars=intraday_metars,
+                station_tz=station_tz,
+                decision_time=decision_time,
+                strict_temporal=strict_temporal,
+            )
 
         bucket_records = [
             BucketFairProbability(

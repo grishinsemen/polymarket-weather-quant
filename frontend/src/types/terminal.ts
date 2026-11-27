@@ -206,6 +206,16 @@ export interface ScreenerRow {
   open_positions_count: number;
 }
 
+export interface TailCalibrationBin {
+  label: string;
+  bin_lower: number;
+  bin_upper: number;
+  count: number;
+  mean_prob: number;
+  empirical_rate: number;
+  abs_error: number;
+}
+
 export interface BrainSliceMetrics {
   label: string;
   sample_count: number;
@@ -218,6 +228,10 @@ export interface BrainSliceMetrics {
   model_tail_brier: number | null;
   model_tail_ece: number | null;
   tail_bucket_count: number;
+  tail_bins?: TailCalibrationBin[];
+  pit_histogram?: number[];
+  pit_mean?: number | null;
+  pit_std?: number | null;
   market_brier: number | null;
   market_log_loss: number | null;
   market_rps: number | null;
@@ -354,6 +368,7 @@ export interface StationCalibrationReport {
 
 export interface CalibrationEvaluationReport {
   generated_at_utc: string;
+  model_version?: string;
   tail_price_threshold: number;
   overall_raw: CalibrationMetricsSummary;
   overall_calibrated: CalibrationMetricsSummary;

@@ -272,3 +272,84 @@ def test_parquet_dataset_builder_populates_24h_dynamics_and_mos_anchors() -> Non
     assert feats["prior_diurnal_range_c"] == pytest.approx(9.0)
     assert feats["pressure_msl_tendency_24h"] == pytest.approx(-6.0)
     assert feats["mosmix_extreme_c"] == pytest.approx(15.8)
+
+
+def test_previous_runs_utc_boundary_preserves_full_24h_local_day_for_americas_and_nzwn() -> None:
+    """KDEN (UTC-6/7) afternoon/evening crosses UTC midnight and NZWN (UTC+13) precedes 08Z ECMWF;
+    both must stitch day1+day2 from strictly pre-decision runs without truncating daytime peaks."""
+    import math
+    from weather_quant.feeds.previous_runs import parse_previous_runs_payload
+    from weather_quant.ml.dataset_builder import build_mos_samples_from_history
+
+    # 1) KDEN local day 2026-10-17 = 2026-10-17 06:00Z .. 2026-10-18 05:00Z
+    kden = get_station("KDEN")
+    assert kden is not None
+    start_kden = datetime(2026, 10, 17, 6, 0, tzinfo=timezone.utc)
+    times_kden = [(start_kden + timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M") for h in range(24)]
+    # Diurnal curve peaking at local 15:00 (h=15 -> 21:00Z) and warm at 18:00 (h=18 -> 00:00Z next UTC day!)
+    # Put peak at h=18 (local 18:00, which is 2026-10-18T00:00Z!) to prove cross-midnight hours survive
+    temps_d1 = [5.0 + (20.0 if h == 18 else (12.0 if h == 14 else 0.0)) for h in range(24)]
+    temps_d2 = [5.0 + (19.0 if h == 18 else (11.0 if h == 14 else 0.0)) for h in range(24)]
+    payload_kden = {
+        "hourly": {
+            "time": times_kden,
+            "temperature_2m_previous_day1_ecmwf_ifs025": temps_d1,
+            "temperature_2m_previous_day2_ecmwf_ifs025": temps_d2,
+        }
+    }
+    pts_kden = parse_previous_runs_payload(
+        payload_kden, station=kden, models=("ecmwf_ifs025",), previous_day=1
+    )
+    assert len(pts_kden) == 24
+    # Hours 0..17 (2026-10-17 UTC) use day1 (init 2026-10-16 00Z -> avail 08Z)
+    # Hours 18..23 (2026-10-18 UTC) switch to day2 (init 2026-10-16 00Z -> avail 08Z < cutoff 2026-10-17 00Z)
+    assert all(p.available_at_utc == datetime(2026, 10, 16, 8, 0, tzinfo=timezone.utc) for p in pts_kden)
+    metars_kden = [
+        MetarObservation(
+            station_icao="KDEN",
+            raw_report="METAR KDEN 172153Z 18008KT 10SM FEW080 24/02 A3000 RMK T02400020",
+            observed_at_utc=datetime(2026, 10, 17, 21, 53, tzinfo=timezone.utc),
+            ingested_at_utc=datetime(2026, 10, 17, 21, 55, tzinfo=timezone.utc),
+            temp_c=24.0,
+            whole_temp_c=24,
+            remark_tenths_c=24.0,
+            has_remark_tenths=True,
+            is_routine=True,
+        )
+    ]
+    samples_kden = build_mos_samples_from_history(
+        station=kden,
+        forecasts=pts_kden,
+        routine_metars=metars_kden,
+        polarity=Polarity.HIGHEST,
+        min_forecast_hours_per_model=20,
+    )
+    assert len(samples_kden) == 1
+    # Peak must come from h=18 (cross-midnight day2 value = 24.0C), NOT truncated to 00:00..05:00!
+    assert samples_kden[0].features["ecmwf_extreme_c"] == pytest.approx(24.0)
+    peak_hr = (math.degrees(math.atan2(samples_kden[0].features["peak_hour_sin"], samples_kden[0].features["peak_hour_cos"])) % 360.0) / 15.0
+    assert peak_hr == pytest.approx(18.0, abs=0.1)
+
+    # 2) NZWN (UTC+13) local day 2026-11-26 = 2026-11-25 11:00Z .. 2026-11-26 10:00Z
+    # Premarket cutoff = 2026-11-25 05:00Z; ECMWF day1 for 2026-11-26 02:00Z (15:00 local) publishes at
+    # 2026-11-25 08:00Z (> 05:00Z), so parser must automatically select day2 (avail 2026-11-24 08:00Z).
+    nzwn = get_station("NZWN")
+    assert nzwn is not None
+    start_nz = datetime(2026, 11, 25, 11, 0, tzinfo=timezone.utc)
+    times_nz = [(start_nz + timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M") for h in range(24)]
+    temps_nz = [12.0 + (7.0 if h == 14 else 0.0) for h in range(24)]
+    payload_nz = {
+        "hourly": {
+            "time": times_nz,
+            "temperature_2m_previous_day1_ecmwf_ifs025": [t + 5.0 for t in temps_nz],
+            "temperature_2m_previous_day2_ecmwf_ifs025": temps_nz,
+        }
+    }
+    pts_nz = parse_previous_runs_payload(
+        payload_nz, station=nzwn, models=("ecmwf_ifs025",), previous_day=1
+    )
+    assert len(pts_nz) == 24
+    cutoff_nz = datetime(2026, 11, 25, 5, 0, tzinfo=timezone.utc)
+    assert all(p.available_at_utc < cutoff_nz for p in pts_nz)
+    # Local 14:00 (h=14 -> 2026-11-26 01:00Z) must come from day2 (19.0C), not future day1 (24.0C)
+    assert pts_nz[14].temperature_2m_c == pytest.approx(19.0)

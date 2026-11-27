@@ -474,6 +474,7 @@ def build_mos_sample(
     target_temp_c: float | None = None,
     target_observed_at_utc: datetime | None = None,
     remark_tenths_enabled: bool = True,
+    min_hours_per_model: int = 1,
 ) -> MosDatasetSample:
     """Build a strictly leak-free MosDatasetSample validating ts < decision_time_utc."""
     decision_utc = _ensure_utc(decision_time_utc)
@@ -513,9 +514,20 @@ def build_mos_sample(
         if 0 < age_days <= 45:
             bias_errors.append(bias.observed_extreme_c - bias.forecast_extreme_c)
 
-    by_model: dict[str, list[HistoricalForecastPoint]] = {}
+    by_model_raw: dict[str, list[HistoricalForecastPoint]] = {}
     for pt in day_forecasts:
-        by_model.setdefault(pt.model, []).append(pt)
+        by_model_raw.setdefault(pt.model, []).append(pt)
+
+    min_hrs = max(1, int(min_hours_per_model))
+    by_model: dict[str, list[HistoricalForecastPoint]] = {
+        m: pts for m, pts in by_model_raw.items() if len(pts) >= min_hrs
+    }
+    if not by_model:
+        raise ValueError(
+            f"Incomplete forecast day for {target_icao} on {local_date.isoformat()}: "
+            f"no model has >= {min_hrs} valid hours (got { {m: len(p) for m, p in by_model_raw.items()} })."
+        )
+    complete_forecasts = [pt for pts in by_model.values() for pt in pts]
 
     model_extremes_c: dict[str, float] = {}
     peak_hours: list[float] = []
@@ -530,21 +542,24 @@ def build_mos_sample(
         peak_hours.append(local_dt.hour + local_dt.minute / 60.0)
 
     all_extremes = list(model_extremes_c.values())
-    wind_speeds = [p.wind_speed_10m for p in day_forecasts if p.wind_speed_10m is not None]
-    wind_dirs = [p.wind_direction_10m for p in day_forecasts if p.wind_direction_10m is not None]
-    clouds = [p.cloud_cover for p in day_forecasts if p.cloud_cover is not None]
-    rhs = [p.relative_humidity_2m for p in day_forecasts if p.relative_humidity_2m is not None]
+    wind_speeds = [p.wind_speed_10m for p in complete_forecasts if p.wind_speed_10m is not None]
+    wind_dirs = [p.wind_direction_10m for p in complete_forecasts if p.wind_direction_10m is not None]
+    clouds = [p.cloud_cover for p in complete_forecasts if p.cloud_cover is not None]
+    rhs = [p.relative_humidity_2m for p in complete_forecasts if p.relative_humidity_2m is not None]
+    # Compute 24h barometric tendency from hourly mean pressure across models (ordered by time)
+    pres_by_ts: dict[datetime, list[float]] = {}
+    for pt in complete_forecasts:
+        if pt.pressure_msl is not None:
+            pres_by_ts.setdefault(_ensure_utc(pt.valid_at_utc), []).append(float(pt.pressure_msl))
     pressures = [
-        p.pressure_msl
-        for p in sorted(day_forecasts, key=lambda pt: _ensure_utc(pt.valid_at_utc))
-        if p.pressure_msl is not None
+        _mean(pres_by_ts[ts]) for ts in sorted(pres_by_ts)
     ]
 
     rolling_bias_c = _mean(bias_errors, 0.0)
     prior_obs_temp_c = valid_obs[-1].temp_c if valid_obs else _mean(all_extremes)
     delta_obs_24h, prior_diurnal_range = _compute_prior_obs_dynamics(valid_obs, local_date, station_tz)
     pressure_tendency = _compute_pressure_tendency(pressures)
-    latest_avail = max(_ensure_utc(p.available_at_utc) for p in day_forecasts)
+    latest_avail = max(_ensure_utc(p.available_at_utc) for p in complete_forecasts)
 
     features, ens_mean, ens_std = _compute_feature_dict(
         station=station,
@@ -588,6 +603,8 @@ def build_mos_samples_from_history(
     polarity: Polarity = Polarity.HIGHEST,
     remark_tenths_enabled: bool = True,
     decision_hour_utc_offset_hours: int = -6,
+    min_forecast_hours_per_model: int = 1,
+    min_metars_per_day: int = 1,
 ) -> list[MosDatasetSample]:
     """Assemble chronological supervised MosDatasetSamples from historical forecasts and Routine METARs."""
     station_tz = ZoneInfo(station.timezone)
@@ -602,16 +619,44 @@ def build_mos_samples_from_history(
         local_d = _ensure_utc(obs.observed_at_utc).astimezone(station_tz).date()
         obs_by_date.setdefault(local_d, []).append(obs)
 
+    # Pre-index forecasts by local date for O(N) assembly on 365d+ multi-station histories
+    forecasts_by_date: dict[date, list[HistoricalForecastPoint]] = {}
+    for f in forecasts:
+        if f.station_icao.strip().upper() != target_icao:
+            continue
+        f_local_d = _ensure_utc(f.valid_at_utc).astimezone(station_tz).date()
+        forecasts_by_date.setdefault(f_local_d, []).append(f)
+
+    # Pre-sort routine METARs once so prior_observations slicing is O(log N) / linear pointer
+    station_metars = sorted(
+        (
+            o
+            for o in routine_metars
+            if o.is_routine
+            and not o.raw_report.strip().upper().startswith("SPECI")
+            and o.station_icao.strip().upper() == target_icao
+        ),
+        key=lambda o: _ensure_utc(o.observed_at_utc),
+    )
+    metar_ptr = 0
+
     samples: list[MosDatasetSample] = []
     history_bias: list[DailyBiasObservation] = []
     sorted_dates = sorted(obs_by_date.keys())
+    min_obs = max(1, int(min_metars_per_day))
 
     for local_d in sorted_dates:
+        day_obs = obs_by_date[local_d]
+        if len(day_obs) < min_obs:
+            continue
+
         # Decision time strictly prior to local day start (premarket decision point)
         local_midnight = datetime(local_d.year, local_d.month, local_d.day, 0, 0, tzinfo=station_tz)
         decision_utc = local_midnight.astimezone(timezone.utc) + timedelta(hours=decision_hour_utc_offset_hours)
 
-        day_obs = obs_by_date[local_d]
+        while metar_ptr < len(station_metars) and _ensure_utc(station_metars[metar_ptr].observed_at_utc) < decision_utc:
+            metar_ptr += 1
+
         if remark_tenths_enabled:
             target_obs = (
                 max(day_obs, key=lambda o: o.temp_c)
@@ -628,12 +673,15 @@ def build_mos_samples_from_history(
             target_val = float(target_obs.whole_temp_c)
 
         eligible_forecasts = [
-            f for f in forecasts
+            f
+            for f in forecasts_by_date.get(local_d, ())
             if _ensure_utc(f.available_at_utc) < decision_utc
         ]
+        # Keep only the recent 3 days of prior observations needed for prior_obs_temp_c & 24h dynamics
+        prior_cutoff = decision_utc - timedelta(days=4)
         prior_obs = [
-            o for o in routine_metars
-            if _ensure_utc(o.observed_at_utc) < decision_utc
+            o for o in station_metars[:metar_ptr]
+            if _ensure_utc(o.observed_at_utc) >= prior_cutoff
         ]
         try:
             sample = build_mos_sample(
@@ -647,6 +695,7 @@ def build_mos_samples_from_history(
                 target_temp_c=target_val,
                 target_observed_at_utc=target_obs.observed_at_utc,
                 remark_tenths_enabled=remark_tenths_enabled,
+                min_hours_per_model=min_forecast_hours_per_model,
             )
         except ValueError:
             continue

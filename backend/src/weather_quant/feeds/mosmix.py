@@ -28,6 +28,7 @@ ICAO_TO_DWD_STATION_ID: dict[str, str] = {
     "LFPG": "07157",
     "EHAM": "06240",
     "RKSI": "47110",
+    "RKPK": "47153",
     "RJTT": "47671",
     "LEMD": "08221",
     "LIRF": "16242",

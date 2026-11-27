@@ -835,7 +835,8 @@ export function ExperimentLabPanel({
                                         <th className="py-1 px-1.5 text-right">ΔLogLoss</th>
                                         <th className="py-1 px-1.5 text-right">RPS (ΔRPS)</th>
                                         <th className="py-1 px-1.5 text-right">Brier (BSS)</th>
-                                        <th className="py-1 pl-1.5 text-right">Tail ECE</th>
+                                        <th className="py-1 px-1.5 text-right">Tail ECE</th>
+                                        <th className="py-1 pl-1.5 text-right">PIT (μ/σ)</th>
                                       </tr>
                                     </thead>
                                     <tbody>
@@ -900,9 +901,41 @@ export function ExperimentLabPanel({
                                               </span>
                                             )}
                                           </td>
-                                          <td className="py-1.5 pl-1.5 text-right text-slate-300 whitespace-nowrap">
+                                          <td
+                                            className="py-1.5 px-1.5 text-right text-slate-300 whitespace-nowrap"
+                                            title={
+                                              slice.tail_bins && slice.tail_bins.length > 0
+                                                ? slice.tail_bins
+                                                    .map(
+                                                      (b) =>
+                                                        `${b.label}: p=${(b.mean_prob * 100).toFixed(1)}% vs y=${(b.empirical_rate * 100).toFixed(1)}% (n=${b.count})`
+                                                    )
+                                                    .join(" | ")
+                                                : `Active tail buckets: ${slice.tail_bucket_count}`
+                                            }
+                                          >
                                             {slice.model_tail_ece !== null
                                               ? `${(slice.model_tail_ece * 100).toFixed(1)}%`
+                                              : "—"}
+                                            {slice.tail_bucket_count > 0 && (
+                                              <span className="ml-1 text-[10px] text-slate-500">
+                                                ({slice.tail_bucket_count})
+                                              </span>
+                                            )}
+                                          </td>
+                                          <td
+                                            className="py-1.5 pl-1.5 text-right text-slate-300 whitespace-nowrap"
+                                            title={
+                                              slice.pit_histogram && slice.pit_histogram.length > 0
+                                                ? `PIT 10-bin: [${slice.pit_histogram.map((v) => v.toFixed(1)).join(", ")}] (ideal μ≈0.50, σ≈0.29)`
+                                                : "Non-randomized discrete PIT (ideal μ≈0.50, σ≈0.29)"
+                                            }
+                                          >
+                                            {slice.pit_mean !== undefined &&
+                                            slice.pit_mean !== null &&
+                                            slice.pit_std !== undefined &&
+                                            slice.pit_std !== null
+                                              ? `${slice.pit_mean.toFixed(2)}/${slice.pit_std.toFixed(2)}`
                                               : "—"}
                                           </td>
                                         </tr>
@@ -1281,11 +1314,19 @@ export function ExperimentLabPanel({
           >
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div>
-                <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-200">
-                  Model Calibration Audit (Raw vs EMOS)
-                </h3>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h3 className="text-[11px] font-semibold uppercase tracking-wider text-slate-200">
+                    Model Calibration Audit (Raw vs EMOS)
+                  </h3>
+                  <span
+                    data-testid="calibration-audited-model"
+                    className="rounded border border-sky-700/70 bg-sky-950/60 px-1.5 py-0.5 text-[10px] font-mono-tabular text-sky-300"
+                  >
+                    {calibrationReport?.model_version ?? activeModelVersion}
+                  </span>
+                </div>
                 <p className="text-[10px] text-slate-400 mt-0.5">
-                  On-demand walk-forward check of forecast accuracy (strictly prior days)
+                  On-demand walk-forward check of active model ({calibrationReport?.model_version ?? activeModelVersion}) vs raw ensemble (strictly prior days)
                 </p>
               </div>
               <button

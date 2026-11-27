@@ -33,11 +33,27 @@ from weather_quant.domain.models import (
 
 _EPS = 1e-9
 _PROB_CLIP_EPS = 1e-4
+_TAIL_MIN_ACTIVE_PROB = 0.01
+_TAIL_EXTREME_LOW_THRESHOLD = 0.05
 _TAIL_LOW_THRESHOLD = 0.15
 _TAIL_HIGH_THRESHOLD = 0.85
+_TAIL_MAX_ACTIVE_PROB = 0.99
+_PIT_BINS = 10
 _MAX_GATE_DD_PCT = 20.0
 _MIN_GATE_MARKOUT = -0.02
 _MIN_GATE_FILL_RATE = 0.10
+
+
+class TailCalibrationBin(BaseModel):
+    """Single active tail probability calibration bin (excludes dead/impossible mass)."""
+
+    label: str
+    bin_lower: float
+    bin_upper: float
+    count: int
+    mean_prob: float
+    empirical_rate: float
+    abs_error: float
 
 
 class BrainSliceMetrics(BaseModel):
@@ -55,6 +71,10 @@ class BrainSliceMetrics(BaseModel):
     model_tail_brier: float | None = None
     model_tail_ece: float | None = None
     tail_bucket_count: int = 0
+    tail_bins: list[TailCalibrationBin] = Field(default_factory=list)
+    pit_histogram: list[float] = Field(default_factory=list)
+    pit_mean: float | None = None
+    pit_std: float | None = None
 
     market_brier: float | None = None
     market_log_loss: float | None = None
@@ -285,8 +305,14 @@ def compute_brain_slice_metrics(
     paired_model_rpss: list[float] = []
 
     tail_sq_errors: list[float] = []
-    low_tail_pairs: list[tuple[float, float]] = []
-    high_tail_pairs: list[tuple[float, float]] = []
+    tail_bin_specs: tuple[tuple[str, float, float], ...] = (
+        ("1-5%", _TAIL_MIN_ACTIVE_PROB, _TAIL_EXTREME_LOW_THRESHOLD),
+        ("5-15%", _TAIL_EXTREME_LOW_THRESHOLD, _TAIL_LOW_THRESHOLD),
+        ("85-99%", _TAIL_HIGH_THRESHOLD, _TAIL_MAX_ACTIVE_PROB),
+    )
+    tail_bin_pairs: dict[str, list[tuple[float, float]]] = {label_k: [] for label_k, _, _ in tail_bin_specs}
+    pit_hist = [0.0] * _PIT_BINS
+    pit_mids: list[float] = []
 
     for obs in filtered:
         ordered = _ordered_buckets(obs.event)
@@ -302,7 +328,9 @@ def compute_brain_slice_metrics(
             continue
 
         prob_map = {b.bucket_id: float(b.fair_probability) for b in obs.prob_snapshot.buckets}
+        impossible_map = {b.bucket_id: bool(b.is_impossible) for b in obs.prob_snapshot.buckets}
         raw_p = [prob_map.get(b.bucket_id, 0.0) for b in ordered]
+        raw_imp = [impossible_map.get(b.bucket_id, False) for b in ordered]
         p = _clip_and_normalize(raw_p, eps=_PROB_CLIP_EPS)
 
         m_brier = sum((p_i - (1.0 if i == ordered_win_idx else 0.0)) ** 2 for i, p_i in enumerate(p))
@@ -313,14 +341,38 @@ def compute_brain_slice_metrics(
         model_lls.append(m_ll)
         model_rpss.append(m_rps)
 
+        # Non-randomized discrete PIT (Czado, Gneiting & Held, 2009) across ordered outcome buckets
+        cdf_lo = sum(p[:ordered_win_idx])
+        p_win = p[ordered_win_idx]
+        cdf_hi = min(1.0, cdf_lo + p_win)
+        mid_pit = cdf_lo + 0.5 * p_win
+        pit_mids.append(mid_pit)
+        width = cdf_hi - cdf_lo
+        if width > _EPS:
+            for b_idx in range(_PIT_BINS):
+                b_lo = b_idx / _PIT_BINS
+                b_hi = (b_idx + 1) / _PIT_BINS
+                overlap = max(0.0, min(cdf_hi, b_hi) - max(cdf_lo, b_lo))
+                if overlap > 0.0:
+                    pit_hist[b_idx] += overlap / width
+        else:
+            b_idx = min(_PIT_BINS - 1, max(0, int(mid_pit * _PIT_BINS)))
+            pit_hist[b_idx] += 1.0
+
+        # Active tail calibration: exclude impossible buckets and dead mass (<1% or >99%)
         for i, p_i in enumerate(raw_p):
+            if raw_imp[i]:
+                continue
             y_i = 1.0 if i == ordered_win_idx else 0.0
-            if p_i < _TAIL_LOW_THRESHOLD:
+            if _TAIL_MIN_ACTIVE_PROB <= p_i < _TAIL_EXTREME_LOW_THRESHOLD:
                 tail_sq_errors.append((p_i - y_i) ** 2)
-                low_tail_pairs.append((p_i, y_i))
-            elif p_i > _TAIL_HIGH_THRESHOLD:
+                tail_bin_pairs["1-5%"].append((p_i, y_i))
+            elif _TAIL_EXTREME_LOW_THRESHOLD <= p_i < _TAIL_LOW_THRESHOLD:
                 tail_sq_errors.append((p_i - y_i) ** 2)
-                high_tail_pairs.append((p_i, y_i))
+                tail_bin_pairs["5-15%"].append((p_i, y_i))
+            elif _TAIL_HIGH_THRESHOLD < p_i <= _TAIL_MAX_ACTIVE_PROB:
+                tail_sq_errors.append((p_i - y_i) ** 2)
+                tail_bin_pairs["85-99%"].append((p_i, y_i))
 
         raw_q = extract_market_probs(obs.event, obs.books)
         if raw_q is not None and len(raw_q) == len(p):
@@ -351,17 +403,35 @@ def compute_brain_slice_metrics(
     avg_m_rps = sum(model_rpss) / n
 
     tail_brier = (sum(tail_sq_errors) / len(tail_sq_errors)) if tail_sq_errors else None
-    tail_ece: float | None = None
-    tail_total = len(low_tail_pairs) + len(high_tail_pairs)
-    if tail_total > 0:
-        weighted_err = 0.0
-        for grp in (low_tail_pairs, high_tail_pairs):
-            if not grp:
-                continue
-            mean_p = sum(x[0] for x in grp) / len(grp)
-            mean_y = sum(x[1] for x in grp) / len(grp)
-            weighted_err += len(grp) * abs(mean_p - mean_y)
-        tail_ece = weighted_err / tail_total
+    tail_bins: list[TailCalibrationBin] = []
+    tail_total = 0
+    weighted_err = 0.0
+    for bin_label, b_lo, b_hi in tail_bin_specs:
+        grp = tail_bin_pairs[bin_label]
+        if not grp:
+            continue
+        cnt = len(grp)
+        mean_p = sum(x[0] for x in grp) / cnt
+        mean_y = sum(x[1] for x in grp) / cnt
+        err = abs(mean_p - mean_y)
+        tail_total += cnt
+        weighted_err += cnt * err
+        tail_bins.append(
+            TailCalibrationBin(
+                label=bin_label,
+                bin_lower=b_lo,
+                bin_upper=b_hi,
+                count=cnt,
+                mean_prob=round(mean_p, 6),
+                empirical_rate=round(mean_y, 6),
+                abs_error=round(err, 6),
+            )
+        )
+    tail_ece: float | None = (weighted_err / tail_total) if tail_total > 0 else None
+
+    pit_mean = sum(pit_mids) / len(pit_mids)
+    pit_std = math.sqrt(sum((u - pit_mean) ** 2 for u in pit_mids) / len(pit_mids))
+    pit_histogram = [round(x, 3) for x in pit_hist]
 
     m_cnt = len(mkt_briers)
     avg_q_brier: float | None = None
@@ -399,6 +469,10 @@ def compute_brain_slice_metrics(
         model_tail_brier=round(tail_brier, 6) if tail_brier is not None else None,
         model_tail_ece=round(tail_ece, 6) if tail_ece is not None else None,
         tail_bucket_count=tail_total,
+        tail_bins=tail_bins,
+        pit_histogram=pit_histogram,
+        pit_mean=round(pit_mean, 4),
+        pit_std=round(pit_std, 4),
         market_brier=round(avg_q_brier, 6) if avg_q_brier is not None else None,
         market_log_loss=round(avg_q_ll, 6) if avg_q_ll is not None else None,
         market_rps=round(avg_q_rps, 6) if avg_q_rps is not None else None,

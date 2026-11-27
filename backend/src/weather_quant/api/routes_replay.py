@@ -47,6 +47,7 @@ from weather_quant.ml.quantile_mos import load_mos_provider_for_version
 from weather_quant.probability.calibration import (
     CalibrationEvaluationReport,
     evaluate_calibration_walk_forward,
+    load_calibration_target,
     load_local_calibration_samples,
 )
 from weather_quant.probability.engine import (
@@ -144,6 +145,7 @@ class CalibrationAuditRequest(BaseModel):
     lookback_days: int = Field(default=45, ge=1, le=180)
     tail_price_threshold: float = Field(default=0.10, gt=0.0, lt=0.5)
     min_metars_per_day: int = Field(default=6, ge=1, le=24)
+    model_version: str | None = Field(default=None)
 
 
 class CalibrationAuditResponse(BaseModel):
@@ -1630,8 +1632,13 @@ async def trigger_calibration_audit(
             lookback_days=req.lookback_days,
             tail_price_threshold=req.tail_price_threshold,
             min_metars_per_day=req.min_metars_per_day,
+            model_version=req.model_version,
         )
     else:
+        resolved_model_version, cal_engine, mos_provider = await load_calibration_target(
+            db,
+            model_version=req.model_version,
+        )
         samples = await load_local_calibration_samples(
             db,
             archive_store,
@@ -1641,6 +1648,9 @@ async def trigger_calibration_audit(
         report = await asyncio.to_thread(
             evaluate_calibration_walk_forward,
             samples,
+            engine=cal_engine,
+            mos_provider=mos_provider,
+            model_version=resolved_model_version,
             tail_price_threshold=req.tail_price_threshold,
         )
     return CalibrationAuditResponse(report=report)

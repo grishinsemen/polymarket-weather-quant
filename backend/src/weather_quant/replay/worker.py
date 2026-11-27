@@ -21,6 +21,7 @@ from weather_quant.domain.clock import TemporalIntegrityError
 from weather_quant.probability.calibration import (
     CalibrationEvaluationReport,
     evaluate_calibration_walk_forward,
+    load_calibration_target,
     load_local_calibration_samples,
 )
 from weather_quant.replay.runner import (
@@ -99,6 +100,10 @@ async def _handle_payload(payload: dict[str, Any]) -> dict[str, Any]:
             return comparison.model_dump(mode="json")
 
         if op == "calibration_audit":
+            resolved_model_version, cal_engine, mos_provider = await load_calibration_target(
+                db,
+                model_version=payload.get("model_version"),
+            )
             samples = await load_local_calibration_samples(
                 db,
                 archive_store,
@@ -107,6 +112,9 @@ async def _handle_payload(payload: dict[str, Any]) -> dict[str, Any]:
             )
             report = evaluate_calibration_walk_forward(
                 samples,
+                engine=cal_engine,
+                mos_provider=mos_provider,
+                model_version=resolved_model_version,
                 tail_price_threshold=float(payload.get("tail_price_threshold", 0.10)),
             )
             return report.model_dump(mode="json")
@@ -259,6 +267,7 @@ async def calibration_audit_subprocess(
     lookback_days: int = 45,
     tail_price_threshold: float = 0.10,
     min_metars_per_day: int = 6,
+    model_version: str | None = None,
 ) -> CalibrationEvaluationReport:
     data = await run_lab_job_in_subprocess(
         {
@@ -268,6 +277,7 @@ async def calibration_audit_subprocess(
             "lookback_days": lookback_days,
             "tail_price_threshold": tail_price_threshold,
             "min_metars_per_day": min_metars_per_day,
+            "model_version": model_version,
         }
     )
     return CalibrationEvaluationReport.model_validate(data)
