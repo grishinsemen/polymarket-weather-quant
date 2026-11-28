@@ -865,4 +865,62 @@ async def test_settle_expired_events_settles_positions_and_expires_resting_order
         await db.close()
 
 
+def test_is_ml_mos_model_and_badge_exclude_analytical_emos() -> None:
+    """Analytical ``emos*`` models must not false-trigger the ``MOS ML`` badge/ML flag."""
+    from weather_quant.api.routes_replay import _model_badge
+    from weather_quant.ml.quantile_mos import is_ml_mos_model
+
+    now = datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc)
+    emos_rec = ModelVersionRecord(
+        model_version="emos-student-t-v2",
+        model_type="emos_student_t",
+        description="Analytical Student-t EMOS",
+        feature_schema_hash="emos-t7",
+        config_json={},
+        is_active=True,
+        created_at_utc=now,
+    )
+    baseline_rec = ModelVersionRecord(
+        model_version="ensemble-3layer-v1",
+        model_type="ensemble_3layer",
+        description="Baseline",
+        feature_schema_hash="v1",
+        config_json={},
+        is_active=False,
+        created_at_utc=now,
+    )
+    lgbm_rec = ModelVersionRecord(
+        model_version="mos-lgbm-v1",
+        model_type="quantile_lightgbm_mos",
+        description="LightGBM MOS",
+        feature_schema_hash="h2",
+        config_json={"covered_stations": ["EDDM", "LFPB"]},
+        is_active=False,
+        created_at_utc=now,
+    )
+    residual_rec = ModelVersionRecord(
+        model_version="mos-residual-120d-v1",
+        model_type="residual_lightgbm_mos",
+        description="Residual MOS",
+        feature_schema_hash="h3",
+        config_json={"covered_stations": ["KLGA"]},
+        is_active=False,
+        created_at_utc=now,
+    )
+
+    assert is_ml_mos_model(emos_rec) is False
+    assert is_ml_mos_model(baseline_rec) is False
+    assert is_ml_mos_model(lgbm_rec) is True
+    assert is_ml_mos_model(residual_rec) is True
+
+    for station_icao in ("EDDM", "LFPB", "EHAM", "KLGA"):
+        assert _model_badge(emos_rec, station_icao) == "3-Layer"
+        assert _model_badge(baseline_rec, station_icao) == "3-Layer"
+
+    assert _model_badge(lgbm_rec, "EDDM") == "MOS ML"
+    assert _model_badge(lgbm_rec, "EHAM") == "3-Layer"
+    assert _model_badge(residual_rec, "KLGA") == "MOS ML"
+    assert _model_badge(residual_rec, "EDDM") == "3-Layer"
+
+
 

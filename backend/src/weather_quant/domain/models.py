@@ -251,6 +251,7 @@ class FillRecord(BaseModel):
     fill_usd: float
     fee_usd: float = 0.0
     is_maker: bool = True
+    entry_midpoint: float | None = None
     expected_edge: float | None = None
     realized_edge: float | None = None
     model_version: str

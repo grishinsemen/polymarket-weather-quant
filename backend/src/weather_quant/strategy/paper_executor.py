@@ -102,6 +102,7 @@ class PaperExecutor:
         clv_horizons_minutes: tuple[int, ...] = DEFAULT_CLV_HORIZONS_MINUTES,
         min_limit_shares: float = 5.0,
         strict_maker_fills: bool = False,
+        stale_feed_seconds: float | None = None,
     ) -> None:
         self.db = db
         self.clock = clock
@@ -109,12 +110,24 @@ class PaperExecutor:
         self.clv_horizons_minutes = tuple(clv_horizons_minutes)
         self.min_limit_shares = float(min_limit_shares)
         self.strict_maker_fills = bool(strict_maker_fills)
+        self.stale_feed_seconds: float | None = (
+            float(stale_feed_seconds) if stale_feed_seconds is not None else None
+        )
         self._events: dict[str, WeatherEvent] = {}
         self._latest_books: dict[str, OrderBookSnapshot] = {}
         self._books_by_bucket: dict[tuple[str, str], OrderBookSnapshot] = {}
         self._last_consumed_sig: dict[str, tuple[Any, ...]] = {}
         self._captured_clv_keys: set[tuple[str, int]] = set()
         self._queue_ahead_shares: dict[str, float] = {}
+
+    def _is_book_stale(self, book: OrderBookSnapshot, now: datetime) -> bool:
+        """Return True when *book* is flagged stale or exceeds ``stale_feed_seconds``."""
+        if book.is_stale:
+            return True
+        if self.stale_feed_seconds is None:
+            return False
+        age_sec = (_ensure_utc(now) - _ensure_utc(book.ingested_at_utc)).total_seconds()
+        return age_sec > self.stale_feed_seconds + _EPS
 
     def register_event(self, event: WeatherEvent) -> None:
         """Register WeatherEvent metadata for fee calculation and Bucket labels."""
@@ -168,22 +181,34 @@ class PaperExecutor:
             await self.store.insert_order(rejected)
             return rejected
 
-        if order.post_only and book is not None and not book.is_stale and _would_cross(order, book):
+        book_fresh = book is not None and not self._is_book_stale(book, now)
+        if order.post_only and book_fresh and _would_cross(order, book):
+            rejected = order.model_copy(update={"status": "CANCELLED", "updated_at_utc": now})
+            await self.store.insert_order(rejected)
+            return rejected
+        if not order.post_only and not book_fresh:
             rejected = order.model_copy(update={"status": "CANCELLED", "updated_at_utc": now})
             await self.store.insert_order(rejected)
             return rejected
 
         await self.store.insert_order(order)
-        if self.strict_maker_fills and order.post_only and book is not None and not book.is_stale:
+        if self.strict_maker_fills and order.post_only and book_fresh:
+            assert book is not None
             same_side = book.bids if order.side == "BUY" else book.asks
             ahead = sum(lvl.size for lvl in same_side if abs(lvl.price - order.limit_price) <= _EPS)
             self._queue_ahead_shares[order.order_id] = float(ahead)
-        if not order.post_only and book is not None and not book.is_stale:
+        if not order.post_only:
+            assert book is not None
             fills = await self._evaluate_orders_against_book([order], book, now)
-            if fills:
-                filled_total = sum(f.fill_shares for f in fills)
-                new_status = "FILLED" if filled_total >= order.size_shares - _EPS else "PARTIAL"
-                return order.model_copy(update={"status": new_status, "updated_at_utc": now})
+            filled_total = sum(f.fill_shares for f in fills)
+            if filled_total >= order.size_shares - _EPS:
+                return order.model_copy(update={"status": "FILLED", "updated_at_utc": now})
+            # IOC/FAK semantics: unfilled taker remainder expires immediately and never rests.
+            final_status: Literal["EXPIRED", "CANCELLED"] = (
+                "EXPIRED" if filled_total > _EPS else "CANCELLED"
+            )
+            await self.store.set_order_status(order.order_id, final_status, now)
+            return order.model_copy(update={"status": final_status, "updated_at_utc": now})
         return order
 
     async def cancel_order(self, order_id: str) -> None:
@@ -238,7 +263,7 @@ class PaperExecutor:
             updated_at_utc=now,
         )
         await self.store.insert_order(order)
-        if book.is_stale:
+        if self._is_book_stale(book, now):
             return order, []
         fills = await self._evaluate_orders_against_book([order], book, now)
         filled_total = sum(f.fill_shares for f in fills)
@@ -254,10 +279,10 @@ class PaperExecutor:
         """Evaluate resting orders and post-fill CLV horizons against a live Book snapshot."""
         self._latest_books[book.token_id] = book
         self._books_by_bucket[(book.event_id, book.bucket_id)] = book
-        if book.is_stale:
+        now = self.clock.now()
+        if self._is_book_stale(book, now):
             return []
 
-        now = self.clock.now()
         resting = [
             o
             for o in await self.store.list_resting_orders(book.event_id)
@@ -271,17 +296,16 @@ class PaperExecutor:
         self, event_id: str, books: Iterable[OrderBookSnapshot]
     ) -> list[FillRecord]:
         """Batch-evaluate all Bucket books for one event with O(1) SQL roundtrips."""
+        now = self.clock.now()
         book_list = list(books)
         fresh: list[OrderBookSnapshot] = []
         for book in book_list:
             self._latest_books[book.token_id] = book
             self._books_by_bucket[(book.event_id, book.bucket_id)] = book
-            if not book.is_stale:
+            if not self._is_book_stale(book, now):
                 fresh.append(book)
         if not fresh:
             return []
-
-        now = self.clock.now()
         resting_all = await self.store.list_resting_orders(event_id)
         created_fills: list[FillRecord] = []
         if resting_all:
@@ -390,6 +414,7 @@ class PaperExecutor:
                     6,
                 )
 
+            eff_mid = _book_midpoint(eff_book)
             fill = FillRecord(
                 fill_id=f"fill-{uuid.uuid4().hex[:12]}",
                 order_id=order.order_id,
@@ -403,6 +428,7 @@ class PaperExecutor:
                 fill_usd=round(fill_price * fill_shares, 6),
                 fee_usd=fee_usd,
                 is_maker=is_maker,
+                entry_midpoint=round(eff_mid, 6) if eff_mid is not None else None,
                 expected_edge=order.expected_edge,
                 model_version=order.model_version,
                 strategy_version=order.strategy_version,
@@ -485,7 +511,7 @@ class PaperExecutor:
         captured: list[ClvSnapshot] = []
         for fill in fills:
             book = books.get(fill.bucket_id)
-            if book is None or book.is_stale:
+            if book is None or self._is_book_stale(book, now_utc):
                 continue
             midpoint = _book_midpoint(book)
             if midpoint is None:

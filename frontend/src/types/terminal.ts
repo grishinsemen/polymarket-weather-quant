@@ -259,6 +259,8 @@ export interface GateEvaluation {
   brain_beats_market: boolean | null;
   max_dd_ok: boolean;
   markout_ok: boolean | null;
+  maker_markout_ok?: boolean | null;
+  taker_drift_ok?: boolean | null;
   fill_rate_ok: boolean;
   overall_pass: boolean;
   reasons: string[];
@@ -267,6 +269,10 @@ export interface GateEvaluation {
 export interface StrategyContourMetrics {
   markouts: MarkoutHorizonSummary[];
   primary_clv_30m: number | null;
+  maker_clv_30m?: number | null;
+  taker_clv_30m?: number | null;
+  taker_midpoint_drift_30m?: number | null;
+  midpoint_drift_30m?: number | null;
   volume_weighted_clv: number | null;
   realized_log_growth: number | null;
   max_drawdown_pct: number;

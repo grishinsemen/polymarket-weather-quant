@@ -152,6 +152,8 @@ async def recompute_probabilities(
                 before_local_date=event.local_date,
                 window_days=engine.bias_window_days,
                 decision_time_utc=ensure_utc(clock.now()),
+                use_regional_nwp_weights=engine.use_regional_nwp_weights,
+                regional_nwp_weights=engine.regional_nwp_weights,
             )
         else:
             bias_obs = []

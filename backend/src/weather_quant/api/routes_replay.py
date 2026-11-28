@@ -43,7 +43,7 @@ from weather_quant.domain.models import (
     WeatherEvent,
 )
 from weather_quant.ml.dataset_builder import TOP_LIQUIDITY_STATIONS
-from weather_quant.ml.quantile_mos import load_mos_provider_for_version
+from weather_quant.ml.quantile_mos import is_ml_mos_model, load_mos_provider_for_version
 from weather_quant.probability.calibration import (
     CalibrationEvaluationReport,
     evaluate_calibration_walk_forward,
@@ -86,6 +86,31 @@ from weather_quant.strategy.engine import (
 
 router = APIRouter(prefix="/api", tags=["replay", "terminal"])
 
+_DEPRECATED_STRATEGY_VERSIONS: frozenset[str] = frozenset(
+    {
+        "conservative-kelly-100-v1",
+        "aggressive-kelly-100-v2",
+        "scalp-spread-100-v1",
+        "scalp-spread-100-v2",
+        "kelly-multi-strict-v2",
+    }
+)
+
+
+def _visible_strategy_versions(
+    strategy_versions: list[StrategyVersionRecord],
+    *,
+    requested_sv: str | None = None,
+) -> list[StrategyVersionRecord]:
+    """Hide retired legacy strategies from UI selectors unless currently active or explicitly requested."""
+    return [
+        s
+        for s in strategy_versions
+        if s.strategy_version not in _DEPRECATED_STRATEGY_VERSIONS
+        or s.is_active
+        or (requested_sv is not None and s.strategy_version == requested_sv)
+    ]
+
 _REASON_EXPLANATIONS: dict[str, str] = {
     "PREMARKET_NET_EDGE_OK": "Premarket Fair Probability exceeds passive Maker ask/bid net of 0% maker fee by >= min Edge.",
     "INTRADAY_NET_EDGE_OK": "Intraday Routine METAR conditioning confirms remaining Edge above threshold.",
@@ -113,7 +138,12 @@ _REASON_EXPLANATIONS: dict[str, str] = {
     "DYNAMIC_TAKE_PROFIT_POST_ONLY": "Posted/repriced dynamic Post-Only SELL take-profit at max(entry + min_profit, fair + premium).",
     "NO_PRICE_OUT_OF_RANGE": "Skipped BUY NO because passive limit price fell outside configured [min_buy_no_price, max_buy_no_price] bounds.",
     "TRADE_EDGE_REALIZED": "Logged expected entry Edge vs actual realized Edge upon exit or settlement.",
-    "ADVERSE_SELECTION_CRASH_CANCEL": "Cancelled resting BUY before fill simulation because opposing ask crashed to <= 2c (probable live METAR breach).",
+    "ADVERSE_SELECTION_CRASH_CANCEL": "Cancelled resting BUY before fill simulation because opposing ask crashed (probable live METAR breach).",
+    "TTL_EXPIRED_CANCEL_RESTING_ENTRY": "Cancelled unfilled resting Maker BUY after exceeding max resting order TTL to prevent stale adverse selection.",
+    "BLACKOUT_METAR_RELEASE": "Blocked or cancelled passive entry inside routine METAR release blackout window.",
+    "BLACKOUT_NWP_RELEASE": "Blocked or cancelled passive entry inside NWP run release blackout window.",
+    "SPECI_ADVERSE_SELECTION_CANCEL": "Cancelled passive BUY / blocked entries after SPECI rapid temperature jump alert.",
+    "ANOMALY_DIVERGENCE_KILL_SWITCH": "Skipped entry because unshrunk model probability diverged abnormally from two-sided market midpoint.",
     "POST_ONLY_WOULD_CROSS": "Post-Only Maker Order rejected because limit price would cross opposing spread.",
 }
 
@@ -381,16 +411,16 @@ def _explain_reasons(reasons: list[str]) -> str:
 
 
 def _model_badge(model_rec: ModelVersionRecord | None, station_icao: str) -> Literal["MOS ML", "3-Layer"]:
-    if model_rec is None:
+    if not is_ml_mos_model(model_rec):
         return "3-Layer"
-    if "mos" in model_rec.model_type.lower() or "mos" in model_rec.model_version.lower():
-        covered = model_rec.config_json.get("covered_stations") if model_rec.config_json else None
-        if isinstance(covered, list) and covered:
-            if station_icao.upper() in {str(s).upper() for s in covered}:
-                return "MOS ML"
-            return "3-Layer"
-        if station_icao.upper() in TOP_LIQUIDITY_STATIONS:
+    assert model_rec is not None
+    covered = model_rec.config_json.get("covered_stations") if model_rec.config_json else None
+    if isinstance(covered, list) and covered:
+        if station_icao.upper() in {str(s).upper() for s in covered}:
             return "MOS ML"
+        return "3-Layer"
+    if station_icao.upper() in TOP_LIQUIDITY_STATIONS:
+        return "MOS ML"
     return "3-Layer"
 
 
@@ -1679,6 +1709,14 @@ async def promote_experiment_pair(
         active_strat = await db.get_active_strategy_version()
         engine.manifest = active_strat
         engine.params = StrategyParams.from_manifest(active_strat)
+        if hasattr(engine.executor, "strict_maker_fills"):
+            engine.executor.strict_maker_fills = engine.params.strict_maker_fills
+        if hasattr(engine.executor, "stale_feed_seconds"):
+            engine.executor.stale_feed_seconds = (
+                float(active_strat.stale_feed_seconds)
+                if engine.params.enforce_fresh_executor_books
+                else None
+            )
 
     loaded_provider = await load_mos_provider_for_version(
         db,
@@ -2105,7 +2143,7 @@ async def get_terminal_snapshot(
         server_time_utc=now,
         portfolio=portfolio,
         model_versions=model_versions,
-        strategy_versions=strategy_versions,
+        strategy_versions=_visible_strategy_versions(strategy_versions, requested_sv=strategy_version),
         screener=screener,
         xrays=xrays,
         closed_positions=closed_positions,

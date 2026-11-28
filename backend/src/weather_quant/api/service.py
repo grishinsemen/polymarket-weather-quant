@@ -73,6 +73,59 @@ class StationRadarService:
         self._last_live_tick_mono: float = 0.0
         self.latest_speci_alerts: dict[str, SpeciCancelAlert] = {}
 
+    async def _ingest_metar_reports(
+        self,
+        target_icaos: list[str],
+        now_utc: datetime,
+    ) -> tuple[set[str], set[str]]:
+        """Fetch and persist Routine METARs and detect active SPECI cancel triggers."""
+        if not target_icaos:
+            return set(), set()
+        prev_latest = await self.db.list_latest_metar_by_station()
+        prev_specis = dict(self.latest_speci_alerts)
+        raw_metars = await self.world_feed.fetch_metar_reports(target_icaos)
+        new_routine_icaos: set[str] = set()
+        fresh_specis: dict[str, SpeciCancelAlert] = {}
+        for line in raw_metars:
+            obs = parse_metar_line(
+                line,
+                ingested_at_utc=now_utc,
+                reference_time_utc=now_utc,
+            )
+            if obs is not None and obs.is_routine:
+                icao_up = obs.station_icao.strip().upper()
+                prev = prev_latest.get(icao_up)
+                await self.db.insert_metar_observation(obs)
+                if prev is None or obs.observed_at_utc > prev.observed_at_utc:
+                    new_routine_icaos.add(icao_up)
+                continue
+            speci = parse_speci_cancel_trigger(line, reference_time_utc=now_utc)
+            if speci is not None and (now_utc - speci.observed_at_utc).total_seconds() <= 1800:
+                prev_sp = fresh_specis.get(speci.station_icao)
+                if prev_sp is None or speci.observed_at_utc > prev_sp.observed_at_utc:
+                    fresh_specis[speci.station_icao] = speci
+        self.latest_speci_alerts = fresh_specis
+        new_speci_icaos = {
+            icao
+            for icao, alert in fresh_specis.items()
+            if icao not in prev_specis or alert.observed_at_utc > prev_specis[icao].observed_at_utc
+        }
+        return new_routine_icaos, new_speci_icaos
+
+    async def poll_metar_only(self) -> tuple[set[str], set[str]]:
+        """Lightweight METAR/SPECI poll across active events without Gamma discovery."""
+        async with self._sync_lock:
+            now_utc = self.clock.now()
+            existing_events = await self.db.list_weather_events(active_only=True)
+            target_icaos = sorted({e.station.icao for e in existing_events})
+            if not target_icaos:
+                return set(), set()
+            new_routine, new_speci = await self._ingest_metar_reports(target_icaos, now_utc)
+            if new_routine or new_speci:
+                self.last_sync_utc = now_utc
+                self.last_sync_error = None
+            return new_routine, new_speci
+
     async def sync_once(self) -> RadarStateResponse:
         """Fetch Weather Events and Routine METARs once, persist, and broadcast."""
         async with self._sync_lock:
@@ -92,24 +145,7 @@ class StationRadarService:
                 target_icaos = sorted(
                     {e.station.icao for e in existing_events} | set(discovered_icaos)
                 )
-                if target_icaos:
-                    raw_metars = await self.world_feed.fetch_metar_reports(target_icaos)
-                    fresh_specis: dict[str, SpeciCancelAlert] = {}
-                    for line in raw_metars:
-                        obs = parse_metar_line(
-                            line,
-                            ingested_at_utc=now_utc,
-                            reference_time_utc=now_utc,
-                        )
-                        if obs is not None and obs.is_routine:
-                            await self.db.insert_metar_observation(obs)
-                            continue
-                        speci = parse_speci_cancel_trigger(line, reference_time_utc=now_utc)
-                        if speci is not None and (now_utc - speci.observed_at_utc).total_seconds() <= 1800:
-                            prev = fresh_specis.get(speci.station_icao)
-                            if prev is None or speci.observed_at_utc > prev.observed_at_utc:
-                                fresh_specis[speci.station_icao] = speci
-                    self.latest_speci_alerts = fresh_specis
+                await self._ingest_metar_reports(target_icaos, now_utc)
 
                 self.last_sync_utc = now_utc
                 self.last_sync_error = None

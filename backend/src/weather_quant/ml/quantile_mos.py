@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import NormalDist
@@ -777,6 +778,20 @@ async def register_model_version(
 
 
 DEFAULT_MODELS_DIR = Path("data/models")
+_MOS_TOKEN_RE = re.compile(r"(?:^|[^a-z0-9])mos(?:[^a-z0-9]|$)")
+_ML_MOS_TYPES = frozenset({"quantile_lightgbm_mos", "residual_lightgbm_mos"})
+
+
+def is_ml_mos_model(model_rec: ModelVersionRecord | None) -> bool:
+    """Return True for trained ML/LightGBM MOS models while excluding analytical ``emos*``."""
+    if model_rec is None:
+        return False
+    mtype = model_rec.model_type.strip().lower()
+    if mtype in _ML_MOS_TYPES or "lightgbm" in mtype:
+        return True
+    mv = model_rec.model_version.strip().lower()
+    cfg = model_rec.config_json or {}
+    return bool(_MOS_TOKEN_RE.search(mtype) or _MOS_TOKEN_RE.search(mv) or cfg.get("artifact_path"))
 
 
 def save_mos_model(
@@ -856,7 +871,7 @@ async def load_mos_provider_for_version(
             return existing_provider
     versions = await db.list_model_versions()
     rec = next((v for v in versions if v.model_version == model_version), None)
-    if rec is None or ("mos" not in rec.model_type.lower() and "mos" not in rec.model_version.lower()):
+    if not is_ml_mos_model(rec):
         return None
     artifact_path = (rec.config_json or {}).get("artifact_path")
     if artifact_path and Path(artifact_path).exists():

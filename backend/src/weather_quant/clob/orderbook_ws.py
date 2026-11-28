@@ -198,6 +198,7 @@ class ClobOrderBookStream:
         self.reconnect_delay_seconds = reconnect_delay_seconds
         self.max_reconnect_delay_seconds = max_reconnect_delay_seconds
         self._on_snapshot = on_snapshot
+        self._extra_callbacks: list[SnapshotCallback] = []
 
         self._token_meta: dict[str, tuple[str, str]] = {}
         self._events: dict[str, WeatherEvent] = {}
@@ -211,6 +212,11 @@ class ClobOrderBookStream:
         self.consecutive_ws_failures: int = 0
         self.last_ws_message_at_utc: datetime | None = None
         self.last_error: str | None = None
+
+    def add_snapshot_callback(self, callback: SnapshotCallback) -> None:
+        """Register an additional async/sync callback invoked on each incoming book snapshot."""
+        if callback not in self._extra_callbacks:
+            self._extra_callbacks.append(callback)
 
     def register_event(self, event: WeatherEvent) -> None:
         """Register all Bucket token IDs belonging to a Weather Event."""
@@ -496,11 +502,16 @@ class ClobOrderBookStream:
         raw: str | bytes | dict[str, Any] | list[dict[str, Any]],
     ) -> list[OrderBookSnapshot]:
         snapshots = self.handle_raw_message(raw)
+        callbacks: list[SnapshotCallback] = []
         if self._on_snapshot is not None:
+            callbacks.append(self._on_snapshot)
+        callbacks.extend(self._extra_callbacks)
+        if callbacks and snapshots:
             for snap in snapshots:
-                res = self._on_snapshot(snap)
-                if inspect.isawaitable(res):
-                    await res
+                for cb in callbacks:
+                    res = cb(snap)
+                    if inspect.isawaitable(res):
+                        await res
         return snapshots
 
     def _get_or_create_book(self, token_id: str, msg: dict[str, Any]) -> _BookState:

@@ -59,6 +59,35 @@ def region_polarity_key(station: Station, polarity: Polarity) -> str:
     return f"{region_of_station(station)}_{polarity.value}"
 
 
+def _extract_model_extremes_c(
+    ensemble: EnsembleSnapshot,
+    day_indices: Sequence[int],
+    polarity: Polarity,
+) -> dict[str, float]:
+    meta = ensemble.metadata if isinstance(ensemble.metadata, dict) else {}
+    mhm = meta.get("model_hourly_means_c")
+    model_extremes: dict[str, float] = {}
+    if isinstance(mhm, dict) and day_indices:
+        max_idx = max(day_indices)
+        for m_name, series in mhm.items():
+            if isinstance(series, list) and len(series) > max_idx:
+                day_vals = [float(series[i]) for i in day_indices]
+                model_extremes[str(m_name)] = (
+                    max(day_vals) if polarity == Polarity.HIGHEST else min(day_vals)
+                )
+    return model_extremes
+
+
+def has_weighted_nwp_means(
+    ensemble: EnsembleSnapshot,
+    day_indices: Sequence[int],
+    polarity: Polarity,
+) -> bool:
+    """Return True when all 3 core NWP models exist in ``model_hourly_means_c``."""
+    model_extremes = _extract_model_extremes_c(ensemble, day_indices, polarity)
+    return all(m in model_extremes for m in ("ecmwf_ifs025", "gfs_seamless", "icon_seamless"))
+
+
 def compute_weighted_nwp_mean_and_var(
     *,
     ensemble: EnsembleSnapshot,
@@ -79,18 +108,7 @@ def compute_weighted_nwp_mean_and_var(
         else 0.25
     )
 
-    meta = ensemble.metadata if isinstance(ensemble.metadata, dict) else {}
-    mhm = meta.get("model_hourly_means_c")
-    model_extremes: dict[str, float] = {}
-    if isinstance(mhm, dict) and day_indices:
-        max_idx = max(day_indices)
-        for m_name, series in mhm.items():
-            if isinstance(series, list) and len(series) > max_idx:
-                day_vals = [float(series[i]) for i in day_indices]
-                model_extremes[str(m_name)] = (
-                    max(day_vals) if polarity == Polarity.HIGHEST else min(day_vals)
-                )
-
+    model_extremes = _extract_model_extremes_c(ensemble, day_indices, polarity)
     e_val = model_extremes.get("ecmwf_ifs025")
     g_val = model_extremes.get("gfs_seamless")
     i_val = model_extremes.get("icon_seamless")
@@ -107,6 +125,52 @@ def compute_weighted_nwp_mean_and_var(
         return w_mean, im_var, raw_mean
 
     return raw_mean, raw_var, raw_mean
+
+
+def _obs_forecast_extreme_c(
+    obs: Any,
+    obs_field: Literal["forecast_extreme_c", "raw_forecast_extreme_c"] = "forecast_extreme_c",
+) -> float:
+    if obs_field == "raw_forecast_extreme_c":
+        raw_val = getattr(obs, "raw_forecast_extreme_c", None)
+        if raw_val is not None:
+            return float(raw_val)
+    return float(obs.forecast_extreme_c)
+
+
+def solve_weighted_t_mle_location(
+    errors: Sequence[float],
+    weights: Sequence[float],
+    nu: float = 7.0,
+    n_iters: int = 8,
+) -> float:
+    """Solve weighted 1D Student-t(nu) MLE location via IRLS so storm outliers don't pull station bias."""
+    if not errors:
+        return 0.0
+    w_sum = sum(weights)
+    if w_sum <= _EPS:
+        return 0.0
+    mu = sum(w * x for w, x in zip(weights, errors)) / w_sum
+    s2 = max(0.09, sum(w * (x - mu) ** 2 for w, x in zip(weights, errors)) / w_sum)
+    for _ in range(n_iters):
+        wu_sum = 0.0
+        wu_x_sum = 0.0
+        for x, w in zip(errors, weights):
+            diff = x - mu
+            u = (nu + 1.0) / (nu + (diff * diff) / s2)
+            wu = w * u
+            wu_sum += wu
+            wu_x_sum += wu * x
+        if wu_sum <= _EPS:
+            break
+        mu = wu_x_sum / wu_sum
+        s2_num = 0.0
+        for x, w in zip(errors, weights):
+            diff = x - mu
+            u = (nu + 1.0) / (nu + (diff * diff) / s2)
+            s2_num += w * u * diff * diff
+        s2 = max(0.09, s2_num / w_sum)
+    return mu
 
 
 def _filter_valid_bias_obs(
@@ -149,6 +213,9 @@ def compute_ewma_station_bias(
     half_life_days: float = 14.0,
     shrinkage_days: float = 6.0,
     strict_temporal: bool = False,
+    use_robust_t_location: bool = False,
+    location_nu: float = 7.0,
+    obs_field: Literal["forecast_extreme_c", "raw_forecast_extreme_c"] = "forecast_extreme_c",
 ) -> float:
     """Compute leak-free EWMA station bias shrunk toward global robust median prior."""
     g_valid: list[float] = []
@@ -165,7 +232,7 @@ def compute_ewma_station_bias(
                 if strict_temporal:
                     raise
                 continue
-        g_valid.append(float(obs.observed_extreme_c) - float(obs.forecast_extreme_c))
+        g_valid.append(float(obs.observed_extreme_c) - _obs_forecast_extreme_c(obs, obs_field))
 
     if len(g_valid) >= 5:
         g_valid.sort()
@@ -188,11 +255,12 @@ def compute_ewma_station_bias(
 
     hl = max(1.0, float(half_life_days))
     weights = [0.5 ** (((event_local_date - obs.local_date).days - 1) / hl) for obs in s_valid]
+    errs = [float(obs.observed_extreme_c) - _obs_forecast_extreme_c(obs, obs_field) for obs in s_valid]
     w_sum = sum(weights)
-    raw_bias_c = sum(
-        w * (float(obs.observed_extreme_c) - float(obs.forecast_extreme_c))
-        for w, obs in zip(weights, s_valid)
-    ) / max(w_sum, _EPS)
+    if use_robust_t_location:
+        raw_bias_c = solve_weighted_t_mle_location(errs, weights, nu=location_nu)
+    else:
+        raw_bias_c = sum(w * e for w, e in zip(weights, errs)) / max(w_sum, _EPS)
     n_eff = (w_sum * w_sum) / max(sum(w * w for w in weights), _EPS)
     return (n_eff * raw_bias_c + shrinkage_days * prior_bias_c) / (n_eff + shrinkage_days)
 
@@ -234,6 +302,7 @@ def compute_ewma_t_mle_scale(
     half_life_days: float = 21.0,
     prior_strength: float = 10.0,
     strict_temporal: bool = False,
+    obs_field: Literal["forecast_extreme_c", "raw_forecast_extreme_c"] = "forecast_extreme_c",
 ) -> float:
     """Compute per-station EWMA Student-t MLE scale multiplier shrunk toward 1.0."""
     hl = max(1.0, float(half_life_days))
@@ -261,7 +330,7 @@ def compute_ewma_t_mle_scale(
             if (obs.forecast_std_c is not None and obs.forecast_std_c > 0.25)
             else fallback_std
         )
-        g_errs.append((age, float(obs.observed_extreme_c) - float(obs.forecast_extreme_c), ref_s))
+        g_errs.append((age, float(obs.observed_extreme_c) - _obs_forecast_extreme_c(obs, obs_field), ref_s))
 
     if len(g_errs) >= 15:
         g_med = sorted(e for _, e, _ in g_errs)[len(g_errs) // 2]
@@ -295,7 +364,7 @@ def compute_ewma_t_mle_scale(
             if (obs.forecast_std_c is not None and obs.forecast_std_c > 0.25)
             else fallback_std
         )
-        res = (float(obs.observed_extreme_c) - float(obs.forecast_extreme_c)) - station_bias_c
+        res = (float(obs.observed_extreme_c) - _obs_forecast_extreme_c(obs, obs_field)) - station_bias_c
         s_z.append(res / ref_s)
         s_w.append(0.5 ** ((age - 1) / hl))
 
@@ -357,3 +426,87 @@ def load_warmstart_bias_cache(path_str: str) -> dict[str, list[dict[str, Any]]]:
         return raw if isinstance(raw, dict) else {}
     except Exception:
         return {}
+
+
+def compute_external_mos_posterior(
+    *,
+    ensemble: EnsembleSnapshot,
+    polarity: Polarity,
+    emos_mean_c: float,
+    emos_std_c: float | None = None,
+    mos_anchor_weight: float = 0.30,
+    sigma_shrink_strength: float = 0.0,
+) -> tuple[float, float]:
+    """Blend external $0 MOS anchors and contract sigma_c smoothly on MOS/EMOS agreement.
+
+    Returns ``(anchor_shift_c, sigma_scale_factor)``.
+    """
+    if mos_anchor_weight <= 0.0 or not isinstance(ensemble.metadata, dict):
+        return 0.0, 1.0
+    meta = ensemble.metadata
+    suffix = "high_c" if polarity == Polarity.HIGHEST else "low_c"
+    prefixes = ("mosmix", "nbm", "nws_point")
+
+    entries: list[tuple[float, float | None]] = []
+    for pref in prefixes:
+        raw_v = meta.get(f"{pref}_{suffix}")
+        if raw_v is None and polarity == Polarity.HIGHEST:
+            raw_v = meta.get(f"{pref}_extreme_c")
+        if raw_v is None:
+            continue
+        try:
+            val = float(raw_v)
+            if not math.isfinite(val):
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        unc_val: float | None = None
+        raw_unc = meta.get(f"{pref}_uncertainty_c")
+        if raw_unc is not None:
+            try:
+                u = float(raw_unc)
+                if math.isfinite(u) and u > 0.1:
+                    unc_val = u
+            except (TypeError, ValueError):
+                unc_val = None
+        entries.append((val, unc_val))
+
+    if not entries:
+        return 0.0, 1.0
+
+    eff_emos_std = max(0.35, float(emos_std_c)) if emos_std_c is not None else 1.0
+    has_uncertainty = any(u is not None for _, u in entries)
+    if not has_uncertainty:
+        anchor_mean = sum(v for v, _ in entries) / len(entries)
+        eff_weight = mos_anchor_weight
+    else:
+        emos_var = eff_emos_std * eff_emos_std
+        base_w = max(0.05, min(0.55, mos_anchor_weight))
+        fallback_mos_var = emos_var * ((1.0 - base_w) / base_w)
+
+        prec_sum = 0.0
+        weighted_val_sum = 0.0
+        for val, unc in entries:
+            # Inflate reported E_TTT by 1.4x to account for shared NWP forecast error correlation
+            var_k = ((max(0.35, unc) * 1.4) ** 2) if unc is not None else fallback_mos_var
+            prec_k = 1.0 / max(0.05, var_k)
+            prec_sum += prec_k
+            weighted_val_sum += prec_k * val
+
+        anchor_mean = weighted_val_sum / prec_sum
+        bayes_w = prec_sum / (prec_sum + (1.0 / emos_var))
+        eff_weight = max(0.10, min(0.45, bayes_w))
+
+    raw_delta = max(-2.5, min(2.5, anchor_mean - emos_mean_c))
+    shift_c = eff_weight * raw_delta
+
+    sigma_scale = 1.0
+    strength = max(0.0, min(1.0, float(sigma_shrink_strength)))
+    if strength > _EPS:
+        z_diff = abs(anchor_mean - emos_mean_c) / eff_emos_std
+        # Smooth Gaussian agreement gate (<= 1 sigma agrees strongly; large disagreement preserves uncertainty)
+        agreement = math.exp(-0.5 * (z_diff / 1.5) ** 2)
+        var_reduction = min(0.45, strength * eff_weight * agreement)
+        sigma_scale = math.sqrt(max(0.55, 1.0 - var_reduction))
+    return shift_c, sigma_scale

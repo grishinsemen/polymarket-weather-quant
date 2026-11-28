@@ -157,6 +157,13 @@ async def get_strategy_engine(request: Request) -> StrategyEngine:
     if not getattr(request.app.state, "_strategy_initialized", False):
         await engine.initialize()
         request.app.state._strategy_initialized = True
+    if isinstance(engine.executor, PaperExecutor):
+        engine.executor.strict_maker_fills = engine.params.strict_maker_fills
+        engine.executor.stale_feed_seconds = (
+            float(engine.manifest.stale_feed_seconds)
+            if engine.params.enforce_fresh_executor_books
+            else None
+        )
     return engine
 
 

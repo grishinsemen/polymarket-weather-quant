@@ -38,6 +38,7 @@ from weather_quant.feeds.hub import apply_date_mos_anchors
 from weather_quant.ml.quantile_mos import (
     MosProbabilityProvider,
     QuantileMosModel,
+    is_ml_mos_model,
     load_mos_provider_for_version,
 )
 from weather_quant.probability.engine import (
@@ -61,9 +62,15 @@ from weather_quant.storage.database import Database
 from weather_quant.strategy.engine import (
     R_TRADE_EDGE_REALIZED,
     StrategyEngine,
+    StrategyParams,
     StrategyStore,
     default_strategy_manifest,
     settlement_close_utc,
+    v2_multi_kelly_strict_manifest,
+    v3_multi_kelly_strict_manifest,
+    v3_1_multi_kelly_strict_manifest,
+    v4_multi_kelly_strict_manifest,
+    v5_multi_kelly_strict_manifest,
 )
 from weather_quant.strategy.paper_executor import PaperExecutor
 
@@ -495,6 +502,7 @@ async def _execute_replay_isolated(
     prior_ensembles: Sequence[EnsembleSnapshot] = (),
     prior_metars: Sequence[MetarObservation] = (),
     progress_cb: ReplayProgressCallback | None = None,
+    prob_cache: dict[tuple[Any, ...], EventProbabilitySnapshot] | None = None,
 ) -> ExperimentReplayResult:
     start_utc = _ensure_utc(dataset_start_utc)
     end_utc = _ensure_utc(dataset_end_utc)
@@ -578,8 +586,18 @@ async def _execute_replay_isolated(
 
         clock = VirtualClock(ticks[0] if ticks else start_utc)
         store = StrategyStore(iso_db)
-        strict_maker = bool((strategy_rec.config_json or {}).get("strict_maker_fills", False))
-        executor = PaperExecutor(db=iso_db, clock=clock, store=store, strict_maker_fills=strict_maker)
+        strat_params = StrategyParams.from_manifest(strategy_rec)
+        executor = PaperExecutor(
+            db=iso_db,
+            clock=clock,
+            store=store,
+            strict_maker_fills=strat_params.strict_maker_fills,
+            stale_feed_seconds=(
+                float(strategy_rec.stale_feed_seconds)
+                if strat_params.enforce_fresh_executor_books
+                else None
+            ),
+        )
         engine = StrategyEngine(
             db=iso_db,
             executor=executor,
@@ -724,92 +742,105 @@ async def _execute_replay_isolated(
                 tick_local_day = tick_time.astimezone(ev_tz).date()
                 prob_key = (_ensure_utc(ens.ingested_at_utc), len(station_metars), tick_local_day)
                 if last_prob_input_stamp.get(event.event_id) != prob_key:
-                    if recent_bias_by_station is not None:
-                        bias_obs: Sequence[DailyBiasObservation] = recent_bias_by_station.get(icao_ev, ())
-                        global_bias_obs = [
-                            obs
-                            for obs_list in recent_bias_by_station.values()
-                            for obs in obs_list
-                        ]
+                    shared_key = (model_rec.model_version, event.event_id, *prob_key)
+                    if prob_cache is not None and shared_key in prob_cache:
+                        latest_probs[event.event_id] = prob_cache[shared_key].model_copy(
+                            update={"computed_at_utc": tick_time}
+                        )
+                        last_prob_input_stamp[event.event_id] = prob_key
                     else:
-                        cache_key = (icao_ev, event.local_date, tick_local_day)
-                        if cache_key not in rolling_bias_cache:
-                            rolling_bias_cache[cache_key] = build_daily_bias_observations_from_history(
-                                station=event.station,
-                                polarity=event.polarity,
-                                remark_tenths_enabled=event.remark_tenths_enabled,
-                                ensembles=ens_history_by_station.get(icao_ev, ()),
-                                metars=metar_history_by_station.get(icao_ev, ()),
-                                before_local_date=event.local_date,
-                                window_days=base_prob_engine.bias_window_days,
-                                decision_time_utc=tick_time,
-                            )
-                        bias_obs = rolling_bias_cache[cache_key]
-                        # Hierarchical cross-station pool strictly prior to tick_time
-                        global_bias_obs = []
-                        seen_gk: set[tuple[str, Any]] = set()
-                        for other_icao, other_station in station_by_icao.items():
-                            try:
-                                o_tz = ZoneInfo(other_station.timezone)
-                            except Exception:
-                                o_tz = timezone.utc
-                            o_day = tick_time.astimezone(o_tz).date()
-                            ok = (other_icao, event.local_date, o_day)
-                            if ok not in rolling_bias_cache:
-                                rolling_bias_cache[ok] = build_daily_bias_observations_from_history(
-                                    station=other_station,
+                        if recent_bias_by_station is not None:
+                            bias_obs: Sequence[DailyBiasObservation] = recent_bias_by_station.get(icao_ev, ())
+                            global_bias_obs = [
+                                obs
+                                for obs_list in recent_bias_by_station.values()
+                                for obs in obs_list
+                            ]
+                        else:
+                            cache_key = (icao_ev, event.local_date, tick_local_day)
+                            if cache_key not in rolling_bias_cache:
+                                rolling_bias_cache[cache_key] = build_daily_bias_observations_from_history(
+                                    station=event.station,
                                     polarity=event.polarity,
                                     remark_tenths_enabled=event.remark_tenths_enabled,
-                                    ensembles=ens_history_by_station.get(other_icao, ()),
-                                    metars=metar_history_by_station.get(other_icao, ()),
+                                    ensembles=ens_history_by_station.get(icao_ev, ()),
+                                    metars=metar_history_by_station.get(icao_ev, ()),
                                     before_local_date=event.local_date,
                                     window_days=base_prob_engine.bias_window_days,
                                     decision_time_utc=tick_time,
+                                    use_regional_nwp_weights=base_prob_engine.use_regional_nwp_weights,
+                                    regional_nwp_weights=base_prob_engine.regional_nwp_weights,
                                 )
-                            for b_item in rolling_bias_cache[ok]:
-                                gk = (other_icao, b_item.local_date)
-                                if gk not in seen_gk:
-                                    seen_gk.add(gk)
-                                    global_bias_obs.append(b_item)
-                    try:
-                        if mos_provider is not None and mos_provider.is_station_covered(event.station.icao):
-                            snap = mos_provider.compute_probabilities(
-                                station=event.station,
-                                event=event,
-                                ensemble=ens,
-                                recent_bias_obs=bias_obs,
-                                intraday_metars=station_metars,
-                                clock=clock,
-                                strict_temporal=strict_temporal,
-                            )
-                            if snap.model_version != model_rec.model_version:
-                                snap = snap.model_copy(
-                                    update={
-                                        "model_version": model_rec.model_version,
-                                        "buckets": [
-                                            b.model_copy(update={"model_version": model_rec.model_version})
-                                            for b in snap.buckets
-                                        ],
-                                    }
+                            bias_obs = rolling_bias_cache[cache_key]
+                            # Hierarchical cross-station pool strictly prior to tick_time
+                            global_bias_obs = []
+                            seen_gk: set[tuple[str, Any]] = set()
+                            for other_icao, other_station in station_by_icao.items():
+                                try:
+                                    o_tz = ZoneInfo(other_station.timezone)
+                                except Exception:
+                                    o_tz = timezone.utc
+                                o_day = tick_time.astimezone(o_tz).date()
+                                ok = (other_icao, event.local_date, o_day)
+                                if ok not in rolling_bias_cache:
+                                    rolling_bias_cache[ok] = build_daily_bias_observations_from_history(
+                                        station=other_station,
+                                        polarity=event.polarity,
+                                        remark_tenths_enabled=event.remark_tenths_enabled,
+                                        ensembles=ens_history_by_station.get(other_icao, ()),
+                                        metars=metar_history_by_station.get(other_icao, ()),
+                                        before_local_date=event.local_date,
+                                        window_days=base_prob_engine.bias_window_days,
+                                        decision_time_utc=tick_time,
+                                        use_regional_nwp_weights=base_prob_engine.use_regional_nwp_weights,
+                                        regional_nwp_weights=base_prob_engine.regional_nwp_weights,
+                                    )
+                                for b_item in rolling_bias_cache[ok]:
+                                    gk = (other_icao, b_item.local_date)
+                                    if gk not in seen_gk:
+                                        seen_gk.add(gk)
+                                        global_bias_obs.append(b_item)
+                        try:
+                            if mos_provider is not None and mos_provider.is_station_covered(event.station.icao):
+                                snap = mos_provider.compute_probabilities(
+                                    station=event.station,
+                                    event=event,
+                                    ensemble=ens,
+                                    recent_bias_obs=bias_obs,
+                                    intraday_metars=station_metars,
+                                    clock=clock,
+                                    strict_temporal=strict_temporal,
                                 )
-                        else:
-                            snap = base_prob_engine.compute_probabilities(
-                                station=event.station,
-                                event=event,
-                                ensemble=ens,
-                                recent_bias_obs=bias_obs,
-                                intraday_metars=station_metars,
-                                clock=clock,
-                                model_version=model_rec.model_version,
-                                strict_temporal=strict_temporal,
-                                global_bias_obs=global_bias_obs,
-                            )
-                    except TemporalIntegrityError:
-                        raise
-                    except (ValueError, ZoneInfoNotFoundError):
-                        continue
-                    latest_probs[event.event_id] = snap
-                    last_prob_input_stamp[event.event_id] = prob_key
+                                if snap.model_version != model_rec.model_version:
+                                    snap = snap.model_copy(
+                                        update={
+                                            "model_version": model_rec.model_version,
+                                            "buckets": [
+                                                b.model_copy(update={"model_version": model_rec.model_version})
+                                                for b in snap.buckets
+                                            ],
+                                        }
+                                    )
+                            else:
+                                snap = base_prob_engine.compute_probabilities(
+                                    station=event.station,
+                                    event=event,
+                                    ensemble=ens,
+                                    recent_bias_obs=bias_obs,
+                                    intraday_metars=station_metars,
+                                    clock=clock,
+                                    model_version=model_rec.model_version,
+                                    strict_temporal=strict_temporal,
+                                    global_bias_obs=global_bias_obs,
+                                )
+                        except TemporalIntegrityError:
+                            raise
+                        except (ValueError, ZoneInfoNotFoundError):
+                            continue
+                        latest_probs[event.event_id] = snap
+                        last_prob_input_stamp[event.event_id] = prob_key
+                        if prob_cache is not None:
+                            prob_cache[shared_key] = snap
 
                 event_prob = latest_probs.get(event.event_id)
                 event_books = latest_books.get(event.event_id, {})
@@ -1040,11 +1071,7 @@ async def _execute_replay_isolated(
 
         decision_obs_list = decision_entry_evals if decision_entry_evals else decision_order_evals
 
-        is_ml_model = (
-            mos_provider is not None
-            or "mos" in model_rec.model_type.lower()
-            or "mos" in model_rec.model_version.lower()
-        )
+        is_ml_model = mos_provider is not None or is_ml_mos_model(model_rec)
         covered_stations: set[str] | None = None
         if is_ml_model:
             if mos_model is not None and getattr(mos_model, "covered_stations", None):
@@ -1401,9 +1428,19 @@ async def run_experiment_replay(
     strategies = {s.strategy_version: s for s in await db.list_strategy_versions()}
     strategy_rec = strategies.get(strategy_version)
     if strategy_rec is None:
-        if strategy_version == default_strategy_manifest().strategy_version:
-            strategy_rec = default_strategy_manifest()
-        else:
+        builtin_strategies = {
+            m.strategy_version: m
+            for m in (
+                default_strategy_manifest(),
+                v2_multi_kelly_strict_manifest(),
+                v3_multi_kelly_strict_manifest(),
+                v3_1_multi_kelly_strict_manifest(),
+                v4_multi_kelly_strict_manifest(),
+                v5_multi_kelly_strict_manifest(),
+            )
+        }
+        strategy_rec = builtin_strategies.get(strategy_version)
+        if strategy_rec is None:
             raise ValueError(f"Unknown strategy_version: {strategy_version!r}")
 
     event_list = list(events) if events is not None else await db.list_weather_events(active_only=False)

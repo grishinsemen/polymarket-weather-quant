@@ -1039,6 +1039,39 @@ export function ExperimentLabPanel({
                                       </div>
                                     )}
                                   </div>
+                                  {(diag.strategy.maker_clv_30m != null ||
+                                    diag.strategy.taker_midpoint_drift_30m != null) && (
+                                    <div className="mt-1.5 flex flex-wrap gap-2 text-[10px] font-mono-tabular">
+                                      {diag.strategy.maker_clv_30m != null && (
+                                        <span className="rounded border border-[#1a2538] bg-[#0a101b] px-2 py-0.5 text-slate-400">
+                                          Maker CLV 30m:{" "}
+                                          <strong
+                                            className={
+                                              diag.strategy.maker_clv_30m >= -0.02
+                                                ? "text-emerald-400"
+                                                : "text-rose-400"
+                                            }
+                                          >
+                                            {fmtEdgeCents(diag.strategy.maker_clv_30m)}
+                                          </strong>
+                                        </span>
+                                      )}
+                                      {diag.strategy.taker_midpoint_drift_30m != null && (
+                                        <span className="rounded border border-[#1a2538] bg-[#0a101b] px-2 py-0.5 text-slate-400">
+                                          Taker Drift 30m:{" "}
+                                          <strong
+                                            className={
+                                              diag.strategy.taker_midpoint_drift_30m >= -0.02
+                                                ? "text-emerald-400"
+                                                : "text-rose-400"
+                                            }
+                                          >
+                                            {fmtEdgeCents(diag.strategy.taker_midpoint_drift_30m)}
+                                          </strong>
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
                                 </div>
 
                                 {/* Risk, growth & concentration */}

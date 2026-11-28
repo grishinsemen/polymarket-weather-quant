@@ -6,6 +6,8 @@ import json
 import math
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
+from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -30,8 +32,9 @@ from weather_quant.probability.student_t_emos import (
     DEFAULT_REGIONAL_NWP_WEIGHTS,
     compute_ewma_station_bias,
     compute_ewma_t_mle_scale,
+    compute_external_mos_posterior,
     compute_weighted_nwp_mean_and_var,
-    load_warmstart_bias_cache,
+    has_weighted_nwp_means,
     map_student_t_cdf_to_probabilities,
     region_polarity_key,
 )
@@ -89,6 +92,7 @@ class DailyBiasObservation(BaseModel):
     forecast_std_c: float | None = None
     observed_at_utc: datetime | None = None
     is_routine: bool = True
+    raw_forecast_extreme_c: float | None = None
 
 
 def to_event_unit(temp_c: float, unit: Literal["C", "F"]) -> float:
@@ -303,6 +307,40 @@ def map_extremes_to_probabilities(
     return normalized
 
 
+@lru_cache(maxsize=16)
+def _load_warmstart_bias_models(
+    path_str: str, mtime_ns: int
+) -> tuple[dict[str, tuple[DailyBiasObservation, ...]], dict[str, tuple[DailyBiasObservation, ...]]]:
+    """Parse and cache pre-validated DailyBiasObservation tuples keyed by '{ICAO}_{POL}' and polarity."""
+    del mtime_ns
+    p = Path(path_str)
+    if not p.exists():
+        return {}, {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}, {}
+    if not isinstance(raw, dict):
+        return {}, {}
+    by_key: dict[str, tuple[DailyBiasObservation, ...]] = {}
+    by_pol: dict[str, list[DailyBiasObservation]] = {}
+    for cache_key, items in raw.items():
+        if not isinstance(items, list):
+            continue
+        parsed: list[DailyBiasObservation] = []
+        for raw_item in items:
+            obs = DailyBiasObservation.model_validate(raw_item)
+            if obs.observed_at_utc is not None and obs.observed_at_utc.tzinfo is None:
+                obs = obs.model_copy(
+                    update={"observed_at_utc": obs.observed_at_utc.replace(tzinfo=timezone.utc)}
+                )
+            parsed.append(obs)
+        by_key[str(cache_key)] = tuple(parsed)
+        pol = str(cache_key).rsplit("_", 1)[-1]
+        by_pol.setdefault(pol, []).extend(parsed)
+    return by_key, {k: tuple(v) for k, v in by_pol.items()}
+
+
 class EnsembleProbabilityEngine:
     """Deep 3-layer calibrated Fair Probability engine.
 
@@ -328,6 +366,10 @@ class EnsembleProbabilityEngine:
         regional_nwp_weights: Mapping[str, Sequence[float]] | None = None,
         regional_het_var: Mapping[str, Sequence[float]] | None = None,
         warmstart_bias_path: str | None = None,
+        bias_shrinkage_days: float = DEFAULT_BIAS_SHRINKAGE_DAYS,
+        use_robust_t_bias: bool = False,
+        mos_sigma_shrink_strength: float = 0.0,
+        align_warmstart_bias_basis: bool = False,
     ) -> None:
         self.smoothing_alpha = smoothing_alpha
         self.bias_window_days = bias_window_days
@@ -343,6 +385,10 @@ class EnsembleProbabilityEngine:
         self.bias_half_life_days = float(bias_half_life_days) if bias_half_life_days is not None else None
         self.scale_half_life_days = float(scale_half_life_days) if scale_half_life_days is not None else None
         self.use_regional_nwp_weights = bool(use_regional_nwp_weights)
+        self.bias_shrinkage_days = max(0.5, float(bias_shrinkage_days))
+        self.use_robust_t_bias = bool(use_robust_t_bias)
+        self.mos_sigma_shrink_strength = max(0.0, min(1.0, float(mos_sigma_shrink_strength)))
+        self.align_warmstart_bias_basis = bool(align_warmstart_bias_basis)
         self.regional_nwp_weights: dict[str, tuple[float, float, float]] = (
             {
                 str(k): (float(v[0]), float(v[1]), float(v[2]))
@@ -391,6 +437,10 @@ class EnsembleProbabilityEngine:
             regional_nwp_weights=cfg.get("regional_nwp_weights"),
             regional_het_var=cfg.get("regional_het_var"),
             warmstart_bias_path=cfg.get("warmstart_bias_path"),
+            bias_shrinkage_days=float(cfg.get("bias_shrinkage_days", DEFAULT_BIAS_SHRINKAGE_DAYS)),
+            use_robust_t_bias=bool(cfg.get("use_robust_t_bias", False)),
+            mos_sigma_shrink_strength=float(cfg.get("mos_sigma_shrink_strength", 0.0)),
+            align_warmstart_bias_basis=bool(cfg.get("align_warmstart_bias_basis", False)),
         )
 
     def _merge_warmstart_bias(
@@ -404,27 +454,27 @@ class EnsembleProbabilityEngine:
         """Merge strictly pre-OOS warm-start DailyBiasObservations with live history (live takes precedence)."""
         if not self.warmstart_bias_path:
             return list(recent_bias_obs), list(global_bias_obs)
-        cache = load_warmstart_bias_cache(self.warmstart_bias_path)
-        if not cache:
+        p = Path(self.warmstart_bias_path)
+        if not p.exists():
+            return list(recent_bias_obs), list(global_bias_obs)
+        try:
+            mtime_ns = p.stat().st_mtime_ns
+        except OSError:
+            return list(recent_bias_obs), list(global_bias_obs)
+        by_key, by_pol = _load_warmstart_bias_models(self.warmstart_bias_path, mtime_ns)
+        if not by_key:
             return list(recent_bias_obs), list(global_bias_obs)
 
         key = f"{station_icao.strip().upper()}_{polarity.value}"
         live_station = list(recent_bias_obs)
         live_dates = {o.local_date for o in live_station}
-        for raw_item in cache.get(key, ()):
-            obs = DailyBiasObservation.model_validate(raw_item)
+        for obs in by_key.get(key, ()):
             if obs.local_date not in live_dates:
                 live_station.append(obs)
                 live_dates.add(obs.local_date)
 
-        # Global pool for the same polarity
-        pol_suffix = f"_{polarity.value}"
         merged_global = list(global_bias_obs)
-        for cache_key, items in cache.items():
-            if not cache_key.endswith(pol_suffix):
-                continue
-            for raw_item in items:
-                merged_global.append(DailyBiasObservation.model_validate(raw_item))
+        merged_global.extend(by_pol.get(polarity.value, ()))
         return live_station, merged_global
 
     def _compute_global_prior(
@@ -731,65 +781,15 @@ class EnsembleProbabilityEngine:
         emos_std_c: float | None = None,
     ) -> float:
         """Blend bounded external $0 MOS anchors (MOSMIX/NBM/NWS) weighted by inverse variance (E_TTT)."""
-        if self.mos_anchor_weight <= 0.0 or not isinstance(ensemble.metadata, dict):
-            return 0.0
-        meta = ensemble.metadata
-        suffix = "high_c" if polarity == Polarity.HIGHEST else "low_c"
-        prefixes = ("mosmix", "nbm", "nws_point")
-
-        entries: list[tuple[float, float | None]] = []
-        for pref in prefixes:
-            raw_v = meta.get(f"{pref}_{suffix}")
-            if raw_v is None and polarity == Polarity.HIGHEST:
-                raw_v = meta.get(f"{pref}_extreme_c")
-            if raw_v is None:
-                continue
-            try:
-                val = float(raw_v)
-                if not math.isfinite(val):
-                    continue
-            except (TypeError, ValueError):
-                continue
-
-            unc_val: float | None = None
-            raw_unc = meta.get(f"{pref}_uncertainty_c")
-            if raw_unc is not None:
-                try:
-                    u = float(raw_unc)
-                    if math.isfinite(u) and u > 0.1:
-                        unc_val = u
-                except (TypeError, ValueError):
-                    unc_val = None
-            entries.append((val, unc_val))
-
-        if not entries:
-            return 0.0
-
-        has_uncertainty = any(u is not None for _, u in entries)
-        if not has_uncertainty:
-            anchor_mean = sum(v for v, _ in entries) / len(entries)
-            eff_weight = self.mos_anchor_weight
-        else:
-            eff_emos_std = max(0.35, float(emos_std_c)) if emos_std_c is not None else 1.0
-            emos_var = eff_emos_std * eff_emos_std
-            base_w = max(0.05, min(0.55, self.mos_anchor_weight))
-            fallback_mos_var = emos_var * ((1.0 - base_w) / base_w)
-
-            prec_sum = 0.0
-            weighted_val_sum = 0.0
-            for val, unc in entries:
-                # Inflate reported E_TTT by 1.4x to account for shared NWP forecast error correlation
-                var_k = ((max(0.35, unc) * 1.4) ** 2) if unc is not None else fallback_mos_var
-                prec_k = 1.0 / max(0.05, var_k)
-                prec_sum += prec_k
-                weighted_val_sum += prec_k * val
-
-            anchor_mean = weighted_val_sum / prec_sum
-            bayes_w = prec_sum / (prec_sum + (1.0 / emos_var))
-            eff_weight = max(0.10, min(0.45, bayes_w))
-
-        raw_delta = max(-2.5, min(2.5, anchor_mean - emos_mean_c))
-        return eff_weight * raw_delta
+        shift_c, _ = compute_external_mos_posterior(
+            ensemble=ensemble,
+            polarity=polarity,
+            emos_mean_c=emos_mean_c,
+            emos_std_c=emos_std_c,
+            mos_anchor_weight=self.mos_anchor_weight,
+            sigma_shrink_strength=0.0,
+        )
+        return shift_c
 
     def calibrate_day_trajectories(
         self,
@@ -960,6 +960,9 @@ class EnsembleProbabilityEngine:
         if self.distribution_mode == "student_t_cdf":
             rp_key = region_polarity_key(station, event.polarity)
             nwp_w = self.regional_nwp_weights.get(rp_key, (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0))
+            weighted_active = self.use_regional_nwp_weights and has_weighted_nwp_means(
+                ensemble, day_indices, event.polarity
+            )
             if self.use_regional_nwp_weights:
                 w_mean_c, im_var_c, raw_mean_c = compute_weighted_nwp_mean_and_var(
                     ensemble=ensemble,
@@ -972,6 +975,11 @@ class EnsembleProbabilityEngine:
                 w_mean_c = raw_mean_c
                 im_var_c = raw_std_c * raw_std_c
 
+            obs_field: Literal["forecast_extreme_c", "raw_forecast_extreme_c"] = (
+                "raw_forecast_extreme_c"
+                if (self.align_warmstart_bias_basis and self.use_regional_nwp_weights and not weighted_active)
+                else "forecast_extreme_c"
+            )
             c0, c1 = self.regional_het_var.get(rp_key, (1.0, 0.2))
             het_std_c = max(0.35, math.sqrt(max(0.05, c0 + c1 * im_var_c)))
 
@@ -984,7 +992,11 @@ class EnsembleProbabilityEngine:
                 decision_time=decision_time,
                 window_days=self.bias_window_days,
                 half_life_days=bias_hl,
+                shrinkage_days=self.bias_shrinkage_days,
                 strict_temporal=strict_temporal,
+                use_robust_t_location=self.use_robust_t_bias,
+                location_nu=self.student_t_df,
+                obs_field=obs_field,
             )
             sigma_mult = compute_ewma_t_mle_scale(
                 recent_bias_obs=eff_recent_bias,
@@ -997,15 +1009,19 @@ class EnsembleProbabilityEngine:
                 window_days=self.bias_window_days,
                 half_life_days=scale_hl,
                 strict_temporal=strict_temporal,
+                obs_field=obs_field,
             )
-            sigma_c = max(0.35, het_std_c * sigma_mult)
-            anchor_shift_c = self._compute_external_mos_anchor_shift(
+            sigma_prior_c = max(0.35, het_std_c * sigma_mult)
+            anchor_shift_c, sigma_scale = compute_external_mos_posterior(
                 ensemble=ensemble,
                 polarity=event.polarity,
                 emos_mean_c=w_mean_c + bias_c,
-                emos_std_c=sigma_c,
+                emos_std_c=sigma_prior_c,
+                mos_anchor_weight=self.mos_anchor_weight,
+                sigma_shrink_strength=self.mos_sigma_shrink_strength,
             )
             mu_c = w_mean_c + bias_c + anchor_shift_c
+            sigma_c = max(0.35, sigma_prior_c * sigma_scale)
 
             bounds_c = [
                 bucket_effective_bounds_c(b, remark_tenths_enabled=event.remark_tenths_enabled)
@@ -1470,6 +1486,8 @@ def build_daily_bias_observations_from_history(
     before_local_date: date,
     window_days: int = 45,
     decision_time_utc: datetime | None = None,
+    use_regional_nwp_weights: bool = False,
+    regional_nwp_weights: Mapping[str, Sequence[float]] | None = None,
 ) -> list[DailyBiasObservation]:
     """Build leak-free historical DailyBiasObservation pairs strictly prior to *before_local_date*.
 
@@ -1561,8 +1579,23 @@ def build_daily_bias_observations_from_history(
         ]
         if not extremes:
             continue
-        f_mean = sum(extremes) / len(extremes)
-        f_std = math.sqrt(sum((x - f_mean) ** 2 for x in extremes) / len(extremes))
+        raw_mean = sum(extremes) / len(extremes)
+        raw_std = math.sqrt(sum((x - raw_mean) ** 2 for x in extremes) / len(extremes))
+        f_mean = raw_mean
+        if use_regional_nwp_weights:
+            rp_key = region_polarity_key(station, polarity)
+            w_seq = (regional_nwp_weights or {}).get(rp_key) or DEFAULT_REGIONAL_NWP_WEIGHTS.get(
+                rp_key, (1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+            )
+            weights_3 = (float(w_seq[0]), float(w_seq[1]), float(w_seq[2]))
+            w_mean, _, _ = compute_weighted_nwp_mean_and_var(
+                ensemble=snap,
+                day_indices=day_indices,
+                polarity=polarity,
+                raw_extremes_c=extremes,
+                weights=weights_3,
+            )
+            f_mean = w_mean
         obs_temps = [
             EnsembleProbabilityEngine.obs_settlement_temp_c(m, remark_tenths_enabled)
             for m in day_metars
@@ -1581,9 +1614,10 @@ def build_daily_bias_observations_from_history(
                 local_date=d,
                 forecast_extreme_c=f_mean,
                 observed_extreme_c=obs_ext,
-                forecast_std_c=f_std if f_std > 1e-6 else None,
+                forecast_std_c=raw_std if raw_std > 1e-6 else None,
                 observed_at_utc=last_obs_utc,
                 is_routine=True,
+                raw_forecast_extreme_c=raw_mean,
             )
         )
     return out

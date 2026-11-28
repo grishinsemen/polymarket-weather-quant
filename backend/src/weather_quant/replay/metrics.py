@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Literal, Mapping, Sequence
+from typing import Callable, Literal, Mapping, Sequence
 
 from pydantic import BaseModel, Field
 
@@ -111,6 +111,8 @@ class GateEvaluation(BaseModel):
     brain_beats_market: bool | None = None
     max_dd_ok: bool = True
     markout_ok: bool | None = None
+    maker_markout_ok: bool | None = None
+    taker_drift_ok: bool | None = None
     fill_rate_ok: bool = True
     overall_pass: bool = False
     reasons: list[str] = Field(default_factory=list)
@@ -121,6 +123,10 @@ class StrategyContourMetrics(BaseModel):
 
     markouts: list[MarkoutHorizonSummary] = Field(default_factory=list)
     primary_clv_30m: float | None = None
+    maker_clv_30m: float | None = None
+    taker_clv_30m: float | None = None
+    taker_midpoint_drift_30m: float | None = None
+    midpoint_drift_30m: float | None = None
     volume_weighted_clv: float | None = None
     realized_log_growth: float | None = None
     max_drawdown_pct: float = 0.0
@@ -491,6 +497,33 @@ def _horizon_label(horizon_minutes: int) -> str:
     return f"{horizon_minutes}m"
 
 
+def _pick_preferred_horizon_metric(
+    clvs: Sequence[ClvSnapshot],
+    fill_usd_by_id: Mapping[str, float],
+    value_fn: Callable[[ClvSnapshot], float | None],
+) -> float | None:
+    """Compute $-weighted markout across the preferred horizon (30m -> 60m -> 5m -> Pre-Close)."""
+    by_horizon: dict[int, list[tuple[ClvSnapshot, float]]] = {}
+    for c in clvs:
+        val = value_fn(c)
+        if val is not None:
+            by_horizon.setdefault(int(c.horizon_minutes), []).append((c, val))
+    if not by_horizon:
+        return None
+    chosen_h: int | None = None
+    for preferred_h in (30, 60, 5, -1):
+        if preferred_h in by_horizon:
+            chosen_h = preferred_h
+            break
+    if chosen_h is None:
+        chosen_h = sorted(by_horizon.keys(), key=lambda h: (1 if h < 0 else 0, h))[0]
+    items = by_horizon[chosen_h]
+    w_sum = sum(fill_usd_by_id.get(c.fill_id, 0.0) for c, _ in items)
+    if w_sum > _EPS:
+        return round(sum(val * fill_usd_by_id.get(c.fill_id, 0.0) for c, val in items) / w_sum, 6)
+    return round(sum(val for _, val in items) / len(items), 6)
+
+
 def compute_strategy_contour_metrics(
     *,
     clvs: Sequence[ClvSnapshot],
@@ -504,6 +537,7 @@ def compute_strategy_contour_metrics(
 ) -> StrategyContourMetrics:
     """Compute Contour 2 execution, adverse selection, risk, and stability diagnostics."""
     fill_usd_by_id = {f.fill_id: max(0.0, float(f.fill_usd)) for f in fills}
+    fill_by_id = {f.fill_id: f for f in fills}
 
     by_horizon: dict[int, list[ClvSnapshot]] = {}
     for c in clvs:
@@ -543,6 +577,20 @@ def compute_strategy_contour_metrics(
             break
     if primary_clv_30m is None and markouts:
         primary_clv_30m = markouts[0].volume_weighted_clv
+
+    maker_clvs = [c for c in clvs if (f := fill_by_id.get(c.fill_id)) is not None and f.is_maker]
+    taker_clvs = [c for c in clvs if (f := fill_by_id.get(c.fill_id)) is not None and not f.is_maker]
+
+    def _drift_fn(snap: ClvSnapshot) -> float | None:
+        fill = fill_by_id.get(snap.fill_id)
+        if fill is None or fill.entry_midpoint is None:
+            return None
+        return snap.benchmark_midpoint - fill.entry_midpoint
+
+    maker_clv_30m = _pick_preferred_horizon_metric(maker_clvs, fill_usd_by_id, lambda c: c.clv)
+    taker_clv_30m = _pick_preferred_horizon_metric(taker_clvs, fill_usd_by_id, lambda c: c.clv)
+    taker_midpoint_drift_30m = _pick_preferred_horizon_metric(taker_clvs, fill_usd_by_id, _drift_fn)
+    midpoint_drift_30m = _pick_preferred_horizon_metric(clvs, fill_usd_by_id, _drift_fn)
 
     # One CLV per fill (picking the longest/closing available horizon per fill) weighted by fill_usd
     best_clv_per_fill: dict[str, ClvSnapshot] = {}
@@ -664,6 +712,10 @@ def compute_strategy_contour_metrics(
     return StrategyContourMetrics(
         markouts=markouts,
         primary_clv_30m=round(primary_clv_30m, 6) if primary_clv_30m is not None else None,
+        maker_clv_30m=maker_clv_30m,
+        taker_clv_30m=taker_clv_30m,
+        taker_midpoint_drift_30m=taker_midpoint_drift_30m,
+        midpoint_drift_30m=midpoint_drift_30m,
         volume_weighted_clv=overall_vw_clv,
         realized_log_growth=log_growth,
         max_drawdown_pct=round(max_dd_pct, 2),
@@ -699,11 +751,27 @@ def evaluate_replay_gates(
     if not max_dd_ok:
         reasons.append(f"MAX_DD_EXCEEDS_{int(_MAX_GATE_DD_PCT)}PCT")
 
+    maker_markout_ok: bool | None = None
+    if strategy.maker_clv_30m is not None:
+        maker_markout_ok = strategy.maker_clv_30m >= _MIN_GATE_MARKOUT - _EPS
+
+    taker_drift_ok: bool | None = None
+    taker_metric = (
+        strategy.taker_midpoint_drift_30m
+        if strategy.taker_midpoint_drift_30m is not None
+        else strategy.taker_clv_30m
+    )
+    if taker_metric is not None:
+        taker_drift_ok = taker_metric >= _MIN_GATE_MARKOUT - _EPS
+
     markout_ok: bool | None = None
-    if strategy.primary_clv_30m is not None:
+    sub_checks = [x for x in (maker_markout_ok, taker_drift_ok) if x is not None]
+    if sub_checks:
+        markout_ok = all(sub_checks)
+    elif strategy.primary_clv_30m is not None:
         markout_ok = strategy.primary_clv_30m >= _MIN_GATE_MARKOUT - _EPS
-        if not markout_ok:
-            reasons.append("ADVERSE_MARKOUT")
+    if markout_ok is False:
+        reasons.append("ADVERSE_MARKOUT")
 
     fill_rate_ok = trade_count > 0 and fill_rate >= _MIN_GATE_FILL_RATE - _EPS
     if not fill_rate_ok:
@@ -719,6 +787,8 @@ def evaluate_replay_gates(
         brain_beats_market=brain_ok,
         max_dd_ok=max_dd_ok,
         markout_ok=markout_ok,
+        maker_markout_ok=maker_markout_ok,
+        taker_drift_ok=taker_drift_ok,
         fill_rate_ok=fill_rate_ok,
         overall_pass=overall_pass,
         reasons=reasons,

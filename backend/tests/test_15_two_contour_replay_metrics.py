@@ -649,3 +649,165 @@ def test_active_tail_ece_excludes_dead_mass_and_computes_discrete_pit() -> None:
     assert sum(res.pit_histogram) == pytest.approx(1.0, abs=1e-2)
     assert res.pit_mean is not None and res.pit_mean > 0.90
     assert res.pit_std == pytest.approx(0.0, abs=1e-4)
+
+
+def test_markout_separates_maker_clv_and_taker_midpoint_drift_and_avoids_spread_false_positive() -> None:
+    from weather_quant.replay.metrics import BrainSliceMetrics
+
+    t0 = datetime(2026, 11, 26, 10, 0, tzinfo=timezone.utc)
+    fills = [
+        FillRecord(
+            fill_id="f-mk",
+            order_id="o-mk",
+            event_id="ev-1",
+            station_icao="LFPB",
+            bucket_id="b-1",
+            side="BUY",
+            outcome_side="YES",
+            fill_price=0.30,
+            fill_shares=10.0,
+            fill_usd=3.0,
+            is_maker=True,
+            entry_midpoint=0.32,
+            model_version="m1",
+            strategy_version="v5",
+            filled_at_utc=t0,
+        ),
+        # Taker buys NO ask at 0.75 when mid0=0.72; 30m later mid30=0.725
+        # taker_clv_30m = 0.725 - 0.75 = -0.025 (looks bad due to 3c half-spread),
+        # BUT taker_midpoint_drift_30m = 0.725 - 0.720 = +0.005 (market moved WITH us!)
+        FillRecord(
+            fill_id="f-tk",
+            order_id="o-tk",
+            event_id="ev-2",
+            station_icao="KLGA",
+            bucket_id="b-2",
+            side="BUY",
+            outcome_side="NO",
+            fill_price=0.75,
+            fill_shares=10.0,
+            fill_usd=7.5,
+            fee_usd=0.14,
+            is_maker=False,
+            entry_midpoint=0.72,
+            model_version="m1",
+            strategy_version="v5",
+            filled_at_utc=t0,
+        ),
+    ]
+    clvs = [
+        ClvSnapshot(
+            clv_id="c-mk",
+            fill_id="f-mk",
+            event_id="ev-1",
+            bucket_id="b-1",
+            outcome_side="YES",
+            entry_price=0.30,
+            benchmark_midpoint=0.325,
+            clv=0.025,
+            horizon_minutes=30,
+            model_version="m1",
+            strategy_version="v5",
+            captured_at_utc=t0 + timedelta(minutes=30),
+        ),
+        ClvSnapshot(
+            clv_id="c-tk",
+            fill_id="f-tk",
+            event_id="ev-2",
+            bucket_id="b-2",
+            outcome_side="NO",
+            entry_price=0.75,
+            benchmark_midpoint=0.725,
+            clv=-0.025,
+            horizon_minutes=30,
+            model_version="m1",
+            strategy_version="v5",
+            captured_at_utc=t0 + timedelta(minutes=30),
+        ),
+    ]
+
+    strat = compute_strategy_contour_metrics(
+        clvs=clvs,
+        fills=fills,
+        positions=[],
+        equity_points=[(t0, 100.0), (t0 + timedelta(hours=1), 102.0)],
+        initial_bankroll=100.0,
+        final_equity=102.0,
+        max_drawdown_usd=0.0,
+        net_return_pct=2.0,
+    )
+    assert strat.maker_clv_30m == pytest.approx(0.025)
+    assert strat.taker_clv_30m == pytest.approx(-0.025)
+    assert strat.taker_midpoint_drift_30m == pytest.approx(0.005)
+    assert strat.midpoint_drift_30m == pytest.approx(0.005)
+
+    good_brain = BrainSliceMetrics(
+        label="premarket",
+        sample_count=10,
+        market_sample_count=10,
+        delta_log_loss=0.05,
+        gate_beats_market=True,
+    )
+    gates_ok = evaluate_replay_gates(
+        primary_brain=good_brain,
+        strategy=strat,
+        fill_rate=0.7,
+        trade_count=2,
+    )
+    assert gates_ok.maker_markout_ok is True
+    assert gates_ok.taker_drift_ok is True
+    assert gates_ok.markout_ok is True
+    assert "ADVERSE_MARKOUT" not in gates_ok.reasons
+
+    # Genuine toxic taker flow (midpoint drops -3c after fill) triggers ADVERSE_MARKOUT
+    toxic_clvs = [
+        clvs[0],
+        clvs[1].model_copy(update={"benchmark_midpoint": 0.69, "clv": -0.06}),
+    ]
+    strat_toxic_taker = compute_strategy_contour_metrics(
+        clvs=toxic_clvs,
+        fills=fills,
+        positions=[],
+        equity_points=[(t0, 100.0), (t0 + timedelta(hours=1), 98.0)],
+        initial_bankroll=100.0,
+        final_equity=98.0,
+        max_drawdown_usd=2.0,
+        net_return_pct=-2.0,
+    )
+    assert strat_toxic_taker.taker_midpoint_drift_30m == pytest.approx(-0.030)
+    gates_toxic_taker = evaluate_replay_gates(
+        primary_brain=good_brain,
+        strategy=strat_toxic_taker,
+        fill_rate=0.7,
+        trade_count=2,
+    )
+    assert gates_toxic_taker.maker_markout_ok is True
+    assert gates_toxic_taker.taker_drift_ok is False
+    assert gates_toxic_taker.markout_ok is False
+    assert "ADVERSE_MARKOUT" in gates_toxic_taker.reasons
+
+    # Toxic maker flow (< -2c) triggers ADVERSE_MARKOUT even when taker drift is positive
+    toxic_maker_clvs = [
+        clvs[0].model_copy(update={"benchmark_midpoint": 0.27, "clv": -0.03}),
+        clvs[1],
+    ]
+    strat_toxic_maker = compute_strategy_contour_metrics(
+        clvs=toxic_maker_clvs,
+        fills=fills,
+        positions=[],
+        equity_points=[(t0, 100.0), (t0 + timedelta(hours=1), 99.0)],
+        initial_bankroll=100.0,
+        final_equity=99.0,
+        max_drawdown_usd=1.0,
+        net_return_pct=-1.0,
+    )
+    gates_toxic_maker = evaluate_replay_gates(
+        primary_brain=good_brain,
+        strategy=strat_toxic_maker,
+        fill_rate=0.7,
+        trade_count=2,
+    )
+    assert gates_toxic_maker.maker_markout_ok is False
+    assert gates_toxic_maker.taker_drift_ok is True
+    assert gates_toxic_maker.markout_ok is False
+    assert "ADVERSE_MARKOUT" in gates_toxic_maker.reasons

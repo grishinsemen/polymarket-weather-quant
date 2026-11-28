@@ -45,6 +45,7 @@ from weather_quant.probability.engine import (
     round_half_away,
     to_event_unit,
 )
+from weather_quant.probability.student_t_emos import solve_weighted_t_mle_location
 from weather_quant.replay.metrics import compute_rps
 
 _EPS = 1e-9
@@ -363,6 +364,10 @@ def _compute_station_ewma_bias(
     current_date: date,
     window_days: int = 60,
     half_life_days: float = 14.0,
+    *,
+    use_robust_t_location: bool = False,
+    bias_shrinkage_days: float = DEFAULT_BIAS_SHRINKAGE_DAYS,
+    location_nu: float = 7.0,
 ) -> tuple[float, float]:
     """Compute EWMA station bias shrunk toward global prior bias, decoupled from scale."""
     s_valid: list[tuple[date, float]] = []
@@ -376,10 +381,17 @@ def _compute_station_ewma_bias(
         return prior_bias_c, 0.0
     weights = [0.5 ** (((current_date - d).days - 1) / half_life_days) for d, _ in s_valid]
     w_sum = sum(weights)
-    raw_bias_c = sum(w * e for w, (_, e) in zip(weights, s_valid)) / max(w_sum, _EPS)
+    if use_robust_t_location and len(s_valid) >= 3:
+        raw_bias_c = solve_weighted_t_mle_location(
+            [e for _, e in s_valid],
+            weights,
+            nu=location_nu,
+        )
+    else:
+        raw_bias_c = sum(w * e for w, (_, e) in zip(weights, s_valid)) / max(w_sum, _EPS)
     n_eff = (w_sum * w_sum) / max(sum(w * w for w in weights), _EPS)
-    bias_c = (n_eff * raw_bias_c + DEFAULT_BIAS_SHRINKAGE_DAYS * prior_bias_c) / (
-        n_eff + DEFAULT_BIAS_SHRINKAGE_DAYS
+    bias_c = (n_eff * raw_bias_c + bias_shrinkage_days * prior_bias_c) / (
+        n_eff + bias_shrinkage_days
     )
     return bias_c, n_eff
 
@@ -709,6 +721,7 @@ def run_benchmark(
         "M2b_tmle_ewma14_nu10",
         "M2b_tmle_ewma14_nu15",
         "M2b_tmle_ewma21_nu7",
+        "M3_v3_tloc_hl10_shrk4",
         "M2c_debiased_rms_norm",
     )
 
@@ -742,6 +755,8 @@ def run_benchmark(
     global_z_hist_14: dict[str, list[tuple[date, float]]] = defaultdict(list)
     station_z_hist_21: dict[tuple[str, str], list[tuple[date, float]]] = defaultdict(list)
     global_z_hist_21: dict[str, list[tuple[date, float]]] = defaultdict(list)
+    station_z_hist_v3: dict[tuple[str, str], list[tuple[date, float]]] = defaultdict(list)
+    global_z_hist_v3: dict[str, list[tuple[date, float]]] = defaultdict(list)
 
     reg_weights_cache: dict[tuple[str, str], tuple[float, float, float]] = {}
     reg_var_cache: dict[tuple[str, str], tuple[float, float]] = {}
@@ -800,9 +815,15 @@ def run_benchmark(
             )
             for pol in ("HIGHEST", "LOWEST")
         }
+        prior_tmle_v3 = {
+            pol: _compute_global_t_mle_prior(
+                global_z_hist_v3[pol], cur_date, nu=7.0, window_days=60, half_life_days=21.0
+            )
+            for pol in ("HIGHEST", "LOWEST")
+        }
 
         day_updates_eq: list[tuple[str, str, date, float, float]] = []
-        day_updates_w: list[tuple[str, str, str, date, float, float, float, float, float, float, float, float, float]] = []
+        day_updates_w: list[tuple[str, str, str, date, float, float, float, float, float, float, float, float, float, float]] = []
 
         for s in day_samples:
             st = station_cache.get(s.station_icao)
@@ -867,18 +888,31 @@ def run_benchmark(
                 window_days=60,
                 half_life_days=21.0,
             )
+            bias_v3, _ = _compute_station_ewma_bias(
+                station_hist_w[(s.station_icao, pol)],
+                pb_w60,
+                cur_date,
+                window_days=60,
+                half_life_days=10.0,
+                use_robust_t_location=True,
+                bias_shrinkage_days=4.0,
+                location_nu=7.0,
+            )
             mu_14 = w_mean + bias_14
             mu_21 = w_mean + bias_21
+            mu_v3 = w_mean + bias_v3
 
             # Standardized de-biased residuals from strictly prior-day bias
             deb_res_14 = actual_c - mu_14
             deb_res_21 = actual_c - mu_21
+            deb_res_v3 = actual_c - mu_v3
             z_14 = deb_res_14 / het_std_deb
             z_21 = deb_res_21 / het_std_deb
+            z_v3 = deb_res_v3 / het_std_deb
 
             day_updates_eq.append((s.station_icao, pol, cur_date, actual_c - eq_mean, eq_std))
             day_updates_w.append(
-                (s.station_icao, reg, pol, cur_date, e_t, g_t, i_t, actual_c, actual_c - w_mean, het_std_old, deb_res_14, z_14, z_21)
+                (s.station_icao, reg, pol, cur_date, e_t, g_t, i_t, actual_c, actual_c - w_mean, het_std_old, deb_res_14, z_14, z_21, z_v3)
             )
 
             if cur_date < score_start_date:
@@ -1006,11 +1040,31 @@ def run_benchmark(
                 _crps_student_t(actual_c, mu_21, sig_tmle_21, 7.0),
             )
 
+            # 6) M3_v3_tloc_hl10_shrk4
+            tmle_mult_v3 = _compute_station_ewma_t_mle_scale(
+                station_z_hist_v3[(s.station_icao, pol)],
+                prior_tmle_v3[pol],
+                cur_date,
+                nu=7.0,
+                window_days=60,
+                half_life_days=21.0,
+                prior_strength=10.0,
+            )
+            sig_tmle_v3 = het_std_deb * tmle_mult_v3
+            _record(
+                "M3_v3_tloc_hl10_shrk4",
+                _cdf_probs_student_t(mu_v3, sig_tmle_v3, 7.0, bounds_lo, bounds_hi),
+                mu_v3 - t7_factor * sig_tmle_v3,
+                mu_v3,
+                mu_v3 + t7_factor * sig_tmle_v3,
+                _crps_student_t(actual_c, mu_v3, sig_tmle_v3, 7.0),
+            )
+
         # Update walk-forward history strictly AFTER scoring cur_date
         for icao, pol, d, err_eq, std_eq in day_updates_eq:
             station_hist_eq[(icao, pol)].append((d, err_eq, std_eq))
             global_hist_eq[pol].append((d, err_eq, std_eq))
-        for icao, reg, pol, d, e_t, g_t, i_t, act_c, err_w, std_w, deb_res_14, z_14, z_21 in day_updates_w:
+        for icao, reg, pol, d, e_t, g_t, i_t, act_c, err_w, std_w, deb_res_14, z_14, z_21, z_v3 in day_updates_w:
             reg_nwp_rows[(reg, pol)].append((e_t, g_t, i_t, act_c))
             eq_m = (e_t + g_t + i_t) / 3.0
             im_var = ((e_t - eq_m) ** 2 + (g_t - eq_m) ** 2 + (i_t - eq_m) ** 2) / 3.0
@@ -1022,6 +1076,8 @@ def run_benchmark(
             global_z_hist_14[pol].append((d, z_14))
             station_z_hist_21[(icao, pol)].append((d, z_21))
             global_z_hist_21[pol].append((d, z_21))
+            station_z_hist_v3[(icao, pol)].append((d, z_v3))
+            global_z_hist_v3[pol].append((d, z_v3))
 
     return {
         "max_date_quarantine": max_date.isoformat(),
@@ -1109,6 +1165,7 @@ def main() -> None:
             ("M2_old_ewma14_t7", "M2_old"),
             ("M2a_debiased_rms_t7", "M2a_rms"),
             ("M2b_tmle_ewma14_nu7", "M2b_t7"),
+            ("M3_v3_tloc_hl10_shrk4", "M3_v3"),
             ("M2b_tmle_ewma14_nu10", "M2b_t10"),
             ("M2c_debiased_rms_norm", "M2c_N"),
         ):
@@ -1125,6 +1182,7 @@ def main() -> None:
         "M2a_debiased_rms_t7",
         "M2b_tmle_ewma14_nu5",
         "M2b_tmle_ewma14_nu7",
+        "M3_v3_tloc_hl10_shrk4",
         "M2b_tmle_ewma14_nu10",
         "M2b_tmle_ewma14_nu15",
         "M2c_debiased_rms_norm",

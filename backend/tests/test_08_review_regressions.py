@@ -564,6 +564,125 @@ async def test_fetch_clob_books_rest_chunks_tokens_and_runtime_handles_429_coold
         await app.state.autonomous_runtime.run_cycle()
         assert limited.calls == 1
 
+        # After 180s cooldown expires, second consecutive 429 triggers 360s exponential backoff
+        clock.advance(timedelta(seconds=160))
+        await app.state.autonomous_runtime.run_cycle()
+        assert limited.calls == 2
+        clock.advance(timedelta(seconds=200))
+        await app.state.autonomous_runtime.run_cycle()
+        assert limited.calls == 2  # still within 360s backoff
+
+
+@pytest.mark.asyncio
+async def test_autonomous_runtime_spreads_ensemble_fetches_across_cycles_with_180m_refresh(
+    tmp_path: Path,
+) -> None:
+    from weather_quant.domain.models import Station
+
+    class _FiveStationWorldFeed:
+        def __init__(self, target_day: date) -> None:
+            self.target_day = target_day
+            self.stations = [
+                ("LFPB", "Paris"),
+                ("EGLC", "London"),
+                ("EDDM", "Munich"),
+                ("LEMD", "Madrid"),
+                ("EHAM", "Amsterdam"),
+            ]
+
+        async def fetch_weather_events(self) -> list[dict[str, Any]]:
+            return [
+                {
+                    "id": f"evt-{icao.lower()}",
+                    "slug": f"highest-temperature-in-{city.lower()}-on-{self.target_day.isoformat()}",
+                    "title": f"Highest temperature in {city} on {self.target_day.isoformat()}?",
+                    "description": (
+                        f"This market will resolve to the highest temperature reported at ({icao}) "
+                        "on 26 Nov '26. Only routine METAR reports qualify; SPECI is excluded."
+                    ),
+                    "negRisk": True,
+                    "active": True,
+                    "markets": [
+                        {
+                            "id": f"m-{icao}-0",
+                            "groupItemTitle": "12°C",
+                            "clobTokenIds": f'["tok-{icao}-0", "tok-{icao}-no-0"]',
+                            "feesEnabled": True,
+                            "feeType": "weather_fees",
+                            "takerBaseFee": 1000,
+                            "makerBaseFee": 0,
+                        },
+                        {
+                            "id": f"m-{icao}-1",
+                            "groupItemTitle": "13°C",
+                            "clobTokenIds": f'["tok-{icao}-1", "tok-{icao}-no-1"]',
+                            "feesEnabled": True,
+                            "feeType": "weather_fees",
+                            "takerBaseFee": 1000,
+                            "makerBaseFee": 0,
+                        },
+                    ],
+                }
+                for icao, city in self.stations
+            ]
+
+        async def fetch_metar_reports(self, station_icaos: list[str]) -> list[str]:
+            return []
+
+    now = datetime(2026, 11, 26, 6, 0, tzinfo=timezone.utc)
+    clock = VirtualClock(now)
+    fetched_by_cycle: list[list[str]] = []
+
+    class _RecordingFetcher:
+        def __init__(self) -> None:
+            self.cur: list[str] = []
+
+        async def fetch_ensemble(self, station: Station, event_id: str, local_date: date | None = None) -> EnsembleSnapshot:
+            self.cur.append(station.icao)
+            hours = [datetime(2026, 11, 26, h, 0, tzinfo=timezone.utc) for h in range(24)]
+            return EnsembleSnapshot(
+                event_id=event_id,
+                station_icao=station.icao,
+                fetched_at_utc=clock.now(),
+                ingested_at_utc=clock.now(),
+                models=["ecmwf_ifs025"],
+                member_count=2,
+                hourly_timestamps_utc=hours,
+                member_temps_c=[[12.0] * 24, [12.5] * 24],
+            )
+
+    app = create_app(
+        db_path=":memory:",
+        world_feed=_FiveStationWorldFeed(date(2026, 11, 26)),
+        clock=clock,
+        enable_background_poll=False,
+        archive_dir=str(tmp_path / "archive_stagger"),
+    )
+    rec_fetcher = _RecordingFetcher()
+    app.state.ensemble_fetcher = rec_fetcher
+    with TestClient(app):
+        rt = app.state.autonomous_runtime
+        assert rt.ensemble_refresh_minutes == 180
+        assert rt.max_ensemble_fetches_per_cycle == 4
+        rt.max_ensemble_fetches_per_cycle = 2
+
+        for _ in range(3):
+            rec_fetcher.cur = []
+            clock.advance(timedelta(minutes=1))
+            await rt.run_cycle()
+            fetched_by_cycle.append(list(rec_fetcher.cur))
+
+        assert [len(batch) for batch in fetched_by_cycle] == [2, 2, 1]
+        assert sorted(icao for batch in fetched_by_cycle for icao in batch) == [
+            "EDDM", "EGLC", "EHAM", "LEMD", "LFPB"
+        ]
+
+        # At +90m (< 180m refresh), zero network fetches happen
+        rec_fetcher.cur = []
+        clock.advance(timedelta(minutes=90))
+        await rt.run_cycle()
+        assert rec_fetcher.cur == []
+
 
 @pytest.mark.asyncio
 async def test_autonomous_runtime_skips_event_missing_hourly_horizon_without_aborting_cycle(
@@ -979,3 +1098,36 @@ async def test_http_world_feed_backfills_36h_metar_on_initial_station_fetch() ->
         ("KLGA", "36"),
         ("MMMX", "4"),
     ]
+
+
+def test_terminal_snapshot_hides_deprecated_strategies_when_modern_strategy_is_active(tmp_path) -> None:
+    """Legacy strategies are hidden from /api/terminal/snapshot dropdowns unless active or explicitly requested."""
+    db_file = tmp_path / "hide_legacy.db"
+    archive_dir = tmp_path / "archive"
+    app = create_app(
+        db_path=str(db_file),
+        archive_dir=str(archive_dir),
+        enable_background_poll=False,
+    )
+    with TestClient(app) as client:
+        assert client.post("/api/terminal/seed-demo").status_code == 200
+        # Switch active strategy away from conservative-kelly-100-v1 to kelly-multi-strict-v3
+        resp_promote = client.post(
+            "/api/replay/promote",
+            json={"model_version": "ensemble-3layer-v1", "strategy_version": "kelly-multi-strict-v3"},
+        )
+        assert resp_promote.status_code == 200
+
+        snap = client.get("/api/terminal/snapshot").json()
+        names = [s["strategy_version"] for s in snap["strategy_versions"]]
+        assert "kelly-multi-strict-v3" in names
+        assert "kelly-multi-strict-v3.1" in names
+        assert "kelly-multi-strict-v4" in names
+        for retired in (
+            "conservative-kelly-100-v1",
+            "aggressive-kelly-100-v2",
+            "scalp-spread-100-v1",
+            "scalp-spread-100-v2",
+            "kelly-multi-strict-v2",
+        ):
+            assert retired not in names

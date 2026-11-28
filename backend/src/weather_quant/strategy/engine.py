@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, Field
 
 from weather_quant.clob.fees import calculate_net_edge
-from weather_quant.domain.clock import Clock
+from weather_quant.domain.clock import Clock, ensure_utc
 from weather_quant.metar.parser import SpeciCancelAlert
 from weather_quant.strategy.kelly import (
     is_metar_or_nwp_blackout,
@@ -222,6 +222,10 @@ R_BLACKOUT_METAR = "BLACKOUT_METAR_RELEASE"
 R_BLACKOUT_NWP = "BLACKOUT_NWP_RELEASE"
 R_SPECI_CANCEL = "SPECI_ADVERSE_SELECTION_CANCEL"
 R_ANOMALY_DIVERGENCE = "ANOMALY_DIVERGENCE_KILL_SWITCH"
+R_TTL_EXPIRED = "TTL_EXPIRED_CANCEL_RESTING_ENTRY"
+R_REPRICE_SPREAD = "REPRICE_SPREAD_INSIDE"
+R_TAKER_EDGE = "SELECTIVE_TAKER_NET_EDGE_OK"
+R_TAKER_UNFILLED = "TAKER_UNFILLED_IOC"
 
 
 # --------------------------------------------------------------------------------------------
@@ -262,10 +266,13 @@ class StrategyParams(BaseModel):
     metar_fresh_minutes: int = 90
     clv_horizons_minutes: tuple[int, ...] = DEFAULT_CLV_HORIZONS_MINUTES
     # TICKET-6 feature flags
+    enable_buy_yes: bool = True
     enable_buy_no: bool = False
+    rank_candidates_by_roi: bool = False
     enable_dynamic_take_profit: bool = False
     hold_to_expiry: bool = False
     take_profit_min_profit: float = 0.03
+    profit_take_min_profit: float = 0.0
     take_profit_premium: float = 0.02
     # V2 Level 4 feature flags
     enable_market_shrinkage: bool = False
@@ -276,6 +283,24 @@ class StrategyParams(BaseModel):
     enable_blackout_windows: bool = False
     max_anomaly_divergence: float | None = None
     strict_maker_fills: bool = False
+    # V3 Contour 2 adverse-selection, TTL, intraday anomaly & stale-book fill protections
+    enforce_fresh_executor_books: bool = False
+    max_order_age_minutes: float | None = None
+    crash_cancel_ask_threshold: float = 0.02
+    crash_cancel_drop_ratio: float | None = None
+    anomaly_divergence_intraday: bool = False
+    # V4 Contour 2 spread-inside passive quoting, selective IOC taker & blackout FIFO preservation
+    spread_inside_edge_share: float = 0.0
+    spread_inside_min_spread: float = 0.04
+    spread_inside_max_improve: float = 0.05
+    spread_inside_reprice_ticks: int = 0
+    spread_inside_buy_yes: bool = True
+    spread_inside_buy_no: bool = True
+    enable_selective_taker: bool = False
+    taker_no_only: bool = False
+    taker_min_net_edge: float = 0.12
+    taker_max_spread: float = 0.10
+    cancel_resting_on_blackout: bool = True
 
     @classmethod
     def from_manifest(cls, manifest: StrategyVersionRecord) -> "StrategyParams":
@@ -308,6 +333,128 @@ def v2_multi_kelly_strict_manifest(created_at_utc: datetime | None = None) -> St
             "enable_multi_kelly": True,
             "enable_blackout_windows": False,
             "strict_maker_fills": True,
+        },
+        is_active=False,
+        created_at_utc=created_at_utc or datetime.now(timezone.utc),
+    )
+
+
+def v3_multi_kelly_strict_manifest(created_at_utc: datetime | None = None) -> StrategyVersionRecord:
+    """Return the V3 ``kelly-multi-strict-v3`` manifest with Contour 2 blackout, TTL & crash-guard fixes."""
+    return StrategyVersionRecord(
+        strategy_version="kelly-multi-strict-v3",
+        description=(
+            "V3 Multi-Outcome Fractional Kelly with blackout windows, 45m resting TTL, "
+            "all-day anomaly kill-switch, upgraded crash guard & strict fresh-book fills"
+        ),
+        reference_bankroll=100.0,
+        kelly_fraction=0.2,
+        max_bucket_usd=5.0,
+        max_city_exposure_usd=8.0,
+        intraday_cash_reserve_ratio=0.4,
+        min_edge=0.05,
+        min_top_liquidity_usd=5.0,
+        stale_feed_seconds=30,
+        cutoff_minutes_before_settlement=30,
+        config_json={
+            "post_only": True,
+            "phases": [PHASE_PREMARKET, PHASE_INTRADAY],
+            "enable_buy_no": True,
+            "enable_market_shrinkage": True,
+            "market_shrinkage_us": 0.30,
+            "market_shrinkage_intl": 0.15,
+            "enable_multi_kelly": True,
+            "enable_blackout_windows": True,
+            "max_anomaly_divergence": 0.18,
+            "anomaly_divergence_intraday": True,
+            "strict_maker_fills": True,
+            "enforce_fresh_executor_books": True,
+            "max_order_age_minutes": 45.0,
+            "crash_cancel_ask_threshold": 0.05,
+            "crash_cancel_drop_ratio": 0.60,
+        },
+        is_active=False,
+        created_at_utc=created_at_utc or datetime.now(timezone.utc),
+    )
+
+
+def v3_1_multi_kelly_strict_manifest(created_at_utc: datetime | None = None) -> StrategyVersionRecord:
+    """Return the V3.1 ``kelly-multi-strict-v3.1`` manifest fixing micro-profit exits & expensive BUY NO."""
+    base_cfg = dict(v3_multi_kelly_strict_manifest(created_at_utc).config_json)
+    return StrategyVersionRecord(
+        strategy_version="kelly-multi-strict-v3.1",
+        description=(
+            "V3.1 Patch: V3 protections + minimum +4c convergence take-profit "
+            "and max_buy_no_price=0.65 cap against asymmetric heavy-NO drawdowns"
+        ),
+        reference_bankroll=100.0,
+        kelly_fraction=0.2,
+        max_bucket_usd=5.0,
+        max_city_exposure_usd=8.0,
+        intraday_cash_reserve_ratio=0.4,
+        min_edge=0.05,
+        min_top_liquidity_usd=5.0,
+        stale_feed_seconds=30,
+        cutoff_minutes_before_settlement=30,
+        config_json={
+            **base_cfg,
+            "profit_take_min_profit": 0.04,
+            "max_buy_no_price": 0.65,
+        },
+        is_active=False,
+        created_at_utc=created_at_utc or datetime.now(timezone.utc),
+    )
+
+
+def v4_multi_kelly_strict_manifest(created_at_utc: datetime | None = None) -> StrategyVersionRecord:
+    """Return the V4 ``kelly-multi-strict-v4`` manifest with spread-inside quoting & selective IOC taker."""
+    base_cfg = dict(v3_multi_kelly_strict_manifest(created_at_utc).config_json)
+    return StrategyVersionRecord(
+        strategy_version="kelly-multi-strict-v4",
+        description="V4 Multi-Outcome Fractional Kelly with spread-inside quoting & selective IOC taker (>=12c outside blackout)",
+        reference_bankroll=100.0,
+        kelly_fraction=0.2,
+        max_bucket_usd=5.0,
+        max_city_exposure_usd=8.0,
+        intraday_cash_reserve_ratio=0.4,
+        min_edge=0.05,
+        min_top_liquidity_usd=5.0,
+        stale_feed_seconds=30,
+        cutoff_minutes_before_settlement=30,
+        config_json={
+            **base_cfg,
+            "spread_inside_edge_share": 0.25,
+            "spread_inside_min_spread": 0.04,
+            "spread_inside_max_improve": 0.05,
+            "spread_inside_reprice_ticks": 2,
+            "enable_selective_taker": True,
+            "taker_min_net_edge": 0.12,
+            "taker_max_spread": 0.10,
+            "cancel_resting_on_blackout": True,
+        },
+        is_active=False,
+        created_at_utc=created_at_utc or datetime.now(timezone.utc),
+    )
+
+
+def v5_multi_kelly_strict_manifest(created_at_utc: datetime | None = None) -> StrategyVersionRecord:
+    """Return V5 ``kelly-multi-strict-v5``: V4 spread-inside + selective NO-only IOC taker."""
+    v4_cfg = dict(v4_multi_kelly_strict_manifest(created_at_utc).config_json)
+    return StrategyVersionRecord(
+        strategy_version="kelly-multi-strict-v5",
+        description="V5 Multi-Outcome Fractional Kelly with spread-inside quoting & selective NO-only IOC taker (>=12c outside blackout)",
+        reference_bankroll=100.0,
+        kelly_fraction=0.2,
+        max_bucket_usd=5.0,
+        max_city_exposure_usd=8.0,
+        intraday_cash_reserve_ratio=0.4,
+        min_edge=0.05,
+        min_top_liquidity_usd=5.0,
+        stale_feed_seconds=30,
+        cutoff_minutes_before_settlement=30,
+        config_json={
+            **v4_cfg,
+            "taker_no_only": True,
         },
         is_active=False,
         created_at_utc=created_at_utc or datetime.now(timezone.utc),
@@ -870,9 +1017,9 @@ class StrategyStore:
             """
             INSERT OR REPLACE INTO fills (
                 fill_id, order_id, event_id, station_icao, bucket_id, side, outcome_side,
-                fill_price, fill_shares, fill_usd, fee_usd, is_maker, expected_edge,
-                realized_edge, model_version, strategy_version, filled_at_utc
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                fill_price, fill_shares, fill_usd, fee_usd, is_maker, entry_midpoint,
+                expected_edge, realized_edge, model_version, strategy_version, filled_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fill.fill_id,
@@ -887,6 +1034,7 @@ class StrategyStore:
                 fill.fill_usd,
                 fill.fee_usd,
                 int(fill.is_maker),
+                fill.entry_midpoint,
                 fill.expected_edge,
                 fill.realized_edge,
                 fill.model_version,
@@ -1035,6 +1183,7 @@ class StrategyStore:
                 fill_usd=r["fill_usd"],
                 fee_usd=r["fee_usd"],
                 is_maker=bool(r["is_maker"]),
+                entry_midpoint=_col(r, "entry_midpoint", None),
                 expected_edge=_col(r, "expected_edge", None),
                 realized_edge=_col(r, "realized_edge", None),
                 model_version=r["model_version"],
@@ -1284,6 +1433,7 @@ class _Candidate:
     limit: float
     edge: float
     model_version: str
+    post_only: bool = True
 
 
 def _round_price(price: float) -> float:
@@ -1337,10 +1487,22 @@ class StrategyEngine:
             try:
                 self.manifest = await self.db.get_active_strategy_version()
                 self.params = StrategyParams.from_manifest(self.manifest)
+                self._sync_executor_flags()
                 return
             except RuntimeError:
                 pass
         await self.store.register_strategy_version(self.manifest)
+        self._sync_executor_flags()
+
+    def _sync_executor_flags(self) -> None:
+        if hasattr(self.executor, "strict_maker_fills"):
+            self.executor.strict_maker_fills = self.params.strict_maker_fills
+        if hasattr(self.executor, "stale_feed_seconds"):
+            self.executor.stale_feed_seconds = (
+                float(self.manifest.stale_feed_seconds)
+                if self.params.enforce_fresh_executor_books
+                else None
+            )
 
     # ---- operator controls ----------------------------------------------------------------
     async def pause(self, model_version: str | None = None) -> None:
@@ -1412,19 +1574,111 @@ class StrategyEngine:
         age = (now - book.ingested_at_utc).total_seconds()
         return age > self.manifest.stale_feed_seconds
 
-    def _passive_buy_limit(self, book: OrderBookSnapshot, fair: float) -> float | None:
+    def _candidate_score(self, cand: _Candidate) -> float:
+        if self.params.rank_candidates_by_roi:
+            return cand.edge / max(cand.limit, _EPS)
+        return cand.edge
+
+    def _passive_buy_limit(
+        self,
+        book: OrderBookSnapshot,
+        fair: float,
+        *,
+        allow_spread_inside: bool = True,
+    ) -> float | None:
         tick = resolve_tick_size(book, self.params.tick_size)
         ceiling = math.floor((fair - self.manifest.min_edge) / tick + _EPS) * tick
         upper = ceiling
         if book.best_ask is not None:
             upper = min(upper, book.best_ask - tick)
         if book.best_bid is not None:
-            target = min(upper, book.best_bid + tick)
+            base_target = book.best_bid + tick
+            if (
+                allow_spread_inside
+                and self.params.spread_inside_edge_share > _EPS
+                and book.best_ask is not None
+                and (book.best_ask - book.best_bid) >= self.params.spread_inside_min_spread - _EPS
+                and upper > base_target + _EPS
+            ):
+                raw_edge_at_base = max(0.0, fair - base_target)
+                improve = min(
+                    max(0.0, self.params.spread_inside_max_improve),
+                    max(0.0, self.params.spread_inside_edge_share) * raw_edge_at_base,
+                )
+                stepped = math.floor((base_target + improve) / tick + _EPS) * tick
+                target = min(upper, max(base_target, stepped))
+            else:
+                target = min(upper, base_target)
             if target < book.best_bid - _EPS:
                 return None
         else:
             target = upper
         return clamp_order_price(target, tick)
+
+    def _evaluate_taker_buy(
+        self,
+        book: OrderBookSnapshot,
+        fair: float,
+        event: WeatherEvent,
+        *,
+        min_price: float,
+        max_price: float,
+    ) -> tuple[float, float] | None:
+        """Return ``(limit_price, net_edge_taker)`` when ask liquidity clears ``taker_min_net_edge``."""
+        if not self.params.enable_selective_taker or book.best_ask is None:
+            return None
+        tick = resolve_tick_size(book, self.params.tick_size)
+        if book.best_bid is not None and (book.best_ask - book.best_bid) > self.params.taker_max_spread + _EPS:
+            return None
+        asks = sorted(
+            (lvl for lvl in book.asks if 0.0 < lvl.price < 1.0 and lvl.size > _EPS),
+            key=lambda lvl: lvl.price,
+        )
+        if not asks:
+            return None
+        if asks[0].price < min_price - _EPS or asks[0].price > max_price + _EPS:
+            return None
+
+        # Only sweep ask levels whose worst-case share still clears taker_min_net_edge after weather_fees.
+        min_req_shares = max(self.params.min_order_shares, self.params.min_entry_shares)
+        acceptable: list[OrderLevel] = []
+        for lvl in asks:
+            if lvl.price > max_price + _EPS:
+                break
+            lvl_edge = calculate_net_edge(fair, lvl.price, side="BUY", is_maker=False, event=event)
+            if lvl_edge < self.params.taker_min_net_edge - _EPS:
+                break
+            acceptable.append(lvl)
+        if not acceptable:
+            return None
+
+        avail_shares = sum(lvl.size for lvl in acceptable)
+        avail_usd = sum(lvl.price * lvl.size for lvl in acceptable)
+        if avail_shares < min_req_shares - _EPS or avail_usd < self.manifest.min_top_liquidity_usd - _EPS:
+            return None
+
+        # Compute net edge at VWAP across a realistic entry chunk (up to max_bucket_usd).
+        target_usd = min(self.manifest.max_bucket_usd, avail_usd)
+        rem_usd = target_usd
+        filled_s = 0.0
+        spent_usd = 0.0
+        for lvl in acceptable:
+            take_s = min(lvl.size, rem_usd / max(lvl.price, tick))
+            filled_s += take_s
+            spent_usd += take_s * lvl.price
+            rem_usd -= take_s * lvl.price
+            if rem_usd <= 1e-6:
+                break
+        if filled_s <= _EPS:
+            return None
+        vwap_ask = spent_usd / filled_s
+        net_edge = calculate_net_edge(fair, vwap_ask, side="BUY", is_maker=False, event=event)
+        if net_edge < self.params.taker_min_net_edge - _EPS:
+            return None
+        limit_px = clamp_order_price(acceptable[-1].price, tick)
+        if limit_px is None:
+            return None
+        return limit_px, net_edge
 
     def _passive_sell_limit(self, book: OrderBookSnapshot) -> float | None:
         tick = resolve_tick_size(book, self.params.tick_size)
@@ -1499,6 +1753,7 @@ class StrategyEngine:
         ``books`` is keyed by ``bucket_id``.
         """
         now = self.clock.now()
+        self._sync_executor_flags()
         mv = probabilities.model_version
         await self.store.ensure_model_version(mv, now)
         result = TickResult()
@@ -1601,11 +1856,17 @@ class StrategyEngine:
                 continue
 
             reasons: list[str] = []
+            max_age_min = self.params.max_order_age_minutes
+            order_age_exceeded = (
+                max_age_min is not None
+                and (ensure_utc(now) - ensure_utc(order.created_at_utc)).total_seconds()
+                > max_age_min * 60.0 + _EPS
+            )
             if price_invalid:
                 reasons = [R_EDGE_LOST_CANCEL]
             elif speci_triggered:
                 reasons = [R_SPECI_CANCEL]
-            elif in_blackout and blackout_reason is not None:
+            elif in_blackout and blackout_reason is not None and self.params.cancel_resting_on_blackout:
                 reasons = [blackout_reason]
             elif in_cutoff:
                 reasons = [R_CUTOFF]
@@ -1613,23 +1874,42 @@ class StrategyEngine:
                 reasons = [R_PAUSED]
             elif is_zeroed and order.outcome_side == "YES":
                 reasons = [R_EDGE_LOST_CANCEL]
-            elif book is not None and prob is not None and not self._is_stale(book, now):
+            elif order_age_exceeded:
+                reasons = [R_TTL_EXPIRED]
+            elif book is not None and prob is not None and (
+                not self._is_stale(book, now) or self.params.enforce_fresh_executor_books
+            ):
                 if order.outcome_side == "NO":
                     eff_fair = 1.0 if prob.is_impossible else (1.0 - prob.fair_probability)
                 else:
                     eff_fair = 0.0 if prob.is_impossible else prob.fair_probability
                 edge = calculate_net_edge(eff_fair, order.limit_price, side="BUY", is_maker=True, event=event)
-                # Adverse-selection crash guard: if ask collapsed to <= 2c on a resting >= 6c BUY,
-                # the market likely already priced in a live METAR breach ahead of our METAR poll.
-                is_crash_ask = (
-                    book.best_ask is not None
-                    and order.limit_price >= 0.06 - _EPS
-                    and book.best_ask <= 0.02 + _EPS
+                # Adverse-selection crash guard: cancel if ask collapsed to floor or dropped sharply vs limit.
+                crash_thr = self.params.crash_cancel_ask_threshold
+                drop_ratio = self.params.crash_cancel_drop_ratio
+                is_crash_ask = book.best_ask is not None and (
+                    (order.limit_price >= 0.06 - _EPS and book.best_ask <= crash_thr + _EPS)
+                    or (drop_ratio is not None and book.best_ask <= order.limit_price * drop_ratio + _EPS)
                 )
                 if is_crash_ask:
                     reasons = [R_CRASH_CANCEL]
                 elif edge < self.manifest.min_edge - _EPS:
                     reasons = [R_EDGE_LOST_CANCEL]
+                elif (
+                    self.params.spread_inside_reprice_ticks > 0
+                    and order.post_only
+                    and order.status == "OPEN"
+                    and not in_blackout
+                    and not self._is_stale(book, now)
+                ):
+                    new_limit = self._passive_buy_limit(book, eff_fair)
+                    if (
+                        new_limit is not None
+                        and abs(new_limit - order.limit_price)
+                        >= self.params.spread_inside_reprice_ticks * tick - _EPS
+                        and (book.best_ask is None or new_limit < book.best_ask - _EPS)
+                    ):
+                        reasons = [R_REPRICE_SPREAD]
             if reasons:
                 await executor.cancel_order(order.order_id)
                 result.cancelled.append(order.order_id)
@@ -1749,7 +2029,7 @@ class StrategyEngine:
             skip_reason: str | None = None
             skip_detail: dict[str, Any] = {}
 
-            # 1) Evaluate BUY YES
+            # 1) Evaluate BUY YES (feature flag: enable_buy_yes)
             fair_yes = 0.0 if prob.is_impossible else prob.fair_probability
             raw_fair_yes = raw_fair_by_bucket.get(bucket.bucket_id, fair_yes)
             if (
@@ -1757,7 +2037,7 @@ class StrategyEngine:
                 and not prob.is_impossible
                 and book.midpoint is not None
                 and abs(raw_fair_yes - book.midpoint) > self.params.max_anomaly_divergence + _EPS
-                and not intraday
+                and (not intraday or self.params.anomaly_divergence_intraday)
             ):
                 await self._skip(
                     result,
@@ -1768,22 +2048,26 @@ class StrategyEngine:
                     {"raw_fair": raw_fair_yes, "shrunk_fair": fair_yes, "midpoint": book.midpoint},
                 )
                 continue
-            limit_yes = self._passive_buy_limit(book, fair_yes)
-            if "NO" in held_sides:
-                limit_yes = None
-            if limit_yes is None:
-                skip_reason = R_BELOW_EDGE
-                skip_detail = {"fair": fair_yes, "best_bid": book.best_bid, "best_ask": book.best_ask}
-            elif limit_yes < self.params.min_buy_price - _EPS:
-                skip_reason = R_CHEAP_TAIL
-                skip_detail = {
-                    "limit_price": limit_yes,
-                    "min_buy_price": self.params.min_buy_price,
-                    "fair": fair_yes,
-                }
-            else:
-                edge_yes = calculate_net_edge(fair_yes, limit_yes, side="BUY", is_maker=True, event=event)
-                if edge_yes >= self.manifest.min_edge - _EPS:
+            if self.params.enable_buy_yes:
+                allow_taker_yes = (
+                    "NO" not in held_sides
+                    and not in_blackout
+                    and not speci_triggered
+                    and not self.params.taker_no_only
+                )
+                taker_yes = (
+                    self._evaluate_taker_buy(
+                        book,
+                        fair_yes,
+                        event,
+                        min_price=self.params.min_buy_price,
+                        max_price=1.0 - resolve_tick_size(book, self.params.tick_size),
+                    )
+                    if allow_taker_yes
+                    else None
+                )
+                if taker_yes is not None:
+                    t_lim, t_edge = taker_yes
                     bucket_cands.append(
                         _Candidate(
                             bucket_id=bucket.bucket_id,
@@ -1791,51 +2075,116 @@ class StrategyEngine:
                             token_id=bucket.token_id,
                             outcome_side="YES",
                             fair=fair_yes,
-                            limit=limit_yes,
-                            edge=edge_yes,
+                            limit=t_lim,
+                            edge=t_edge,
                             model_version=prob.model_version,
+                            post_only=False,
                         )
                     )
                 else:
-                    skip_reason = R_BELOW_EDGE
-                    skip_detail = {"edge": edge_yes}
+                    limit_yes = self._passive_buy_limit(
+                        book,
+                        fair_yes,
+                        allow_spread_inside=self.params.spread_inside_buy_yes,
+                    )
+                    if "NO" in held_sides:
+                        limit_yes = None
+                    if limit_yes is None:
+                        skip_reason = R_BELOW_EDGE
+                        skip_detail = {"fair": fair_yes, "best_bid": book.best_bid, "best_ask": book.best_ask}
+                    elif limit_yes < self.params.min_buy_price - _EPS:
+                        skip_reason = R_CHEAP_TAIL
+                        skip_detail = {
+                            "limit_price": limit_yes,
+                            "min_buy_price": self.params.min_buy_price,
+                            "fair": fair_yes,
+                        }
+                    else:
+                        edge_yes = calculate_net_edge(fair_yes, limit_yes, side="BUY", is_maker=True, event=event)
+                        if edge_yes >= self.manifest.min_edge - _EPS:
+                            bucket_cands.append(
+                                _Candidate(
+                                    bucket_id=bucket.bucket_id,
+                                    label=label_by_bucket.get(bucket.bucket_id, bucket.bucket_id),
+                                    token_id=bucket.token_id,
+                                    outcome_side="YES",
+                                    fair=fair_yes,
+                                    limit=limit_yes,
+                                    edge=edge_yes,
+                                    model_version=prob.model_version,
+                                )
+                            )
+                        else:
+                            skip_reason = R_BELOW_EDGE
+                            skip_detail = {"edge": edge_yes}
 
             # 2) Symmetric BUY NO on overheated buckets (feature flag: enable_buy_no)
             if self.params.enable_buy_no and not prob.is_impossible and "YES" not in held_sides:
                 no_book = derive_no_book(book, no_token_id=bucket.no_token_id)
                 fair_no = max(0.0, min(1.0, 1.0 - prob.fair_probability))
-                limit_no = self._passive_buy_limit(no_book, fair_no)
-                if limit_no is not None:
-                    if (
-                        limit_no < self.params.min_buy_no_price - _EPS
-                        or limit_no > self.params.max_buy_no_price + _EPS
-                    ):
-                        if not bucket_cands and skip_reason is None:
-                            skip_reason = R_NO_PRICE_BOUNDS
-                            skip_detail = {
-                                "limit_no": limit_no,
-                                "min_buy_no_price": self.params.min_buy_no_price,
-                                "max_buy_no_price": self.params.max_buy_no_price,
-                                "fair_no": fair_no,
-                            }
-                    else:
-                        edge_no = calculate_net_edge(fair_no, limit_no, side="BUY", is_maker=True, event=event)
-                        if edge_no >= self.manifest.min_edge - _EPS:
-                            bucket_cands.append(
-                                _Candidate(
-                                    bucket_id=bucket.bucket_id,
-                                    label=label_by_bucket.get(bucket.bucket_id, bucket.bucket_id),
-                                    token_id=no_book.token_id,
-                                    outcome_side="NO",
-                                    fair=fair_no,
-                                    limit=limit_no,
-                                    edge=edge_no,
-                                    model_version=prob.model_version,
+                taker_no = (
+                    self._evaluate_taker_buy(
+                        no_book,
+                        fair_no,
+                        event,
+                        min_price=self.params.min_buy_no_price,
+                        max_price=self.params.max_buy_no_price,
+                    )
+                    if (not in_blackout and not speci_triggered)
+                    else None
+                )
+                if taker_no is not None:
+                    t_lim_no, t_edge_no = taker_no
+                    bucket_cands.append(
+                        _Candidate(
+                            bucket_id=bucket.bucket_id,
+                            label=label_by_bucket.get(bucket.bucket_id, bucket.bucket_id),
+                            token_id=no_book.token_id,
+                            outcome_side="NO",
+                            fair=fair_no,
+                            limit=t_lim_no,
+                            edge=t_edge_no,
+                            model_version=prob.model_version,
+                            post_only=False,
+                        )
+                    )
+                else:
+                    limit_no = self._passive_buy_limit(
+                        no_book,
+                        fair_no,
+                        allow_spread_inside=self.params.spread_inside_buy_no,
+                    )
+                    if limit_no is not None:
+                        if (
+                            limit_no < self.params.min_buy_no_price - _EPS
+                            or limit_no > self.params.max_buy_no_price + _EPS
+                        ):
+                            if not bucket_cands and skip_reason is None:
+                                skip_reason = R_NO_PRICE_BOUNDS
+                                skip_detail = {
+                                    "limit_no": limit_no,
+                                    "min_buy_no_price": self.params.min_buy_no_price,
+                                    "max_buy_no_price": self.params.max_buy_no_price,
+                                    "fair_no": fair_no,
+                                }
+                        else:
+                            edge_no = calculate_net_edge(fair_no, limit_no, side="BUY", is_maker=True, event=event)
+                            if edge_no >= self.manifest.min_edge - _EPS:
+                                bucket_cands.append(
+                                    _Candidate(
+                                        bucket_id=bucket.bucket_id,
+                                        label=label_by_bucket.get(bucket.bucket_id, bucket.bucket_id),
+                                        token_id=no_book.token_id,
+                                        outcome_side="NO",
+                                        fair=fair_no,
+                                        limit=limit_no,
+                                        edge=edge_no,
+                                        model_version=prob.model_version,
+                                    )
                                 )
-                            )
 
             if bucket_cands:
-                best_cand = max(bucket_cands, key=lambda c: c.edge)
+                best_cand = max(bucket_cands, key=self._candidate_score)
                 candidates.append(best_cand)
             else:
                 await self._skip(
@@ -1879,7 +2228,7 @@ class StrategyEngine:
                 multi_kelly_usd[(b.bucket_id, "YES")] = yes_fracs[idx] * self.manifest.reference_bankroll
                 multi_kelly_usd[(b.bucket_id, "NO")] = no_fracs[idx] * self.manifest.reference_bankroll
 
-        candidates.sort(key=lambda c: c.edge, reverse=True)
+        candidates.sort(key=self._candidate_score, reverse=True)
         for cand in candidates:
             override_usd = (
                 multi_kelly_usd.get((cand.bucket_id, cand.outcome_side))
@@ -1961,6 +2310,8 @@ class StrategyEngine:
         reason_codes = [reason, f"BINDING_{binding}"]
         if cand.outcome_side == "NO":
             reason_codes.append(R_BUY_NO_EDGE)
+        if not cand.post_only:
+            reason_codes.append(R_TAKER_EDGE)
         signal = SignalCard(
             signal_id=f"sig-{uuid.uuid4().hex[:12]}",
             event_id=event.event_id,
@@ -1993,7 +2344,7 @@ class StrategyEngine:
             limit_price=cand.limit,
             size_shares=shares,
             size_usd=notional,
-            post_only=True,
+            post_only=cand.post_only,
             phase=phase,
             status="OPEN",
             expected_edge=round(cand.edge, 6),
@@ -2010,9 +2361,10 @@ class StrategyEngine:
     ) -> None:
         self._last_skip.pop((event.event_id, placed.bucket_id), None)
         if placed.status == "CANCELLED":
+            reject_reason = R_POST_ONLY_REJECT if placed.post_only else R_TAKER_UNFILLED
             await self._audit(
                 "ORDER_REJECTED",
-                [R_POST_ONLY_REJECT],
+                [reject_reason],
                 placed.model_version,
                 event_id=event.event_id,
                 bucket_id=placed.bucket_id,
@@ -2020,10 +2372,20 @@ class StrategyEngine:
                     "order_id": placed.order_id,
                     "outcome_side": placed.outcome_side,
                     "limit_price": placed.limit_price,
+                    "post_only": placed.post_only,
                 },
             )
             return
         result.placed.append(placed)
+        if not placed.post_only:
+            order_fills = [
+                f
+                for f in await self.store.list_fills(limit=100, event_id=event.event_id, side=placed.side)
+                if f.order_id == placed.order_id
+            ]
+            if order_fills:
+                existing_ids = {f.fill_id for f in result.fills}
+                result.fills.extend(f for f in order_fills if f.fill_id not in existing_ids)
         await self._audit(
             "ORDER_PLACED",
             signal.reason_codes,
@@ -2135,7 +2497,10 @@ class StrategyEngine:
             if tp_limit is not None:
                 reasons = [R_DYNAMIC_TAKE_PROFIT]
                 exit_limit = tp_limit
-        elif residual <= self.params.convergence_edge + _EPS and passive_sell > pos.avg_entry_price + _EPS:
+        elif (
+            residual <= self.params.convergence_edge + _EPS
+            and passive_sell > pos.avg_entry_price + max(0.0, self.params.profit_take_min_profit) + _EPS
+        ):
             reasons = [R_PROFIT_TAKE]
             exit_limit = passive_sell
 

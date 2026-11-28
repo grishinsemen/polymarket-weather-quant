@@ -1545,6 +1545,8 @@ describe("WeatherQuantTerminal", () => {
                 },
               ],
               primary_clv_30m: 0.029,
+              maker_clv_30m: 0.015,
+              taker_midpoint_drift_30m: 0.008,
               volume_weighted_clv: 0.031,
               realized_log_growth: 0.074,
               max_drawdown_pct: 1.4,
@@ -1800,6 +1802,8 @@ describe("WeatherQuantTerminal", () => {
     expect(within(sharpDetails).getByText("ML-Covered Premarket")).toBeInTheDocument();
     expect(within(sharpDetails).getByText("+1.85")).toBeInTheDocument();
     expect(within(sharpDetails).getByText("+2.90¢")).toBeInTheDocument();
+    expect(within(sharpDetails).getByText("+1.50¢")).toBeInTheDocument();
+    expect(within(sharpDetails).getByText("+0.80¢")).toBeInTheDocument();
     expect(within(sharpDetails).getByText("42%")).toBeInTheDocument();
     const legacyDetails = screen.getByTestId("experiment-run-details-exp-legacy-null");
     expect(within(legacyDetails).getByText(/Legacy run/i)).toBeInTheDocument();

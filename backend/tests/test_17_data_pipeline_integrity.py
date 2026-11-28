@@ -419,3 +419,123 @@ def test_orderbook_tick_size_round_trip_and_legacy_schema_compaction(tmp_path: P
     assert len(reloaded) == 2
     assert reloaded[0].tick_size is None
     assert reloaded[1].tick_size == pytest.approx(0.001)
+
+
+@pytest.mark.asyncio
+async def test_reactive_metar_poll_and_ws_book_callback_trigger_without_full_cycle(tmp_path: Path) -> None:
+    """Verify fast METAR/SPECI polling and WS orderbook shifts trigger reactive ticks cleanly."""
+    import asyncio
+
+    now_utc = datetime(2026, 11, 26, 9, 10, tzinfo=timezone.utc)
+    clock = VirtualClock(now_utc)
+    raw_events = [
+        {
+            "id": "evt-paris-react",
+            "slug": "highest-temp-paris-nov-26",
+            "title": "Highest temperature in Paris on November 26?",
+            "description": (
+                "Resolves on routine hourly METAR at Paris-Le Bourget (ICAO: LFPB) "
+                "on November 26, 2026. Tenths of a degree via RMK if available."
+            ),
+            "negRisk": True,
+            "feesEnabled": True,
+            "feeType": "weather_fees",
+            "takerBaseFee": 1000,
+            "makerBaseFee": 0,
+            "markets": [
+                {"id": "b-r-1", "groupItemTitle": "11°C or below", "clobTokenIds": '["tok-r-1","no-r-1"]'},
+                {"id": "b-r-2", "groupItemTitle": "12°C", "clobTokenIds": '["tok-r-2","no-r-2"]'},
+                {"id": "b-r-3", "groupItemTitle": "15°C or higher", "clobTokenIds": '["tok-r-3","no-r-3"]'},
+            ],
+        }
+    ]
+    metar_lines = ["METAR LFPB 260800Z 24008KT 9999 SCT030 10/04 Q1016 RMK T01000040"]
+
+    class _TrackingWorldFeed(_StubWorldFeed):
+        def __init__(self) -> None:
+            super().__init__(raw_events, metar_lines)
+            self.fetch_events_calls = 0
+
+        async def fetch_weather_events(self) -> list[dict[str, object]]:
+            self.fetch_events_calls += 1
+            return await super().fetch_weather_events()
+
+    feed = _TrackingWorldFeed()
+    archive = ParquetArchiveStore(base_dir=tmp_path / "archive")
+    app = create_app(
+        db_path=str(tmp_path / "reactive.db"),
+        world_feed=feed,
+        clock=clock,
+        enable_background_poll=False,
+    )
+    app.state.parquet_archive = archive
+    app.state.ensemble_fetcher = _StubEnsembleFetcher(now_utc)
+
+    await app.state.db.initialize()
+    try:
+        runtime = AutonomousRuntime(app, metar_poll_interval_seconds=20, ws_reaction_cooldown_seconds=2.0)
+        stream = app.state.clob_stream
+        stream.add_snapshot_callback(runtime.react_to_book_snapshot)
+
+        # Initial cycle establishes ensemble + probability + watched resting order on b-r-3 NO or b-r-1
+        await runtime.run_cycle()
+        assert feed.fetch_events_calls == 1
+
+        # Seed fresh WS books via process_raw_message so reactive ticks have valid non-stale depth
+        for idx in (1, 2, 3):
+            await stream.process_raw_message(
+                {
+                    "event_type": "book",
+                    "asset_id": f"tok-r-{idx}",
+                    "bids": [{"price": "0.25", "size": "100"}],
+                    "asks": [{"price": "0.29", "size": "100"}],
+                }
+            )
+        await runtime.run_cycle()
+        assert feed.fetch_events_calls == 2
+
+        # 1) Unchanged METAR poll does NOT hit fetch_weather_events and triggers 0 event reactions
+        res_noop = await runtime.run_metar_poll_once()
+        assert res_noop["changed_stations"] == 0
+        assert res_noop["events_reacted"] == 0
+        assert feed.fetch_events_calls == 2
+
+        # 2) New routine METAR arrives -> poll_metar_only detects change, updates probs & ticks event!
+        clock.advance(timedelta(seconds=20))
+        feed._metars.append("METAR LFPB 260900Z 24008KT 9999 SCT030 13/04 Q1016 RMK T01320040")
+        res_metar = await runtime.run_metar_poll_once()
+        assert res_metar["changed_stations"] == 1
+        assert res_metar["events_reacted"] == 1
+        assert feed.fetch_events_calls == 2
+
+        # 3) New SPECI arrives -> triggers immediate SPECI alert + reactive cancel/tick without waiting 60s
+        clock.advance(timedelta(seconds=20))
+        feed._metars.append("SPECI LFPB 260910Z 24018KT 9999 BKN020 15/04 Q1016")
+        res_speci = await runtime.run_metar_poll_once()
+        assert res_speci["speci_alerts"] == 1
+        assert res_speci["events_reacted"] == 1
+
+        # 4) WS orderbook callback: sharp >=2c move after cooldown fires react_to_event via stream callback
+        clock.advance(timedelta(seconds=5))
+        reacted_calls = 0
+        orig_react = runtime.react_to_event
+
+        async def _spy_react(event_id: str) -> dict[str, int]:
+            nonlocal reacted_calls
+            reacted_calls += 1
+            return await orig_react(event_id)
+
+        runtime.react_to_event = _spy_react  # type: ignore[method-assign]
+        await stream.process_raw_message(
+            {
+                "event_type": "book",
+                "asset_id": "tok-r-2",
+                "bids": [{"price": "0.29", "size": "100"}],
+                "asks": [{"price": "0.33", "size": "100"}],
+            }
+        )
+        await asyncio.sleep(0.05)
+        assert reacted_calls == 1
+        await runtime.stop()
+    finally:
+        await app.state.db.close()

@@ -460,6 +460,7 @@ def evaluate_calibration_walk_forward(
                     DailyBiasObservation(
                         local_date=item.local_date,
                         forecast_extreme_c=layer2.forecast_ref_c,
+                        raw_forecast_extreme_c=layer2.raw_mean_c,
                         observed_extreme_c=item.actual_extreme_c,
                         forecast_std_c=(
                             layer2.forecast_ref_std_c if layer2.forecast_ref_std_c > 1e-6 else None
@@ -712,10 +713,10 @@ async def load_calibration_target(
             return DEFAULT_MODEL_VERSION, EnsembleProbabilityEngine(), None
 
     base_engine = EnsembleProbabilityEngine.from_model_config(model_rec.config_json)
-    mos_provider: Any | None = None
-    if "mos" in model_rec.model_type.lower() or "mos" in model_rec.model_version.lower():
-        from weather_quant.ml.quantile_mos import load_mos_provider_for_version
+    from weather_quant.ml.quantile_mos import is_ml_mos_model, load_mos_provider_for_version
 
+    mos_provider: Any | None = None
+    if is_ml_mos_model(model_rec):
         mos_provider = await load_mos_provider_for_version(db, model_rec.model_version)
         if mos_provider is not None:
             mos_provider.baseline_engine = base_engine

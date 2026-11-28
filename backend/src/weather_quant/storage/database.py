@@ -255,6 +255,7 @@ class Database:
             ("orders", "outcome_side", "TEXT NOT NULL DEFAULT 'YES'"),
             ("orders", "expected_edge", "REAL"),
             ("fills", "outcome_side", "TEXT NOT NULL DEFAULT 'YES'"),
+            ("fills", "entry_midpoint", "REAL"),
             ("fills", "expected_edge", "REAL"),
             ("fills", "realized_edge", "REAL"),
             ("positions", "outcome_side", "TEXT NOT NULL DEFAULT 'YES'"),
@@ -421,6 +422,204 @@ class Database:
                         "enable_multi_kelly": True,
                         "enable_blackout_windows": False,
                         "strict_maker_fills": True,
+                    }
+                ),
+                0,
+                now_iso,
+            ),
+        )
+        await self.conn.execute(
+            """
+            INSERT OR IGNORE INTO strategy_versions (
+                strategy_version, description, reference_bankroll, kelly_fraction,
+                max_bucket_usd, max_city_exposure_usd, intraday_cash_reserve_ratio,
+                min_edge, min_top_liquidity_usd, stale_feed_seconds,
+                cutoff_minutes_before_settlement, config_json, is_active, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "kelly-multi-strict-v3",
+                "V3 Multi-Outcome Fractional Kelly with blackout windows, 45m resting TTL, all-day anomaly kill-switch, upgraded crash guard & strict fresh-book fills",
+                100.0,
+                0.2,
+                5.0,
+                8.0,
+                0.4,
+                0.05,
+                5.0,
+                30,
+                30,
+                json.dumps(
+                    {
+                        "post_only": True,
+                        "phases": ["PREMARKET_ENTRY", "INTRADAY_REPRICING"],
+                        "enable_buy_no": True,
+                        "enable_market_shrinkage": True,
+                        "market_shrinkage_us": 0.30,
+                        "market_shrinkage_intl": 0.15,
+                        "enable_multi_kelly": True,
+                        "enable_blackout_windows": True,
+                        "max_anomaly_divergence": 0.18,
+                        "anomaly_divergence_intraday": True,
+                        "strict_maker_fills": True,
+                        "enforce_fresh_executor_books": True,
+                        "max_order_age_minutes": 45.0,
+                        "crash_cancel_ask_threshold": 0.05,
+                        "crash_cancel_drop_ratio": 0.60,
+                    }
+                ),
+                0,
+                now_iso,
+            ),
+        )
+        await self.conn.execute(
+            """
+            INSERT OR IGNORE INTO strategy_versions (
+                strategy_version, description, reference_bankroll, kelly_fraction,
+                max_bucket_usd, max_city_exposure_usd, intraday_cash_reserve_ratio,
+                min_edge, min_top_liquidity_usd, stale_feed_seconds,
+                cutoff_minutes_before_settlement, config_json, is_active, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "kelly-multi-strict-v4",
+                "V4 Multi-Outcome Fractional Kelly with spread-inside quoting & selective IOC taker (>=12c outside blackout)",
+                100.0,
+                0.2,
+                5.0,
+                8.0,
+                0.4,
+                0.05,
+                5.0,
+                30,
+                30,
+                json.dumps(
+                    {
+                        "post_only": True,
+                        "phases": ["PREMARKET_ENTRY", "INTRADAY_REPRICING"],
+                        "enable_buy_no": True,
+                        "enable_market_shrinkage": True,
+                        "market_shrinkage_us": 0.30,
+                        "market_shrinkage_intl": 0.15,
+                        "enable_multi_kelly": True,
+                        "enable_blackout_windows": True,
+                        "max_anomaly_divergence": 0.18,
+                        "anomaly_divergence_intraday": True,
+                        "strict_maker_fills": True,
+                        "enforce_fresh_executor_books": True,
+                        "max_order_age_minutes": 45.0,
+                        "crash_cancel_ask_threshold": 0.05,
+                        "crash_cancel_drop_ratio": 0.60,
+                        "spread_inside_edge_share": 0.25,
+                        "spread_inside_min_spread": 0.04,
+                        "spread_inside_max_improve": 0.05,
+                        "spread_inside_reprice_ticks": 2,
+                        "enable_selective_taker": True,
+                        "taker_min_net_edge": 0.12,
+                        "taker_max_spread": 0.10,
+                        "cancel_resting_on_blackout": True,
+                    }
+                ),
+                0,
+                now_iso,
+            ),
+        )
+        await self.conn.execute(
+            """
+            INSERT OR IGNORE INTO strategy_versions (
+                strategy_version, description, reference_bankroll, kelly_fraction,
+                max_bucket_usd, max_city_exposure_usd, intraday_cash_reserve_ratio,
+                min_edge, min_top_liquidity_usd, stale_feed_seconds,
+                cutoff_minutes_before_settlement, config_json, is_active, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "kelly-multi-strict-v5",
+                "V5 Multi-Outcome Fractional Kelly with spread-inside quoting & selective NO-only IOC taker (>=12c outside blackout)",
+                100.0,
+                0.2,
+                5.0,
+                8.0,
+                0.4,
+                0.05,
+                5.0,
+                30,
+                30,
+                json.dumps(
+                    {
+                        "post_only": True,
+                        "phases": ["PREMARKET_ENTRY", "INTRADAY_REPRICING"],
+                        "enable_buy_no": True,
+                        "enable_market_shrinkage": True,
+                        "market_shrinkage_us": 0.30,
+                        "market_shrinkage_intl": 0.15,
+                        "enable_multi_kelly": True,
+                        "enable_blackout_windows": True,
+                        "max_anomaly_divergence": 0.18,
+                        "anomaly_divergence_intraday": True,
+                        "strict_maker_fills": True,
+                        "enforce_fresh_executor_books": True,
+                        "max_order_age_minutes": 45.0,
+                        "crash_cancel_ask_threshold": 0.05,
+                        "crash_cancel_drop_ratio": 0.60,
+                        "spread_inside_edge_share": 0.25,
+                        "spread_inside_min_spread": 0.04,
+                        "spread_inside_max_improve": 0.05,
+                        "spread_inside_reprice_ticks": 2,
+                        "enable_selective_taker": True,
+                        "taker_no_only": True,
+                        "taker_min_net_edge": 0.12,
+                        "taker_max_spread": 0.10,
+                        "cancel_resting_on_blackout": True,
+                    }
+                ),
+                0,
+                now_iso,
+            ),
+        )
+        await self.conn.execute(
+            """
+            INSERT OR IGNORE INTO strategy_versions (
+                strategy_version, description, reference_bankroll, kelly_fraction,
+                max_bucket_usd, max_city_exposure_usd, intraday_cash_reserve_ratio,
+                min_edge, min_top_liquidity_usd, stale_feed_seconds,
+                cutoff_minutes_before_settlement, config_json, is_active, created_at_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "kelly-multi-strict-v3.1",
+                (
+                    "V3.1 Patch: V3 protections + minimum +4c convergence take-profit "
+                    "and max_buy_no_price=0.65 cap against asymmetric heavy-NO drawdowns"
+                ),
+                100.0,
+                0.2,
+                5.0,
+                8.0,
+                0.4,
+                0.05,
+                5.0,
+                30,
+                30,
+                json.dumps(
+                    {
+                        "post_only": True,
+                        "phases": ["PREMARKET_ENTRY", "INTRADAY_REPRICING"],
+                        "enable_buy_no": True,
+                        "enable_market_shrinkage": True,
+                        "market_shrinkage_us": 0.30,
+                        "market_shrinkage_intl": 0.15,
+                        "enable_multi_kelly": True,
+                        "enable_blackout_windows": True,
+                        "max_anomaly_divergence": 0.18,
+                        "anomaly_divergence_intraday": True,
+                        "strict_maker_fills": True,
+                        "enforce_fresh_executor_books": True,
+                        "max_order_age_minutes": 45.0,
+                        "crash_cancel_ask_threshold": 0.05,
+                        "crash_cancel_drop_ratio": 0.60,
+                        "profit_take_min_profit": 0.04,
+                        "max_buy_no_price": 0.65,
                     }
                 ),
                 0,

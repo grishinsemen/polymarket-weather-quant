@@ -15,12 +15,129 @@
 
 ## Реестр прогонов
 
-| Дата | Ветка / Коммит | Model Version | Strategy Version | Окно данных | Brier | Mean CLV | Trades | Max DD | Net PnL | Решение |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 2026-11-26 | `main` (baseline) | `ensemble-3layer-v1` | `conservative-kelly-100-v1` | _Baseline (живой сбор Parquet)_ | — | — | — | — | — | Baseline |
-| 2026-11-27 | `emos-student-t-v2` | `emos-student-t-v2` | `kelly-multi-strict-v2` | `2026-11-25..27` (`30` OOS премаркет) | `0.673` | `-6.1¢` (`30m`) | `43` | `-$57.73` (`57.7%`) | `-$48.81` | Candidate (Premarket LL `1.792→1.353`) |
+| Дата | Ветка / Run ID | Model Version | Strategy Version | Окно данных | Premarket LL (ΔLL) | Brier | Wtd CLV (30m) | Trades / Fill | Max DD | Net PnL | Решение |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2026-11-27 | `exp-13c99b466e8d` | `ensemble-3layer-v1` | `conservative-kelly-100-v1` | `2026-11-25..27` | `1.766` (`-0.624`) | `0.762` | `-0.37¢` (`-2.7¢`) | `84` (`85%`) | `78.21%` | `-$67.01` | Отклонено (истор. baseline) |
+| 2026-11-27 | `exp-e0b4a26b5a9f` | `emos-student-t-v2` | `kelly-multi-strict-v2` | `2026-11-25..27` | `1.353` (`-0.207`) | `0.673` | `-5.48¢` (`-6.1¢`) | `43` (`70%`) | `57.73%` | `-$48.81` | **Модель v2 принята** (`LL 1.792→1.353`) |
+| 2026-11-27 | `exp-66773f520959` | `emos-student-t-v2-nocens` | `kelly-multi-strict-v3` | `2026-11-25..27` | `1.348` (`-0.205`) | `0.681` | `-3.58¢` (`-4.3¢`) | `13` (`46%`) | `18.90%` | `-$15.68` | Отклонено (`Censored-Max` нужен) |
+| 2026-11-27 | `exp-12278ebd9f09` | `emos-student-t-v2` | `kelly-multi-strict-v3` | `2026-11-25..27` | `1.344` (`-0.201`) | `0.673` | `-2.04¢` (`-1.6¢`) | `18` (`52%`) | `18.77%` | `-$0.75` | **Promoted (активен в проде)** |
+| 2026-11-27 | `exp-fc641db5efdf` | `emos-student-t-v2` | `kelly-multi-strict-v3` | `2026-11-25..27` (расш.) | `1.314` (`-0.197`) | `0.657` | `-2.04¢` (`-1.6¢`) | `19` (`46%`) | `18.77%` | `-$3.41` | Актуальный срез `v2 + v3` |
+| 2026-11-28 | `exp-ba7fb1567b2f` | `emos-student-t-v2` | `kelly-multi-strict-v4` | `2026-11-25..28` (`1223t`) | — | — | `-4.77¢` (`-3.11¢`) | `39` (`66.0%`) | `19.21%` | `-$0.64` | Кандидат (`is_active=0`, `Sharpe +0.197`) |
+| 2026-11-28 | `exp-c1ddd31af184` | `emos-student-t-v2` | `kelly-multi-strict-v5` | `2026-11-25..28` (`1630t`) | `1.248` (`-0.178`) | `0.625` | `-2.76¢` (`-1.63¢`) | `45` (`78.4%`) | `15.07%` | **`+$3.44`** | **Кандидат (`is_active=0`, `Sharpe +0.286`, Markout OK)** |
+| 2026-11-27 | `exp-77ecbe4c4400` | `emos-student-t-v3` | `kelly-multi-strict-v3` | `2026-11-25..27` (расш.) | `1.351` (`-0.235`) | `0.670` | `-5.20¢` (`0.0¢`) | `23` (`62%`) | `22.41%` | `-$15.13` | Кандидат (`is_active=False`, см. ниже) |
 
-> **Напоминание на 2026-11-29 (см. `.scratch/mos-anchor-ablation/issues/01-ablate-mos-anchor-weights.md`):** после накопления закрытых событий 28–29.11 с `mos_anchors_by_date` прогнать на одном окне абляцию `emos-student-t-v2` с `mos_anchor_weight = 0.0` vs `fixed 0.30` vs `dynamic E_TTT` и сравнить `Premarket ΔLogLoss` / `RPS` / `Tail ECE`.
+---
+
+## Матрица выводов: что сработало и что отклонено
+
+### Что подтверждённо дало плюс (не терять)
+
+1. **Контур 1 — Student-t(7) CDF + EWMA-bias + t-MLE scale + warm-start (`emos-student-t-v2`):**
+   `Premarket LogLoss` упал с `1.792` до `1.314–1.353`, `Brier` с `0.768` до `0.657–0.673`.
+2. **Контур 1 — Intraday `Censored-Max` (`use_censored_max=True`):**
+   Без него на `kelly-multi-strict-v3` `PnL` падает с `-$0.75` до `-$15.68` (`exp-12278ebd9f09` vs `exp-66773f520959`), а `WtdCLV` с `-2.04¢` до `-3.58¢`.
+3. **Контур 1 — `dual-basis` выравнивание без `model_hourly_means_c` (`align_warmstart_bias_basis=True`):**
+   На 76 премаркет-событиях без `wNWP` изолированный `dual-basis` снизил средний `LogLoss` (`2.0504 → 2.0382`, на `2026-11-27`: `2.2597 → 2.2187`).
+4. **Контур 2 — Фильтр входов `kelly-multi-strict-v3` (`blackout` + `TTL 45m` + `crash guard` + `anomaly 0.18` + `fresh executor books`):**
+   Сократил просадку с `57.7%` (`-$48.81`) до `18.77%` (`-$0.75` / `-$3.41`), `Sharpe` вырос с `-1.34` до `+0.12` / `+0.03`, `WtdCLV` улучшился с `-5.48¢` до `-2.04¢`.
+5. **Контур 2 — Шаг внутрь широкого спреда (`spread_inside_edge_share=0.25, >=4¢, reprice 2t`, [ablate_strategy_v4.py](../../scripts/ablate_strategy_v4.py)):**
+   Против `1_v3_baseline` (`-$3.41`, `DD 18.77%`, `Sharpe +0.032`) улучшил `PnL` до **`-$0.46`**, снизил **`DD` до `14.75%`** и поднял `Sharpe` до **`+0.168`** (минус: `CLV 30m` просел до `-3.54¢`).
+6. **Контур 2 — Селективный IOC Taker при `net_edge_taker >= 12¢` вне blackout (`3_v4_spread_taker12`):**
+   Вывел стратегию в **`+$1.95`** (`+0.257 Sharpe`, `+0.0193 LogG`, `33` сделки, `fill 63.6%`, `DD 19.21%`, `6/14` станций в плюсе). Но `CLV 30m = -4.29¢` против `midpoint` из-за уплаты полспреда при входе по `ask`.
+
+### Что подтверждённо ухудшило результат (не повторять без веской причины)
+
+1. **Не отменять пассивные ордера в `blackout_windows` (`cancel_resting_on_blackout=False` / `5_v4_spread_keepfifo`):**
+   Поток токсичных заливок вырос (`38` сделок, `fill 71.1%`), `PnL` рухнул до **`-$18.77`**, `DD` выросла до `25.23%`, **`WtdCLV = -5.40¢`**. Авто-отмена ордеров перед выходом METAR/NWP — обязательна.
+2. **Низкий порог Taker `net_edge_taker >= 8¢` (`4_v4_spread_taker08`):**
+   `63` сделки, **`-$28.07`**, `DD 36.82%`, `Sharpe -0.165`. Комиссия `weather_fees` (`1000 bps`) + полспреда съедают слабые сигналы.
+3. **Преждевременный промоут `emos-student-t-v3` с коротким `hl=10d / shrk=4d` и сильным `mos_sigma_shrink=0.65`:**
+   Несмотря на победу на 365d (`LL 1.5178 → 1.5149`, `18,816` дней), на коротком 3-дн OOS дал `-$15.13` и `DD 22.41%`. Оставлен в реестре как `is_active=False` до накопления 5–7 дней с живыми `mos_anchors_by_date`.
+
+### Открытые гипотезы и изолированные прогоны Taker (`--suite isolate`, `emos-student-t-v2`)
+
+| Вариант | Trades | Fill% | Net PnL | Max DD | Sharpe | CLV 30m | WtdCLV | Gates (Контур 2) | Вывод |
+|---|---:|---:|---:|---:|---:|---:|---:|---|---|
+| `1_v3_baseline` | 19 | 39.0% | -$3.41 | 18.77% | +0.032 | -1.62¢ | -2.04¢ | `DD OK, Markout OK` | База |
+| `2_v3_taker12_no_spread` | 35 | 59.6% | -$5.21 | 22.32% | +0.039 | -2.70¢ | -2.63¢ | `DD>20%, ADVERSE_MARKOUT` | Taker 12¢ без шага в спред проседает |
+| `3_v3_taker15_no_spread` | 20 | 41.5% | -$4.38 | 18.77% | -0.001 | -1.62¢ | -2.03¢ | `DD OK, Markout OK` | Почти не срабатывает (+1 сделка) |
+| `4_v4_mild_spread15_taker12` | 20 | 52.6% | -$4.66 | **11.36%** | -0.146 | -1.91¢ | **-1.87¢** | `DD OK, Markout OK` | Лучший риск-профиль (DD 11.36%), но `EHAM` увела PnL |
+| **`kelly-multi-strict-v4`** (`3_v4_spread_taker12`) | **33** | **63.6%** | **+$1.95** | 19.21% | **+0.257** | -4.29¢ | -3.10¢ | `DD OK`, `ADVERSE_MARKOUT` | **Зарегистрирован в БД (`is_active=0`) как лучший по PnL / Sharpe / LogG (+0.0193)** |
+
+### Декомпозиция `Maker vs Taker` в `kelly-multi-strict-v4` ([diagnose_maker_vs_taker_v4.py](../../scripts/diagnose_maker_vs_taker_v4.py), `1,609` тиков, `44` BUY-фила)
+
+| Срез | Fills | Объём | Комиссия | Закрыто (`wins`) | Реал. PnL | `fill - mid0` | `midDrift30` | `CLV 30m` |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `ALL BUY FILLS` | 44 | $140.56 | $4.55 | 26 (`12`) | **+$3.06** | +2.12¢ | -0.34¢ | -2.28¢ |
+| `MAKER (post_only=T)` | 22 | $60.79 | $0.00 | 16 (`7`) | **-$2.60** | +2.55¢ | -0.19¢ | -2.43¢ |
+| `TAKER (post_only=F)` | 22 | $79.77 | $4.55 | 10 (`5`) | **+$5.65** | +1.69¢ | -0.46¢ | -2.16¢ |
+| ↳ `TAKER NO` | 10 | $46.75 | $1.84 (`3.9%`) | 6 (`4`) | **+$9.22** | +1.80¢ | -1.40¢ | -3.21¢ |
+| ↳ `TAKER YES` | 12 | $33.02 | $2.71 (`8.2%`) | 4 (`1`) | **-$3.56** | +1.59¢ | +0.88¢ | -0.69¢ |
+| ↳ `MAKER US / NON-US` | 7 / 15 | $17.19 / $43.60 | $0 / $0 | 5 (`3`) / 11 (`4`) | **+$3.54** / **-$6.14** | +3.57¢ / +2.07¢ | -0.92¢ / +0.10¢ | -3.52¢ / -2.01¢ |
+
+- **Главный вывод:** Тейкер при `>= 12¢` суммарно зарабатывает (**`+$5.65`** после комиссий), причём 100% прибыли даёт **`TAKER NO` (`+$9.22`)**, тогда как `TAKER YES` (`-$3.56`) сжигает `8.2%` комиссий на дешёвых хвостах. При этом `midDrift30 = -0.34¢` (`+0.67¢` на `TAKER NON-US`) доказывает отсутствие массового выноса инсайдерами — отрицательный `CLV 30m` вызван в основном тем, что и тейкер (`+1.69¢`), и шаг внутрь спреда (`+2.55¢`) на момент заливки фиксируются выше `mid0`.
+
+### Абляция `TAKER_NO_ONLY` (`--suite v5`, `1,329,149` книг, `1,617` тиков, `emos-student-t-v2`)
+
+| Вариант | Trades | Fill% | Net PnL | Max DD | Sharpe | LogG | CLV 30m | WtdCLV | Gates (Контур 2) | Вывод |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| `1_v3_baseline` | 26 | 52.3% | -$5.00 | 18.77% | -0.022 | -0.0513 | **-1.26¢** | **-1.89¢** | `DD OK, Markout OK` | Пассивная база |
+| `2_v4_spread_taker12_both` (`v4`) | 57 | **78.5%** | -$7.96 | 19.21% | +0.043 | -0.0830 | -2.35¢ | -2.69¢ | `DD OK`, `ADVERSE_MARKOUT` | `TAKER YES` просаживает PnL и Markout |
+| **`3_v5_spread_taker_no_only` (`kelly-multi-strict-v5`)** | **45** | 70.2% | **+$1.64** | **15.07%** | **+0.243** | **+0.0162** | **-1.63¢** | -2.76¢ | **`DD OK, Markout OK`** | **Лучший баланс: плюс к `v3`/`v4`, минимальный `DD`, Markout без флага (`exp-c1ddd31af184`: `+$3.44`, `78.4%`, `Sharpe +0.286`)** |
+| `4_v5_taker_no_only_min5` | 49 | 70.5% | +$4.53 | 16.92% | +0.304 | +0.0443 | -3.34¢ | -2.44¢ | `DD OK`, `ADVERSE_MARKOUT` | `min_entry_shares=5.0` добавляет токсичных мелких заливок |
+| `5_v5_no_spread_taker_no_only` | 40 | 63.2% | +$4.10 | 20.35% | +0.286 | +0.0402 | -2.40¢ | -2.39¢ | `DD>20%`, `ADVERSE_MARKOUT` | Без `spread_inside` просадка выше `20%` |
+
+- **Решение по Контуру 2:** Зарегистрирована версия **`kelly-multi-strict-v5`** (`is_active=False`, [`engine.py`](../../backend/src/weather_quant/strategy/engine.py)) с `taker_no_only=True` и сохранённым `min_entry_shares=6.0` + `spread_inside` (`0.25`).
+
+### Проверка идей `v3.1` поверх `v5` (`--suite v51`, `1,348,388` книг, `1,634` тиков, `emos-student-t-v2`)
+
+| Вариант | Trades | Fill% | Net PnL | Max DD | Sharpe | LogG | Maker CLV 30m | Taker Drift 30m | Taker CLV 30m | Вывод |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `1_v31_baseline` (`v3.1`) | 28 | 55.6% | -$3.11 | 19.86% | +0.086 | -0.0316 | **-0.78¢** | — | — | Пассивная `v3.1` уступает `v5` по PnL/DD |
+| **`2_v5_baseline` (`kelly-multi-strict-v5`)** | **46** | **67.2%** | **+$6.66** | **15.07%** | **+0.361** | **+0.0645** | -2.49¢ | **+1.46¢** | **-0.40¢** | **`TAKER NO` бьёт рынок (`+1.46¢`), просадка минимальна** |
+| `3_v5_pt4c_only` (`+profit_take_min=0.04`) | 46 | 67.2% | +$6.66 | 15.07% | +0.361 | +0.0645 | -2.49¢ | +1.46¢ | -0.40¢ | Идентично `v5` (ни одна сделка не изменилась) |
+| `4_v5_pt4c_cap65` (`+max_buy_no=0.65`) | 36 | 58.8% | -$0.99 | 19.48% | +0.228 | -0.0099 | -4.11¢ | -0.23¢ | -2.04¢ | **Отклонено:** режет прибыльные `TAKER NO > 65¢` |
+
+- **Вывод по `v51`:** оставляем `kelly-multi-strict-v5` без `max_buy_no_price=0.65` (`v6` не создаём). Раздельный маркаут также подсветил, что `TakerDrift30 = +1.46¢` чистый, а `-2.49¢` сидит в `MakerCLV30` из-за шага `spread_inside`.
+
+### Проверка гипотезы `BUY NO`-Only, отключения `spread_inside` и ранжирования по `ROI` (`--suite no_only`, `1,348,388` книг, `1,634` тиков, `emos-student-t-v2`)
+
+1. **Декомпозиция `kelly-multi-strict-v5` ([diagnose_maker_vs_taker_v4.py](../../scripts/diagnose_maker_vs_taker_v4.py) `--strategy kelly-multi-strict-v5`, `34` BUY-фила, общий `PnL = +$12.19`):**
+   - `MAKER YES`: `11` филов (`10` закрыто, `3` победы), `$16.62`, **`-$5.78`**, `midDrift30 = -3.07¢`, **`CLV 30m = -4.96¢`** (дешёвые хвосты `YES` по `12–19¢` в `EHAM/EGLC/CYYZ/KLAX`).
+   - `MAKER NO`: `12` филов (`5` закрыто, `3` победы), `$51.43`, `-$1.26` (`7 OPEN`), `midDrift30 = +1.29¢`, `CLV 30m = -0.74¢`.
+   - `TAKER NO`: `11` филов (`6` закрыто, `5` побед), `$52.10` (`$1.94` fee), **`+$10.39`**, `midDrift30 = -0.02¢`, `CLV 30m = -1.84¢`.
+   - `ALL NO (px > 0.65)`: `12` филов (`6` закрыто, `5` побед), **`+$3.11`**, **`midDrift30 = +2.21¢`**, **`CLV 30m = +0.41¢`**.
+
+2. **Сравнительная таблица `--suite no_only`:**
+
+| Вариант | Trades | Fill% | Net PnL | Max DD | Sharpe | LogG | Maker CLV 30m | Taker Drift 30m | WtdCLV | Станции | Вывод |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| `1_v5_baseline` (`kelly-multi-strict-v5`) | 44 | 90.7% | +$12.19 | 15.07% | +0.484 | +0.1150 | -2.49¢ | +1.46¢ | -2.76¢ | 10 / 18 | База (`ADVERSE_MARKOUT` на Maker YES) |
+| `2_no_only_v5` (`enable_buy_yes=False`) | 38 | 92.5% | +$12.80 | 11.60% | +0.544 | +0.1205 | -1.53¢ | +1.46¢ | -2.27¢ | 13 / 18 | Лучше DD и Markout OK без YES |
+| **`3_no_only_no_spread`** (`YES=F, spread=0`) | **29** | **93.5%** | **+$20.78** | **8.89%** | **+0.953** | **+0.1888** | **+0.98¢** | **+1.91¢** | **+0.58¢** | **10 / 13** | **Лидер по риску/чистоте: DD 8.89%, Sharpe +0.95, оба CLV > 0!** |
+| `4_no_only_min5` (`YES=F, min_shares=5`) | 45 | 93.6% | +$10.14 | 15.09% | +0.447 | +0.0966 | -2.63¢ | -1.13¢ | -3.76¢ | 12 / 18 | Худший маркаут (`ADVERSE_MARKOUT`) |
+| `5_no_only_passive` (`YES=F, Taker=F`) | 25 | 95.8% | +$0.86 | 12.79% | +0.169 | +0.0086 | -1.60¢ | — | -4.01¢ | 9 / 13 | Без `TAKER NO` теряется почти весь плюс |
+| `6_v5_no_spread_yes` (`spread_yes=False`) | 35 | 89.5% | +$10.49 | 13.78% | +0.471 | +0.0998 | -1.45¢ | +1.30¢ | -2.34¢ | 12 / 19 | Снимает `ADVERSE_MARKOUT`, лучше `DD` |
+| `7_v5_no_spread_all` (`spread=0`, YES+NO) | 22 | 88.0% | +$16.26 | 9.32% | +0.842 | +0.1506 | **+1.71¢** | +1.47¢ | +0.12¢ | 7 / 12 | Сильно, но уступает чистому `NO-Only` (`+$20.78`, `10/13`) |
+| `8_v5_roi_ranked` (`rank_by_roi=True`) | 48 | 91.3% | **+$25.45** | 17.70% | +0.760 | +0.2267 | -2.64¢ | +1.40¢ | -1.34¢ | 12 / 19 | Макс. PnL/LogG, но `ADVERSE_MARKOUT` от `spread_inside` |
+
+- **Главный вывод:** два самых сильных независимых улучшения поверх `v5`: (а) отказ от переплаты в спред (`spread_inside_edge_share=0.0` на пассивных лимитках), который вывел `Maker CLV 30m` из `-2.49¢` в `+0.98..+1.71¢` и срезал просадку до `~9%`; (б) отключение `MAKER YES` (`enable_buy_yes=False`), добавившее ещё `+$4.52` и повысившее стабильность станций с `7/12` до `10/13` (`Worst = -$1.40`). Кандидат **`3_no_only_no_spread`** + комбинация с **`rank_candidates_by_roi=True`** готовы к финальному прогону и регистрации `kelly-multi-strict-v6` по команде пользователя.
+
+### Внедрено и осталось в бэклоге (`2026-11-28`)
+
+1. **[Сделано] `TAKER_NO_ONLY` (`kelly-multi-strict-v5`, [`engine.py`](../../backend/src/weather_quant/strategy/engine.py)):**
+   - Селективный IOC Taker (`net_edge_taker >= 12¢`, вне blackout/SPECI) работает только для `BUY NO`; покупки `BUY YES` остаются строго `Post-Only` Maker (`0%` комиссии). Прогон `min_entry_shares = 5.0` отклонён из-за `ADVERSE_MARKOUT` (`CLV 30m = -3.34¢`).
+2. **[Сделано] Раздельная диагностика `Maker CLV 30m` и `Taker Midpoint Drift 30m` ([metrics.py](../../backend/src/weather_quant/replay/metrics.py), [ExperimentLabPanel.tsx](../../frontend/src/components/ExperimentLabPanel.tsx)):**
+   - Фиксируется `entry_midpoint` (`mid0`) в `FillRecord`, гейт `ADVERSE_MARKOUT` проверяет `maker_clv_30m` и `taker_midpoint_drift_30m` раздельно.
+3. **[Сделано] Event-driven архитектура в [AutonomousRuntime](../../backend/src/weather_quant/api/runtime.py):**
+   - Подписка на `SnapshotCallback` через `ClobOrderBookStream.add_snapshot_callback` ([orderbook_ws.py](../../backend/src/weather_quant/clob/orderbook_ws.py)) с debounced `react_to_event(event_id)` (`ws_reaction_cooldown_seconds=2.0`) при сдвигах `>= 2¢` / `crash` / активных позициях и ордерах;
+   - отдельный `20s` поллер `METAR/SPECI` (`StationRadarService.poll_metar_only` + `run_metar_poll_once`, `metar_poll_interval_seconds=20`) с пересчётом Layer 1–3 и тиком затронутых станций без запуска Discovery / Open-Meteo / Parquet compaction.
+4. **Калибровка `spread_inside`, ранжирования и фильтров риска (Контур 2):**
+   - Проверить причины просадки `MAKER NON-US` (`-$6.14`) против `MAKER US` (`+$3.54`) и ограничить/отключить `spread_inside` на широких не-US хвостах.
+   - Проверить конфликт `max_anomaly_divergence = 0.18` × `market_shrinkage_us = 0.30` (который режет потолок `net_edge_taker` на US до `~8.5–9.5¢`).
+   - Ранжировать кандидатов `YES vs NO` и порядок входа по ROI/log-growth на `$1` вместо абсолютных центов эджа; проверить тейкер-выход на `R_EARLY_EXIT` при порче эджа свежим METAR.
+5. **Контур 1 (`2026-11-29+`, см. `.scratch/mos-anchor-ablation/issues/01-ablate-mos-anchor-weights.md`):**
+   - После накопления `5–7` дней закрытых событий с живыми `model_hourly_means_c` и `mos_anchors_by_date` сравнить `emos-student-t-v2`, чистый `dual-basis`, `mos_anchor_weight` (`0.0` vs `fixed 0.30` vs `dynamic E_TTT`) и `emos-student-t-v3`.
 
 ---
 
